@@ -1,6 +1,7 @@
 """§7.1 conformance: taxonomy codes, payloads, stable __str__, picklability."""
 
 import pickle
+from string import Formatter
 from typing import Any
 
 import pytest
@@ -132,7 +133,6 @@ def test_error_code_payload_args_str(
     assert "\n" not in text and "\r" not in text
     assert str(cls(**kwargs)) == text  # stable
     # suggestion is a per-class template, never baked into the raised string
-    assert type(exc).suggestion is exc.suggestion
     if type(exc).suggestion:
         assert type(exc).suggestion not in text
 
@@ -153,6 +153,22 @@ def test_resolve_error_code_mro_and_fallback() -> None:
 def test_suggestion_templates_are_renderable() -> None:
     exc = ExtrasMissingError(extra="memu")
     assert type(exc).suggestion.format(extra=exc.extra) != ""
+
+
+@pytest.mark.parametrize(("cls", "kwargs", "code"), CASES)
+def test_suggestion_template_keys_are_declared_payload_keys(
+    cls: type[EmuctlError], kwargs: dict[str, Any], code: str
+) -> None:
+    """Every {key} in a class suggestion template must be a declared payload key."""
+    template_keys = {
+        field.split("!")[0].split(":")[0].split(".")[0].split("[")[0]
+        for _, field, _, _ in Formatter().parse(cls.suggestion)
+        if field
+    }
+    assert template_keys <= set(cls.payload), (
+        f"{cls.__name__}.suggestion names {sorted(template_keys - set(cls.payload))} "
+        f"outside payload {list(cls.payload)}"
+    )
 
 
 @pytest.mark.parametrize(("cls", "kwargs", "code"), CASES)

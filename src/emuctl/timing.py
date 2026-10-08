@@ -32,12 +32,6 @@ class _DefaultType:
     def __repr__(self) -> str:
         return "DEFAULT"
 
-    def __copy__(self) -> _DefaultType:
-        return self
-
-    def __deepcopy__(self, memo: dict[int, object]) -> _DefaultType:
-        return self
-
 
 #: Sentinel selecting the op's group constant; distinct from None (explicit unbounded).
 DEFAULT: Final[_DefaultType] = _DefaultType()

@@ -4,8 +4,6 @@ import importlib
 import logging
 import sys
 
-import emuctl
-import emuctl.log
 from emuctl.log import sanitize
 
 
@@ -16,11 +14,6 @@ def test_sanitize_strips_controls_and_truncates() -> None:
     assert len(sanitize(long_text)) <= 200
     assert sanitize("ok") == "ok"
     assert sanitize("") == ""
-
-
-def test_module_loggers_use_dunder_name() -> None:
-    assert emuctl.log.logger.name == "emuctl.log"
-    assert logging.getLogger("emuctl.log") is emuctl.log.logger
 
 
 def test_import_is_silent_and_null_handler_idempotent(capsys) -> None:  # type: ignore[no-untyped-def]

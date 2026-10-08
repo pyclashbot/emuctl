@@ -57,7 +57,7 @@ async def wait_until(
     while True:
         now = time.monotonic()
         if now >= deadline:
-            raise OperationTimeoutError(operation=operation, deadline=budget, elapsed=now - start)
+            raise OperationTimeoutError(operation=operation, deadline=deadline, elapsed=now - start)
         result = predicate()
         if inspect.isawaitable(result):
             result = await result

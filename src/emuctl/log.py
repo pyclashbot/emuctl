@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 import re
 
 __all__ = ["sanitize"]
-
-logger = logging.getLogger(__name__)
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 

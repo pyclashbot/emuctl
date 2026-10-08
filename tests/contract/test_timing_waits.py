@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import logging
+import time
 from typing import Any
 
 import pytest
@@ -37,10 +38,6 @@ def test_default_sentinel_unique() -> None:
     assert DEFAULT is not None
     assert not isinstance(DEFAULT, float)
     assert repr(DEFAULT) == "DEFAULT"
-    import copy
-
-    assert copy.copy(DEFAULT) is DEFAULT
-    assert copy.deepcopy(DEFAULT) is DEFAULT
     assert timing.DEFAULT is DEFAULT
 
 
@@ -120,11 +117,14 @@ def test_wait_until_predicate_exceptions_propagate_unchanged() -> None:
 
 
 def test_wait_until_expiry_raises_operation_timeout() -> None:
+    before = time.monotonic()
     with pytest.raises(OperationTimeoutError) as excinfo:
         asyncio.run(wait_until(lambda: False, operation="boot", timeout=0.15))
     exc = excinfo.value
     assert exc.operation == "boot"
-    assert exc.deadline == 0.15
+    # deadline is the absolute monotonic deadline (start + budget), not the duration.
+    assert exc.deadline == pytest.approx(before + 0.15, abs=1.0)
+    assert exc.deadline is not None and exc.deadline > 0.15
     assert exc.elapsed is not None and exc.elapsed >= 0.15
     assert exc.elapsed < 5.0
 

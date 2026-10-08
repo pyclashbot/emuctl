@@ -53,6 +53,7 @@ type = "layers"
 containers = ["emuctl"]
 layers = [
   "backends",
+  # `:` = one non-independent core tier (timing→errors→waits…); `|` would forbid intra-core imports.
   "config : log : png : port : errors : timing : waits : _proc : _serials : _identification : _discovery : _platforms",
 ]
 exhaustive = true

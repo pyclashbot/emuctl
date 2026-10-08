@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any, ClassVar
 
+from emuctl.log import sanitize
+
 __all__ = [
     "EmuctlError",
     "InvalidArgumentError",
@@ -26,17 +28,6 @@ __all__ = [
     "SyncCallInsideEventLoopError",
     "resolve_error_code",
 ]
-
-_EXCERPT_LIMIT = 200
-
-
-def _sanitize(value: object, *, limit: int = _EXCERPT_LIMIT) -> str:
-    """Strip CR/LF/control characters and truncate excerpts (mirrors emuctl.log.sanitize)."""
-    text = value if isinstance(value, str) else str(value)
-    cleaned = "".join(ch for ch in text if ord(ch) >= 0x20 and ord(ch) != 0x7F)
-    if len(cleaned) > limit:
-        return cleaned[: max(limit - 3, 0)] + "..."
-    return cleaned
 
 
 def _reconstruct(cls: type[EmuctlError], state: dict[str, Any]) -> EmuctlError:
@@ -64,12 +55,10 @@ class EmuctlError(Exception):
         self.detail = detail
 
     def __str__(self) -> str:
-        parts = [
-            f"{name}={_sanitize(repr(getattr(self, name, None)))}" for name in type(self).payload
-        ]
+        parts = [f"{name}={sanitize(repr(getattr(self, name)))}" for name in type(self).payload]
         text = self.error_code if not parts else f"{self.error_code}: {', '.join(parts)}"
         if self.detail:
-            text += f": {_sanitize(self.detail)}"
+            text += f": {sanitize(self.detail)}"
         return text
 
     def __reduce__(
@@ -341,18 +330,6 @@ class EmulatorNotReadyError(EmuctlError):
         super().__init__(detail=detail)
         self.reason = reason
         self.cause = cause
-
-    def __str__(self) -> str:
-        if isinstance(self.cause, BaseException):
-            rendered = f"{type(self.cause).__name__}: {_sanitize(str(self.cause))}"
-        elif self.cause is None:
-            rendered = "None"
-        else:
-            rendered = _sanitize(repr(self.cause))
-        text = f"{self.error_code}: reason={_sanitize(repr(self.reason))}, cause={rendered}"
-        if self.detail:
-            text += f": {_sanitize(self.detail)}"
-        return text
 
 
 class ControllerClosedError(EmuctlError):
