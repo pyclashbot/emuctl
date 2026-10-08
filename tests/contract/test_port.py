@@ -311,6 +311,9 @@ def test_probe_reason_vocabulary_pinned() -> None:
     assert isinstance(PROBE_REASONS, frozenset)
     assert "ok" in PROBE_REASONS
     assert "no-adb" in PROBE_REASONS
+    # additive-only, but never speculative: "not-found" was cut until a
+    # is_reachable/probe producer emits it.
+    assert "not-found" not in PROBE_REASONS
 
 
 def test_is_reachable_default_reports_unknown_without_io() -> None:

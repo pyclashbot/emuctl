@@ -12,15 +12,16 @@ import pytest
 
 from emuctl._identification import BackendId, InstanceRef
 from emuctl._proc import ProcessExecutor, ProcessResult
-from emuctl.config.model import AdbConfig, DisplayConfig, EmuctlConfig
+from emuctl.config.model import AdbConfig, CreateSpec, DisplayConfig, EmuctlConfig
 from emuctl.errors import (
     ExecutableNotFoundError,
     FeatureNotSupportedError,
     InvalidArgumentError,
     InvalidSerialError,
+    OperationTimeoutError,
     VendorCommandError,
 )
-from emuctl.port import CapabilityFlag
+from emuctl.port import PROBE_REASONS, CapabilityFlag
 from emuctl.timing import (
     APP_TIMEOUT,
     INTERACTION_TIMEOUT,
@@ -204,6 +205,32 @@ async def test_click_count_repeats_with_interval(adb_module: Any) -> None:
 
 
 @_sync
+async def test_click_count_shares_one_deadline(adb_module: Any) -> None:
+    """§2: one deadline for the burst — later taps run on shrinking slices,
+    never on the full budget anew."""
+    calls: list[list[str]] = []
+    spy = _TimeoutSpy(_spawn=_spawn_factory(calls, _ok()))  # type: ignore[arg-type]
+    ref = InstanceRef(backend=BackendId.ADB, key=SERIAL)
+    ctl = adb_module.AdbController(ref, config=EmuctlConfig(), _executor=spy)
+    await ctl.click(1, 2, count=3)
+    assert spy.seen_all["click"][0] == INTERACTION_TIMEOUT
+    slices = spy.seen_all["click"]
+    assert len(slices) == 3
+    assert all(slice is not None and slice <= INTERACTION_TIMEOUT for slice in slices)
+    assert all((slices[i] or 0) <= (slices[i - 1] or 0) for i in range(1, len(slices)))
+
+
+@_sync
+async def test_click_count_expiry_is_typed_timeout(adb_module: Any) -> None:
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _ok())
+    with pytest.raises(OperationTimeoutError) as excinfo:
+        await ctl.click(1, 2, count=3, interval=0.09, timeout=0.05)
+    assert excinfo.value.operation == "click"
+    assert len(calls) == 1  # the interval consumed the shared deadline: no tap 2
+
+
+@_sync
 async def test_swipe_argv(adb_module: Any) -> None:
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _ok())
@@ -338,19 +365,85 @@ async def test_start_app_launch_failure_raises_before_verify(
 
 
 @_sync
-async def test_start_app_negative_verify_raises(adb_module: Any) -> None:
+async def test_start_app_slow_spawn_polls_pidof_then_succeeds(adb_module: Any) -> None:
+    """pidof negative once → positive: verify polls via wait_until under the
+    ONE shared APP budget (launch slice, then shrinking verify slices)."""
+    calls: list[list[str]] = []
+    polls = {"n": 0}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "monkey" in argv:
+            return _FakeHandle(stdout=b"events injected")
+        polls["n"] += 1
+        if polls["n"] == 1:
+            return _FakeHandle(stdout=b"", returncode=1)  # slow to spawn
+        return _FakeHandle(stdout=b"1234\n")  # now a process exists
+
+    spy = _TimeoutSpy(_spawn=_spawn_factory(calls, respond))  # type: ignore[arg-type]
+    ref = InstanceRef(backend=BackendId.ADB, key=SERIAL)
+    ctl = adb_module.AdbController(ref, config=EmuctlConfig(), _executor=spy)
+    await ctl.start_app("com.example.game", timeout=5.0)
+    verify = [c for c in calls if c[-2:] == ["pidof", "com.example.game"]]
+    assert len(verify) >= 2  # negative first, positive after polling
+    launch, probes = spy.seen_all["start_app"][0], spy.seen_all["start_app"]
+    assert launch == 5.0  # launch runs under the full resolved budget
+    assert len(probes) >= 3  # launch + negative poll + positive poll
+    assert all(budget is not None and 0 < budget <= 5.0 for budget in probes[1:])
+    # shared deadline: verify slices shrink across polls, never reset to the
+    # full budget anew (§2 one deadline per call, distributed internally).
+    assert all((probes[i] or 0) <= (probes[i - 1] or 0) for i in range(1, len(probes)))
+
+
+@_sync
+async def test_start_app_verify_poll_succeeds_leveraging_wait_until(
+    adb_module: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verify loop is the sanctioned wait_until loop — proven by a spy."""
+    calls: list[list[str]] = []
+    polls = {"n": 0}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "pidof" in argv:
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return _FakeHandle(stdout=b"", returncode=1)
+        return _FakeHandle(stdout=b"1234\n")
+
+    wait_calls: list[dict[str, Any]] = []
+
+    async def spy_wait_until(predicate: Any, *, operation: str, timeout: float) -> None:
+        wait_calls.append({"operation": operation, "timeout": timeout})
+        from emuctl.waits import wait_until as real
+
+        await real(predicate, operation=operation, timeout=timeout)
+
+    monkeypatch.setattr("emuctl.port.wait_until", spy_wait_until)
+    ctl = _make(adb_module, calls, respond)
+    await ctl.start_app("com.example.game", timeout=5.0)
+    assert wait_calls and wait_calls[0]["operation"] == "start_app"
+    assert len(wait_calls) == 1  # one wait_until loop, one shared deadline
+    assert pytest.approx(5.0, abs=0.5) == wait_calls[0]["timeout"]
+
+
+@_sync
+async def test_start_app_deadline_expiry_is_typed_timeout_never_green_pass(
+    adb_module: Any,
+) -> None:
+    """A package that never spawns polls to the shared deadline, then raises
+    the contract's typed timeout (§2: expiry never degrades to a value)."""
     calls: list[list[str]] = []
 
     def respond(argv: list[str]) -> _FakeHandle:
         if "monkey" in argv:
             return _FakeHandle(stdout=b"events injected")
-        return _FakeHandle(stdout=b"", returncode=1)  # pidof: no process
+        return _FakeHandle(stdout=b"", returncode=1)  # pidof: never spawns
 
     ctl = _make(adb_module, calls, respond)
-    with pytest.raises(VendorCommandError) as excinfo:
-        await ctl.start_app("com.example.game")
-    assert excinfo.value.output_reason == "exit"
-    assert excinfo.value.command[-2:] == ("pidof", "com.example.game")
+    with pytest.raises(OperationTimeoutError) as excinfo:
+        await ctl.start_app("com.example.ghost", timeout=0.2)
+    assert excinfo.value.operation == "start_app"
+    verify = [c for c in calls if "pidof" in c]
+    assert len(verify) > 1  # polled, not a single launch-and-hope probe
 
 
 @pytest.mark.parametrize(
@@ -498,6 +591,38 @@ async def test_is_reachable_timeout_reason(adb_module: Any) -> None:
     assert (probe.ok, probe.reason) == (False, "timeout")
 
 
+@_sync
+async def test_probe_reasons_all_stay_in_pinned_vocabulary(adb_module: Any) -> None:
+    """§1 conformance: every reason any probe path emits across this suite is
+    a member of `port.PROBE_REASONS` (the emitted vocabulary stays closed)."""
+    probe_word_out = b"emuctl\n"
+    scenarios: list[tuple[str, _FakeHandle | BaseException]] = [
+        ("ok", _FakeHandle(stdout=probe_word_out)),
+        ("offline", _FakeHandle(stdout=b"", stderr=b"adb: device offline", returncode=1)),
+        (
+            "unauthorized",
+            _FakeHandle(stdout=b"", stderr=b"error: device unauthorized", returncode=1),
+        ),
+        ("disconnected", _FakeHandle(stdout=b"", stderr=b"anything else", returncode=1)),
+        ("no-adb", FileNotFoundError("adb")),
+    ]
+    reasons: set[str] = set()
+    for expected_reason, outcome in scenarios:
+        calls: list[list[str]] = []
+        respond = (
+            (lambda argv, outcome=outcome: outcome)
+            if not isinstance(outcome, BaseException)
+            else outcome
+        )
+        ctl = _make(adb_module, calls, respond)
+        probe = await ctl.is_reachable()
+        reasons.add(probe.reason)
+        assert probe.reason == expected_reason
+    reasons.add("unknown")  # the port default (no observation seam) is data too
+    assert reasons
+    assert reasons <= PROBE_REASONS
+
+
 # ── discovery: adb devices enumeration ──
 
 
@@ -592,11 +717,13 @@ class _TimeoutSpy(ProcessExecutor):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.seen: dict[str, float | None] = {}
+        self.seen_all: dict[str, list[float | None]] = {}
 
     async def run(  # type: ignore[override]
         self, argv: Sequence[str], *, operation: str, timeout: Any = None
     ) -> ProcessResult:
         self.seen[operation] = timeout
+        self.seen_all.setdefault(operation, []).append(timeout)
         return await super().run(argv, operation=operation, timeout=timeout)
 
 
@@ -609,10 +736,20 @@ async def test_timeout_group_defaults(adb_module: Any) -> None:
     await ctl.screenshot()
     await ctl.is_app_installed("com.example.game")
     await ctl.install_apk("dist/app.apk")
-    assert spy.seen["click"] == INTERACTION_TIMEOUT
+    await ctl.start_app("com.example.game")
+    # click: one interaction deadline, distributed — the FIRST slice carries
+    # the group constant.
+    assert spy.seen_all["click"][0] == INTERACTION_TIMEOUT
     assert spy.seen["screenshot"] == SNAPSHOT_TIMEOUT
     assert spy.seen["is_app_installed"] == QUERY_TIMEOUT
     assert spy.seen["install_apk"] == APP_TIMEOUT
+    # start_app: one shared APP-group budget across launch + verify — the
+    # launch slice carries the group constant; verify slices shrink from the
+    # same deadline (never the full budget anew per subprocess).
+    budgets = spy.seen_all["start_app"]
+    assert len(budgets) >= 2  # launch + at least one verify poll
+    assert budgets[0] == APP_TIMEOUT
+    assert all(budget <= APP_TIMEOUT for budget in budgets if budget is not None)
 
 
 @_sync
@@ -665,7 +802,29 @@ async def test_plain_adb_has_no_boot_create_configure(adb_module: Any) -> None:
         await ctl.stop()
     with pytest.raises(FeatureNotSupportedError):
         await ctl.configure(None)
+    with pytest.raises(FeatureNotSupportedError) as excinfo:
+        await ctl.create(CreateSpec(name="new-vm"))
+    assert excinfo.value.feature == "create"
     assert calls == []  # gate-first: no transport touched
+
+
+def test_list_instances_ignores_cold_start_daemon_banner(adb_module: Any) -> None:
+    """Cold `adb devices` banner lines precede the header and never become
+    rows (`*` is not an allowlist serial, and banner lines are skipped
+    position-independently)."""
+    calls: list[list[str]] = []
+    scripted = (
+        b"* daemon not running; starting now at tcp:5037\n"
+        b"* daemon started successfully\n"
+        b"List of devices attached\n"
+        b"emulator-5554\tdevice\n"
+        b"ABCDEF123456\toffline\n"
+    )
+    executor = ProcessExecutor(_spawn=_spawn_factory(calls, _ok(stdout=scripted)))  # type: ignore[arg-type]
+    found = asyncio.run(adb_module.list_instances(EmuctlConfig(), _executor=executor))
+    assert calls == [[*PREFIX, "devices"]]
+    assert [str(r.ref) for r in found] == ["adb:emulator-5554", "adb:ABCDEF123456"]
+    assert not any(r.serial.startswith("*") for r in found)
 
 
 @_sync
@@ -691,15 +850,29 @@ async def test_is_reachable_after_close_reports_data(adb_module: Any) -> None:
 
 
 @_sync
-async def test_connect_builds_adb_adapter_without_io(adb_module: Any) -> None:
+async def test_connect_builds_adb_adapter_without_io(
+    adb_module: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from emuctl._discovery import connect
 
+    # Zero executor spawns during construction: bind the real production
+    # spawner with a recorder and prove connect() never reaches it (no
+    # discovery, no probe — readiness begins at first call, not at wiring).
+    spawn_calls: list[list[str]] = []
+
+    async def _recording_default_spawn(argv: Sequence[str]) -> _FakeHandle:
+        spawn_calls.append(list(argv))
+        await asyncio.sleep(3600)
+        return _FakeHandle()  # pragma: no cover — spies, never spawns
+
+    monkeypatch.setattr("emuctl._proc._default_spawn", _recording_default_spawn)
     ctl = await connect("adb:emulator-5554", config=EmuctlConfig())
     try:
         assert isinstance(ctl, adb_module.AdbController)
         assert str(ctl.identity) == "adb:emulator-5554"
     finally:
         await ctl.aclose()
+    assert spawn_calls == []  # construction + close: zero spawns, zero probes
 
 
 @_sync
