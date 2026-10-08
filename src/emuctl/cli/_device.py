@@ -41,15 +41,18 @@ import click
 from emuctl._identification import InstanceRef
 from emuctl.cli._exitmap import EXIT_OK
 from emuctl.cli._options import Options
-from emuctl.cli._render import document, emit_line, emit_raw, emit_result, json_safe
+from emuctl.cli._render import document, emit_line, emit_raw, emit_result, json_safe, shown
 from emuctl.errors import InvalidArgumentError
 from emuctl.png import png_dimensions
 from emuctl.timing import TimeoutParam
 
 __all__ = ["KEYCODE_RE", "register"]
 
-#: §5's pinned key grammar: ``^KEYCODE_[A-Z_]+$`` or bare digits.
-KEYCODE_RE: Final[re.Pattern[str]] = re.compile(r"^(?:KEYCODE_[A-Z_]+|\d+)$")
+#: §5's pinned key grammar: ``^KEYCODE_[A-Z_]+$`` or bare digits. Anchored at
+#: BOTH ends with ``\Z`` (NOT ``$``, which also matches before a trailing
+#: newline): ``"KEYCODE_HOME\n"`` and ``"66\n"`` must refuse like any other
+#: non-grammar token — §5's "anything else ⇒ usage exit 2".
+KEYCODE_RE: Final[re.Pattern[str]] = re.compile(r"^(?:KEYCODE_[A-Z_]+|\d+)\Z")
 
 
 def _keycode_or_refuse(token: str) -> str:
@@ -73,12 +76,8 @@ def _result(verb: str, target: str, payload: Mapping[str, Any]) -> dict[str, Any
 
 def _human(verb: str, target: str, payload: Mapping[str, Any]) -> str:
     """The human-mode echo of one verb (never colored, never a secret)."""
-    details = " ".join(f"{key}={_shown(value)}" for key, value in payload.items())
+    details = " ".join(f"{key}={shown(value)}" for key, value in payload.items())
     return f"{verb} {target}" + (f" {details}" if details else "")
-
-
-def _shown(value: object) -> str:
-    return "unknown" if value is None else str(value)
 
 
 def _write_file(path: str, data: bytes) -> None:

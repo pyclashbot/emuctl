@@ -51,6 +51,7 @@ __all__ = [
     "error_object",
     "json_safe",
     "render_suggestion",
+    "shown",
 ]
 
 #: §5's output-contract anchor: every pinned JSON document carries it.
@@ -125,6 +126,22 @@ def json_safe(value: object) -> object:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [json_safe(item) for item in value]
     return sanitize(str(value))
+
+
+def shown(value: object) -> str:
+    """Human rendering of one observed value (never a Python repr).
+
+    The ONE value-projection site for every human channel (the ``list`` table,
+    the probe state line, the verb echoes): ``None`` reads ``unknown`` (a
+    missing observation, not an invention — §3's honesty rule), a bool reads
+    ``yes``/``no`` (association with the RUNNING column's pinned vocabulary),
+    and everything else is ``str()``. Never colored, never a repr.
+    """
+    if value is None:
+        return "unknown"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
 
 
 def render_suggestion(exc: BaseException) -> str:

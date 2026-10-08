@@ -61,7 +61,14 @@ from emuctl._platforms import current_platform
 from emuctl.cli._exitmap import EXIT_BROKEN_PIPE, EXIT_OK, EXIT_SIGINT
 from emuctl.cli._exitmap import exit_for as _exit_for
 from emuctl.cli._options import Options
-from emuctl.cli._render import PipeClosed, document, emit_error, emit_line, emit_result
+from emuctl.cli._render import (
+    PipeClosed,
+    document,
+    emit_error,
+    emit_line,
+    emit_result,
+    shown,
+)
 from emuctl.errors import EmuctlError, InvalidArgumentError
 from emuctl.log import sanitize
 from emuctl.port import CapabilityFlag
@@ -130,7 +137,7 @@ def _human_table(rows: Sequence[Mapping[str, Any]]) -> str:
 
     def cell(row: Mapping[str, Any], column: str) -> str:
         if column == "running":
-            return "yes" if row["running"] else "no"
+            return shown(row["running"])
         if column == "platform":
             return ",".join(row["platform"])
         return str(row[column]) if row[column] is not None else "-"
@@ -179,16 +186,20 @@ def _version_string() -> str:
 
 
 def _human_probe(document: Mapping[str, Any]) -> str:
-    """The human-mode ``probe`` rendering (never colored)."""
+    """The human-mode ``probe`` rendering (never colored).
+
+    The supported-platform list reads from the SAME document field the JSON
+    path emits (the TARGET backend's list), so the two renderings cannot
+    diverge (D3: one probe observation, one projection)."""
     target = document["target"]
     platform = document["platform"]
     state = document["state"]
-    supported = ",".join(_platform_map().get(target["backend"], []))
+    supported = ",".join(platform["supported"])
     lines = [
         f"backend: {target['backend']}",
         f"target: {target['backend']}:{target['key']}",
         f"platform: os={platform['os']} supported={supported}",
-        "state: " + " ".join(f"{key}={_shown(value)}" for key, value in state.items()),
+        "state: " + " ".join(f"{key}={shown(value)}" for key, value in state.items()),
         "features:",
     ]
     lines.extend(
@@ -196,15 +207,6 @@ def _human_probe(document: Mapping[str, Any]) -> str:
         for row in document["features"]
     )
     return "\n".join(lines)
-
-
-def _shown(value: object) -> str:
-    """Human rendering of one observed value (never a Python repr)."""
-    if value is None:
-        return "unknown"
-    if isinstance(value, bool):
-        return "yes" if value else "no"
-    return str(value)
 
 
 # ── the group + global options ──
@@ -346,7 +348,7 @@ async def _probe(options: Options, target: str) -> int:
     probe_document = document(
         backend=ref.backend.value,
         target={"backend": ref.backend.value, "key": ref.key},
-        platform={"os": current_platform().value, "supported": _platform_map()},
+        platform={"os": current_platform().value, "supported": _supported_platforms(ref.backend)},
         state=state,
         features=_features(controller),
     )
@@ -407,7 +409,11 @@ async def run(argv: Sequence[str] | None = None) -> int:
         wrapped = EmuctlError(detail=sanitize(exc.format_message()))
         emit_error(wrapped)
         return _exit_for(wrapped)
-    except BaseException as exc:  # noqa: BLE001 - the CLI IS the process boundary
+    except Exception as exc:
+        # Deliberately NOT ``BaseException``: §2 — cancellation is never caught,
+        # rewrapped, or logged as an error. ``CancelledError`` (and the other
+        # control-flow ``BaseException``s) must propagate to the caller's own
+        # cancellation; only real failures render the error object.
         emit_error(exc)
         return _exit_for(exc)
 

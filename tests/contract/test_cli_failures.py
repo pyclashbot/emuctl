@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import json
+import re
 import subprocess
 import sys
 import textwrap
 from collections.abc import Generator, Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -64,6 +67,25 @@ from ._clifake import (
 
 ADB = "adb:emulator-5554"
 MEMU = "memu:pyclashbot-136"
+
+#: The suite's own location on disk — the docstring-anchor and ledger parses
+#: below read the REAL sources of truth (not copies).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_ERRORS_SOURCE = _REPO_ROOT / "src" / "emuctl" / "errors.py"
+_LEDGER = _REPO_ROOT / "docs" / "archive" / "CONTRACTS.md"
+
+
+def _anchored_exits() -> dict[str, int]:
+    """Every ``<code> → exit N`` anchor parsed from ``errors.py``'s docstrings."""
+    text = _ERRORS_SOURCE.read_text(encoding="utf-8")
+    return {
+        code: int(exit_number)
+        for code, exit_number in re.findall(r"([a-z][a-z0-9_]*) → exit (\d+)", text)
+    }
+
+
+#: Anchors, frozen once at import so the parametrization below is eager.
+ANCHORED_EXITS: dict[str, int] = _anchored_exits()
 
 #: Every taxonomy class with a constructible payload set and its pinned code.
 TAXONOMY_CASES: tuple[tuple[type[EmuctlError], dict[str, Any], str], ...] = (
@@ -217,36 +239,53 @@ def test_pinned_code_maps_to_its_pinned_exit(code: str, expected: int) -> None:
     assert ERROR_EXITS[code] == expected
 
 
-def test_pinned_exits_are_exactly_the_contract_table() -> None:
-    """§2's exit table, restated: the mapping is a frozen, single-site artifact."""
-    assert ERROR_EXITS == {
-        # exit 2 · usage
-        "invalid_argument": 2,
-        "invalid_serial": 2,
-        "backend_not_found": 2,
-        "sync_call_inside_loop": 2,
-        # exit 3 · environment
-        "extras_missing": 3,
-        "executable_not_found": 3,
-        "config": 3,
-        "config_validation": 3,
-        # exit 4 · not found
-        "instance_not_found": 4,
-        # exit 5 · unsupported
-        "feature_not_supported": 5,
-        "backend_not_available": 5,
-        # exit 6 · state
-        "not_ready": 6,
-        "controller_closed": 6,
-        "ambiguous_target": 6,
-        # exit 7 · deadline
-        "timeout": 7,
-        # exit 8 · transport
-        "vendor_command_failed": 8,
-        "device_state": 8,
-        # exit 1 · general (the root code)
-        "emuctl_error": EXIT_GENERAL,
-    }
+@pytest.mark.parametrize(("code", "expected"), sorted(ANCHORED_EXITS.items()))
+def test_exit_map_matches_the_anchors_in_errors_docstrings(code: str, expected: int) -> None:
+    """§2 (D5): every ``<code> → exit N`` anchor written into ``emuctl/errors.py``'s
+    docstrings is honored by the single-site table — no doc/table drift."""
+    assert ERROR_EXITS[code] == expected
+
+
+def test_anchors_cover_exactly_the_tree_minus_the_root() -> None:
+    """The anchor parse is not a silent subset: every tree code but the root
+    carries a docstring anchor (the root's exit is the ledger's, below)."""
+    assert set(ANCHORED_EXITS) == _tree_codes() - {"emuctl_error"}
+
+
+def test_exit_table_matches_the_archive_ledger() -> None:
+    """§2 (D5/D6): the WHOLE single-site table against the archive ledger
+    (``docs/archive/CONTRACTS.md``: "0 ok · 1 general ... · 2 usage (...)·...").
+    The expected mapping is PARSED from the ledger, never restated."""
+    text = _LEDGER.read_text(encoding="utf-8")
+    line = next(candidate for candidate in text.splitlines() if "2 usage (" in candidate)
+    ledger: dict[str, int] = {}
+    for segment in line.split("·"):
+        header = re.match(r"\s*(\d+)\s+[a-z_]+", segment)
+        if header is None:
+            continue
+        band = int(header.group(1))
+        for code in re.findall(r"`([a-z_]+)`", segment):
+            assert code not in ledger  # no ledger code listed under two bands
+            ledger[code] = band
+    assert set(ERROR_EXITS) == set(ledger) | {"emuctl_error"}
+    for code, band in ledger.items():
+        assert ERROR_EXITS[code] == band
+
+
+def test_root_exits_one_per_the_ledger() -> None:
+    """The root code has no docstring anchor of its own; its exit is pinned to
+    ``EXIT_GENERAL`` against the ledger quote "1 general (base root / unknown
+    code)" — at THIS one site only."""
+    assert "1 general (base root / unknown code)" in _LEDGER.read_text(encoding="utf-8")
+    assert ERROR_EXITS["emuctl_error"] == EXIT_GENERAL
+
+
+def test_error_exits_is_frozen() -> None:
+    """§2: "Exit numbers live in one site" — the table is read-only at import
+    (no caller can remap an exit under the CLI's feet)."""
+    mapping: Any = ERROR_EXITS
+    with pytest.raises(TypeError):
+        mapping["invalid_argument"] = 9
 
 
 def test_unmapped_code_exits_nine() -> None:
@@ -318,8 +357,8 @@ def test_error_objects_are_emitted_without_the_json_flag(monkeypatch: pytest.Mon
     error is empty."""
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
-    code, out, err = _run(["key", ADB, "home"])
-    assert code == 2
+    code, out, err = _run(["--no-config", "key", ADB, "home"])
+    assert code == ERROR_EXITS["invalid_argument"]
     assert out == ""
     assert _error(err)["code"] == "invalid_argument"
 
@@ -331,7 +370,7 @@ def test_absent_target_error_object_is_pasteable(
     calls: list[list[str]] = []
     install_transport(monkeypatch, memu_transport(calls, vms=b"0,other,MEmu,1,1\n"))
     code, _, err = _run(["--no-config", "click", MEMU, "1", "2"])
-    assert code == 4
+    assert code == ERROR_EXITS["instance_not_found"]
     assert "emuctl list" in _error(err)["suggestion"]
 
 
@@ -340,8 +379,8 @@ def test_platform_unsupported_backend_exits_five(monkeypatch: pytest.MonkeyPatch
     from emuctl.backends import _registry
 
     monkeypatch.setattr(_registry, "current_platform", lambda: Platform.MACOS)
-    code, out, err = _run(["start", MEMU])
-    assert code == 5
+    code, out, err = _run(["--no-config", "start", MEMU])
+    assert code == ERROR_EXITS["backend_not_available"]
     assert out == ""
     assert _error(err)["code"] == "backend_not_available"
 
@@ -367,9 +406,9 @@ def test_unsupported_feature_exits_five(monkeypatch: pytest.MonkeyPatch) -> None
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
     for verb in ("start", "stop", "restart", "configure"):
-        argv = [verb, ADB] + (["set", "display.width", "800"] if verb == "configure" else [])
-        code, out, err = _run(argv)
-        assert code == 5, verb
+        argv_tail = ["set", "display.width", "800"] if verb == "configure" else []
+        code, out, err = _run(["--no-config", verb, ADB] + argv_tail)
+        assert code == ERROR_EXITS["feature_not_supported"], verb
         assert out == ""
         assert _error(err)["code"] == "feature_not_supported"
     assert calls == []  # gate-first: no transport was ever touched
@@ -378,8 +417,8 @@ def test_unsupported_feature_exits_five(monkeypatch: pytest.MonkeyPatch) -> None
 def test_vendor_failure_exits_eight(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
     install_transport(monkeypatch, spawn_from(calls, lambda argv: failing()))
-    code, out, err = _run(["click", ADB, "1", "2"])
-    assert code == 8
+    code, out, err = _run(["--no-config", "click", ADB, "1", "2"])
+    assert code == ERROR_EXITS["vendor_command_failed"]
     assert out == ""
     assert _error(err)["code"] == "vendor_command_failed"
 
@@ -396,7 +435,7 @@ def test_deadline_expiry_exits_seven(monkeypatch: pytest.MonkeyPatch, windows_ho
 
     install_transport(monkeypatch, spawn_from(calls, respond))
     code, out, err = _run(["--no-config", "start", MEMU, "--timeout", "0.05"])
-    assert code == 7
+    assert code == ERROR_EXITS["timeout"]
     assert out == ""
     assert _error(err)["code"] == "timeout"
 
@@ -410,7 +449,7 @@ def test_unexpected_internal_error_exits_nine(monkeypatch: pytest.MonkeyPatch) -
         return RuntimeError("internal boom")
 
     install_transport(monkeypatch, spawn_from(calls, respond))
-    code, out, err = _run(["click", ADB, "1", "2"])
+    code, out, err = _run(["--no-config", "click", ADB, "1", "2"])
     assert code == EXIT_UNMAPPED
     assert out == ""
     error = _error(err)
@@ -426,7 +465,7 @@ def test_config_value_that_is_not_typed_exits_three(
     calls: list[list[str]] = []
     install_transport(monkeypatch, memu_transport(calls))
     code, out, err = _run(["--no-config", "configure", MEMU, "set", "display.width", "abc"])
-    assert code == 3
+    assert code == ERROR_EXITS["config_validation"]
     assert out == ""
     assert _error(err)["code"] == "config_validation"
     assert calls == []  # the refusal fires before any vendor argv
@@ -439,7 +478,7 @@ def test_unknown_canonical_leaf_exits_two(
     calls: list[list[str]] = []
     install_transport(monkeypatch, memu_transport(calls))
     code, out, err = _run(["--no-config", "configure", MEMU, "set", "not.a.leaf", "1"])
-    assert code == 2
+    assert code == ERROR_EXITS["invalid_argument"]
     assert out == ""
     assert _error(err)["code"] == "invalid_argument"
     assert calls == []
@@ -457,7 +496,7 @@ def test_sigint_maps_to_130_with_no_traceback(monkeypatch: pytest.MonkeyPatch) -
         raise KeyboardInterrupt
 
     install_transport(monkeypatch, spawn_from(calls, respond))
-    code, out, err = _run(["click", ADB, "1", "2"])
+    code, out, err = _run(["--no-config", "click", ADB, "1", "2"])
     assert code == EXIT_SIGINT
     assert out == ""
     assert "Traceback" not in err
@@ -473,7 +512,7 @@ def test_sigint_through_the_sync_entry(monkeypatch: pytest.MonkeyPatch) -> None:
         raise KeyboardInterrupt
 
     install_transport(monkeypatch, spawn_from(calls, respond))
-    assert main(["click", ADB, "1", "2"]) == EXIT_SIGINT
+    assert main(["--no-config", "click", ADB, "1", "2"]) == EXIT_SIGINT
 
 
 def test_broken_pipe_on_the_raw_bytes_path_exits_141_silently(
@@ -483,7 +522,7 @@ def test_broken_pipe_on_the_raw_bytes_path_exits_141_silently(
     with no traceback and no stderr noise."""
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
-    code, err = _run_broken(["screenshot", ADB, "--stdout"])
+    code, err = _run_broken(["--no-config", "screenshot", ADB, "--stdout"])
     assert code == EXIT_BROKEN_PIPE
     assert err == ""
     assert "Traceback" not in err
@@ -493,7 +532,7 @@ def test_broken_pipe_on_a_text_result_exits_141_silently(monkeypatch: pytest.Mon
     """The same discipline on the text paths (``emuctl list | head -1``)."""
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
-    code, err = _run_broken(["list"])
+    code, err = _run_broken(["--no-config", "list"])
     assert code == EXIT_BROKEN_PIPE
     assert err == ""
 
@@ -513,11 +552,11 @@ def test_main_inside_a_running_loop_refuses_and_names_amain(
             return main(["version"]), out.text, err.text
 
     code, out, err = asyncio.run(inside_loop())
-    assert code == 2
+    assert code == ERROR_EXITS["sync_call_inside_loop"]
     assert out == ""
     error = _error(err)
     assert error["code"] == "sync_call_inside_loop"
-    assert error["exit"] == 2
+    assert error["exit"] == ERROR_EXITS["sync_call_inside_loop"]
     assert "amain" in error["message"]
     # §7.9: the suggestion is the CLASS template, rendered — never a ctor baked one
     assert error["suggestion"] == _LoopError.suggestion
@@ -669,7 +708,7 @@ _PIPE_SCRIPT = textwrap.dedent(
 
     from emuctl.cli import main
 
-    sys.exit(main(["screenshot", "adb:emulator-5554", "--stdout"]))
+    sys.exit(main(["--no-config", "screenshot", "adb:emulator-5554", "--stdout"]))
     '''
 )
 
@@ -691,3 +730,98 @@ def test_a_real_closed_pipe_closes_cleanly() -> None:
     assert child.returncode in (141, -signal.SIGPIPE), child.returncode
     assert b"Traceback" not in stderr
     assert b"BrokenPipeError" not in stderr
+
+
+# ── cancellation is never caught, rewrapped, or logged as an error (§2) ──
+
+
+def test_cancellation_mid_op_propagates_and_is_never_an_error_object(
+    monkeypatch: pytest.MonkeyPatch,
+    windows_host: Any,
+) -> None:
+    """§2: cancellation is "never caught, rewrapped, or logged as an error".
+    ``run()``'s funnel catches ``Exception`` — NOT ``BaseException`` — so a
+    ``task.cancel()`` mid-operation propagates ``CancelledError`` out of
+    ``amain`` with NO error object on stderr, NO stdout noise, and NO exit
+    number fabricated for it."""
+    calls: list[list[str]] = []
+    install_transport(monkeypatch, spawn_from(calls, lambda argv: HangingHandle()))
+
+    async def scenario() -> tuple[str, str]:
+        with _captured() as (out, err):
+            task = asyncio.create_task(amain(["--no-config", "start", MEMU, "--timeout", "60"]))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return out.text, err.text
+
+    stdout_text, stderr_text = asyncio.run(scenario())
+    assert stderr_text == ""
+    assert stdout_text == ""
+
+
+# ── version resolves NO config (§5's cheap early probe) ──
+
+
+def test_version_resolves_no_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A broken config file cannot fail ``version`` — it never resolves the
+    §4 chain, so ``--config /nonexistent`` exits 0 with stderr clean."""
+    code, out, err = _run(["--config", "/nonexistent/emuctl.toml", "version"])
+    assert code == EXIT_OK
+    assert err == ""
+    assert out.startswith("emuctl ")
+
+
+# ── no ANSI color anywhere (§5: "non-TTY ⇒ no color", trivially always) ──
+
+
+def test_no_ansi_escape_reaches_either_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ``\\x1b`` in stdout or stderr across a human run AND a JSON run (and
+    an error path) — the never-colored promise, byte-level."""
+    calls: list[list[str]] = []
+    install_transport(monkeypatch, adb_transport(calls))
+    for argv in (
+        ["--no-config", "list"],
+        ["--json", "--no-config", "list"],
+        ["--no-config", "key", ADB, "home"],  # an error path
+    ):
+        code, out, err = _run(argv)
+        assert "\x1b" not in out, argv
+        assert "\x1b" not in err, argv
+
+
+# ── ConfigWarning rendering (§4: "the CLI surface renders these for the user") ──
+
+
+def test_config_warnings_render_as_notes_on_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A config file with an unknown key warns on stderr (the note names the
+    key) and the unknown key is IGNORED — the command still succeeds with
+    exactly one document on stdout and stderr carries nothing else."""
+    conf = tmp_path / "emuctl.toml"
+    conf.write_text("[display]\nwidht = 800\n", encoding="utf-8")
+    calls: list[list[str]] = []
+    install_transport(monkeypatch, adb_transport(calls))
+    code, out, err = _run(["--config", str(conf), "--json", "click", ADB, "1", "2"])
+    assert code == EXIT_OK, err
+    assert len(out.splitlines()) == 1  # exactly one document, no note on stdout
+    assert "warning: unknown config key" in err
+    assert "display.widht" in err
+    # the note is not doubled: the resolved config is folded exactly once
+    assert err.count("display.widht") == 1
+
+
+# ── the console-script entry point, pinned at metadata level ──
+
+
+def test_console_script_entry_point_is_pinned() -> None:
+    """§5: "Console script in the core distribution" — the installed metadata
+    must expose ``emuctl = "emuctl.cli:main"`` under ``console_scripts``
+    (importlib.metadata view of ``pyproject``'s ``[project.scripts]``)."""
+    eps = importlib.metadata.entry_points(group="console_scripts")
+    chosen = [ep for ep in eps if ep.name == "emuctl"]
+    assert len(chosen) == 1
+    assert chosen[0].value == "emuctl.cli:main"

@@ -29,8 +29,12 @@ exit             ``error_code``
 
 §2 also pins the drift test: "A CI drift test walks the class tree and asserts
 every ``error_code`` has a table entry — no reverse-map artifact to maintain."
-That test lives in ``tests/contract/test_cli.py`` (every code in this table is
-reachable from ``EmuctlError`` and vice versa).
+That test lives in ``tests/contract/test_cli_failures.py``
+(``test_exit_map_covers_every_error_code_in_the_tree`` walks the tree in both
+directions; ``test_exit_map_matches_the_anchors_in_errors_docstrings`` parses
+the ``<code> → exit N`` docstring anchors of ``emuctl/errors.py``; the root's
+exit 1 is pinned to ``EXIT_GENERAL`` against the ledger's "1 general (base
+root / unknown code)").
 """
 
 from __future__ import annotations

@@ -316,12 +316,30 @@ def test_key_accepts_the_pinned_grammar(
 ) -> None:
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
-    code, out, _ = _run(["key", ADB, token])
+    code, out, _ = _run(["--no-config", "key", ADB, token])
     assert code == EXIT_OK, out
     assert calls[-1][-2:] == ["keyevent", ok_token]
 
 
-@pytest.mark.parametrize("token", ["home", "KEYCODE_home", "KEYCODE_", "1a", "h ome", "", "HOME"])
+@pytest.mark.parametrize(
+    "token",
+    [
+        "home",
+        "KEYCODE_home",
+        "KEYCODE_",
+        "1a",
+        "h ome",
+        "",
+        "HOME",
+        # trailing whitespace must refuse too (§5: ``^...$`` means the WHOLE
+        # token — the regex anchors at ``\Z``, not at the pre-``$`` newline):
+        "KEYCODE_HOME\n",
+        "66\n",
+        "KEYCODE_HOME\r",
+        "66\r",
+        "KEYCODE_HOME\t",
+    ],
+)
 def test_key_refuses_anything_else_as_usage_exit_two(
     monkeypatch: pytest.MonkeyPatch, token: str
 ) -> None:
@@ -329,7 +347,7 @@ def test_key_refuses_anything_else_as_usage_exit_two(
     the grammar and the escaping route, and no vendor argv ever runs."""
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
-    code, out, err = _run(["key", ADB, token])
+    code, out, err = _run(["--no-config", "key", ADB, token])
     assert code == 2
     assert out == ""
     assert calls == []
@@ -344,7 +362,7 @@ def test_key_refuses_anything_else_as_usage_exit_two(
 def test_click_verb(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
-    code, out, _ = _run(["--json", "click", ADB, "100", "200"])
+    code, out, _ = _run(["--no-config", "--json", "click", ADB, "100", "200"])
     assert code == EXIT_OK
     document = _doc(out)
     assert document["schema_version"] == 1
@@ -372,7 +390,7 @@ def test_click_verb(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_click_count_and_interval_repeat_one_tap_per_count(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
-    code, _, _ = _run(["click", ADB, "5", "6", "--count", "3", "--interval", "0"])
+    code, _, _ = _run(["--no-config", "click", ADB, "5", "6", "--count", "3", "--interval", "0"])
     assert code == EXIT_OK
     assert (
         calls
@@ -400,7 +418,7 @@ def test_swipe_verb(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
     code, out, _ = _run(
-        ["--json", "swipe", ADB, "1", "2", "3", "4", "--duration-ms", "500"],
+        ["--no-config", "--json", "swipe", ADB, "1", "2", "3", "4", "--duration-ms", "500"],
     )
     assert code == EXIT_OK
     assert _doc(out)["result"]["duration_ms"] == 500
@@ -411,7 +429,7 @@ def test_text_passes_through_verbatim_and_is_never_echoed(monkeypatch: pytest.Mo
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
     secret = "1337 4242"  # noqa: S105 - a typed PIN, not a credential
-    code, out, _ = _run(["--json", "text", ADB, secret])
+    code, out, _ = _run(["--no-config", "--json", "text", ADB, secret])
     assert code == EXIT_OK
     # escaping is the ADB mechanic's (§1/§4), verified here only as passthrough
     assert calls[-1][-2:] == ["text", "1337%s4242"]
@@ -423,7 +441,7 @@ def test_text_passes_through_verbatim_and_is_never_echoed(monkeypatch: pytest.Mo
 def test_app_start_launch_and_verify(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
-    code, out, _ = _run(["--json", "app", "start", ADB, "com.example.game"])
+    code, out, _ = _run(["--no-config", "--json", "app", "start", ADB, "com.example.game"])
     assert code == EXIT_OK
     assert _doc(out)["command"] == "app start"
     assert _doc(out)["result"] == {"package": "com.example.game", "started": True}
@@ -445,7 +463,7 @@ def test_app_installed_reports_the_observation(
 ) -> None:
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls, installed=pm_out))
-    code, out, _ = _run(["--json", "app", "installed", ADB, "com.example.game"])
+    code, out, _ = _run(["--no-config", "--json", "app", "installed", ADB, "com.example.game"])
     assert code == EXIT_OK
     assert _doc(out)["result"] == {"package": "com.example.game", "installed": installed}
     assert calls[-1][-4:] == ["pm", "list", "packages", "com.example.game"]
@@ -456,7 +474,7 @@ def test_screenshot_stdout_emits_raw_png_only(monkeypatch: pytest.MonkeyPatch) -
     no wrapper, no base64, no trailing newline."""
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls, screencap=PNG + b"tail-bytes"))
-    code, recorder, _ = _run_raw(["screenshot", ADB, "--stdout"])
+    code, recorder, _ = _run_raw(["--no-config", "screenshot", ADB, "--stdout"])
     assert code == EXIT_OK
     assert recorder.raw == PNG + b"tail-bytes"
     assert recorder.text == ""  # no wrapper document, no base64, no newline
@@ -470,7 +488,7 @@ def test_screenshot_output_writes_the_file_and_reports_geometry(
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
     destination = tmp_path / "frame.png"
-    code, out, err = _run(["--json", "screenshot", ADB, "-o", str(destination)])
+    code, out, err = _run(["--no-config", "--json", "screenshot", ADB, "-o", str(destination)])
     assert code == EXIT_OK, err
     assert destination.read_bytes() == PNG
     document = _doc(out)
@@ -491,7 +509,7 @@ def test_screenshot_output_overwrites_an_existing_file(
     install_transport(monkeypatch, adb_transport(calls))
     destination = tmp_path / "frame.png"
     destination.write_bytes(b"stale-contents")
-    code, _, _ = _run(["screenshot", ADB, "-o", str(destination)])
+    code, _, _ = _run(["--no-config", "screenshot", ADB, "-o", str(destination)])
     assert code == EXIT_OK
     assert destination.read_bytes() == PNG
 
@@ -503,7 +521,9 @@ def test_screenshot_output_to_an_unopenable_path_is_an_unmapped_refusal(
     pinned error object (never a traceback, never a silent success)."""
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
-    code, out, err = _run(["--json", "screenshot", ADB, "-o", "/nonexistent-dir/frame.png"])
+    code, out, err = _run(
+        ["--no-config", "--json", "screenshot", ADB, "-o", "/nonexistent-dir/frame.png"]
+    )
     assert code == 9
     assert out == ""
     error = _error(err)
@@ -615,7 +635,8 @@ def test_probe_document_is_the_pinned_shape(monkeypatch: pytest.MonkeyPatch) -> 
     assert document["backend"] == "adb"
     assert document["target"] == {"backend": "adb", "key": SERIAL}
     assert document["platform"]["os"]
-    assert document["platform"]["supported"]["adb"] == ["linux", "macos", "windows"]
+    # D3: supported is the TARGET backend's list — for adb, the three platforms.
+    assert document["platform"]["supported"] == ["linux", "macos", "windows"]
     assert document["state"]["reachable"] == "ok"
     assert document["state"]["running"] is True
     assert document["state"]["adb_state"] == "device"
@@ -625,6 +646,34 @@ def test_probe_document_is_the_pinned_shape(monkeypatch: pytest.MonkeyPatch) -> 
     assert features[0] == {"flag": "apk_install", "present": True}
     assert all(set(row) == {"flag", "present"} for row in features)
     assert {"flag": "boot", "present": False} in features  # plain ADB has no BOOT
+
+    # D3, human channel: the supported list reads the SAME document field, so
+    # the two renderings cannot disagree about the target's platforms.
+    _, human_out, human_err = _run(["--no-config", "probe", ADB])
+    assert human_err == ""
+    assert "platform: os=" in human_out
+    assert "supported=linux,macos,windows" in human_out
+
+
+def test_probe_platform_supported_names_the_target_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    windows_host: Any,
+) -> None:
+    """D3 divergence pin: probing a windows-only backend must report THAT
+    backend's supported list in both renderings — not the whole platform map
+    (which would leak adb's three-platform list into a MEmu probe)."""
+    calls: list[list[str]] = []
+    install_transport(monkeypatch, memu_transport(calls, vms=MEMU_VMS))
+
+    code, out, err = _run(["--json", "--no-config", "probe", MEMU])
+    assert code == EXIT_OK, err
+    assert _doc(out)["platform"]["supported"] == ["windows"]
+
+    code, out, err = _run(["--no-config", "probe", MEMU])
+    assert code == EXIT_OK, err
+    assert "platform: os=" in out
+    assert "supported=windows" in out
+    assert "supported=linux,macos,windows" not in out  # the divergence, refused
 
 
 def test_probe_reports_unreachable_as_data(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -650,7 +699,7 @@ def test_probe_reports_unreachable_as_data(monkeypatch: pytest.MonkeyPatch) -> N
 def test_probe_of_an_absent_instance_reports_nulls(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls, devices=b"List of devices attached\n"))
-    code, out, _ = _run(["--json", "probe", ADB])
+    code, out, _ = _run(["--no-config", "--json", "probe", ADB])
     assert code == EXIT_OK
     state = _doc(out)["state"]
     assert state["running"] is None and state["adb_state"] is None
@@ -771,7 +820,11 @@ def test_the_entry_points_drive_one_tree() -> None:
     from emuctl.cli._commands import cli
 
     assert cli is cli_group
-    assert set(cli.commands) >= set(PINNED_VERBS)
+    # D7: the surface is EXACTLY the pinned verb set — no spy verb, no gap —
+    # and the app group's subverbs too.
+    assert set(cli.commands) == set(PINNED_VERBS)
+    app_group: Any = cli.commands["app"]
+    assert set(app_group.commands) == {"start", "installed"}
 
 
 def test_cli_runner_reports_usage_errors_as_exit_two() -> None:
@@ -789,15 +842,26 @@ def test_main_returns_the_exit_number(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_screenshot_stdout_refuses_json_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
-    """§5 pins the refusal from both spellings of ``--json``: the raw-bytes path
-    cannot carry a JSON document."""
+    """§5 pins the refusal from the ONLY ``--json`` spelling that exists: it is
+    a GROUP option (§5's grammar put it on the top line), so the group-level
+    argv is the real refusal path for "a raw-bytes path cannot carry a JSON
+    wrapper". The per-verb spelling (``screenshot … --json``) has no such
+    option — it hits click's UNKNOWN-OPTION usage refusal, a distinct message
+    (D9: don't mistake the two paths for the same pin)."""
     calls: list[list[str]] = []
     install_transport(monkeypatch, adb_transport(calls))
-    for argv in (
-        ["--json", "screenshot", ADB, "--stdout"],
-        ["screenshot", ADB, "--json", "--stdout"],
-    ):
-        code, out, err = _run(argv)
-        assert code == 2
-        assert out == ""
-        assert json.loads(err.splitlines()[-1])["error"]["code"] == "invalid_argument"
+    code, out, err = _run(["--json", "screenshot", ADB, "--stdout"])
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    error = json.loads(err.splitlines()[-1])["error"]
+    assert error["code"] == "invalid_argument"
+    assert "--stdout" in error["message"]  # the typed refusal names the conflict
+
+    code, out, err = _run(["screenshot", ADB, "--json", "--stdout"])
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    verb_spelling = json.loads(err.splitlines()[-1])["error"]
+    assert "No such option" in verb_spelling["message"]  # a different refusal
+    assert verb_spelling["message"] != error["message"]
