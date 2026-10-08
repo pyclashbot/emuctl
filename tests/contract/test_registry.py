@@ -189,7 +189,10 @@ def test_refusal_missing_dep_last(
     reg: Any, no_backend_imports: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # MEMU on Windows without pymemuc: the dep refusal names the extra.
+    # Hermetic: stub the registry's dep-probe seam so the missing-dep path is
+    # simulated regardless of whether the dep is installed locally.
     monkeypatch.setattr(reg, "current_platform", lambda: Platform.WINDOWS)
+    monkeypatch.setattr(reg, "_dep_available", lambda name: False)
     assert "pymemuc" not in sys.modules
     with pytest.raises(ExtrasMissingError) as excinfo:
         reg.resolve_backend(BackendId.MEMU)
@@ -210,6 +213,10 @@ def test_find_spec_honesty(
 
     def spy(name: str, *args: Any, **kwargs: Any) -> Any:
         calls.append(name)
+        # Hermetic: simulate the [memu] extra's absence regardless of the
+        # local package store, while still spying real find_spec names.
+        if name == "pymemuc":
+            return None
         return real_find_spec(name, *args, **kwargs)
 
     monkeypatch.setattr("importlib.util.find_spec", spy)
