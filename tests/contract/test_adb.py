@@ -605,6 +605,8 @@ async def test_probe_reasons_all_stay_in_pinned_vocabulary(adb_module: Any) -> N
         ),
         ("disconnected", _FakeHandle(stdout=b"", stderr=b"anything else", returncode=1)),
         ("no-adb", FileNotFoundError("adb")),
+        # the promoted shared probe (port.AdbController) is what runs: pin
+        # the classifier lives core-side and is inherited, not a private copy
     ]
     reasons: set[str] = set()
     for expected_reason, outcome in scenarios:

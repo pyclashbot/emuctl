@@ -6,9 +6,9 @@ second middle layer"), carrying the interaction primitives, the scoping
 machinery, and the mechanics once over raw ADB. THIS module is the thin
 concrete plain-ADB adapter: a subclass binding the transport construction
 (§1: ``config.adb`` is the ONLY system-server selector), the declared
-FEATURES set, the concrete ``_vendor_run`` through the ``_proc.py`` executor,
-the ``is_reachable`` transport probe, and the module-level
-``BackendDiscovery`` seam (discovery is backend-specific; it stays here).
+FEATURES set, the concrete ``_vendor_run`` through the ``_proc.py`` executor, and the
+module-level ``BackendDiscovery`` seam (discovery is backend-specific; it
+stays here).
 
 The registry pins this module's ``adapter_attr`` to ``"AdbController"``, so
 this class doubles as the plain-ADB concrete adapter; future ADB-speaking
@@ -23,11 +23,12 @@ Interpretation decisions (CONTRACT wins; these fill its silences):
 - ``_vendor_run`` is always device-scoped (auto ``-s``; the scoping argv
   machinery is inherited core-side). Module-level discovery (``adb devices``)
   bypasses it through the runner with ``server_verb=True``.
-- ``is_reachable()`` probes ``shell echo emuctl`` (device-scoped) and maps
-  the outcome to data only: rc 0 → ``("ok")``; nonzero → stderr-token scan
-  (``unauthorized``/``offline``/``disconnected`` — stderr, never stdout);
-  missing binary → ``"no-adb"``; budget expiry → ``"timeout"``. stdout is
-  never parsed for the decision. ``CancelledError`` propagates unmodified.
+- ``is_reachable()`` is INHERITED from the core-side middle layer (§6's
+  promotion tier): the shared device-scoped ``shell echo`` probe — rc 0 →
+  "ok"; expiry → "timeout"; missing binary → "no-adb"; nonzero rc → the
+  shared stderr-token scan (unauthorized/offline/disconnected — stderr,
+  never stdout); anything else → "disconnected". stdout is never parsed for
+  the decision. ``CancelledError`` propagates unmodified.
 - Discovery enumeration (``adb devices``) is the sanctioned stdout-reading
   probe: banner lines (``* daemon …`` cold-start/started lines) and the
   ``List of devices attached`` header are skipped position-independently;
@@ -49,9 +50,7 @@ from emuctl._proc import ProcessExecutor, ProcessResult
 from emuctl._serials import is_valid_serial, validate_serial
 from emuctl.config.model import EmuctlConfig
 from emuctl.errors import (
-    ExecutableNotFoundError,
     InvalidArgumentError,
-    OperationTimeoutError,
     VendorCommandError,
 )
 from emuctl.log import sanitize
@@ -67,9 +66,6 @@ from emuctl.timing import (
 __all__ = ["AdbController", "list_instances", "get_instance"]
 
 logger = logging.getLogger(__name__)
-
-#: Probe word: ``shell echo <word>``; the output is ignored (never parsed).
-_PROBE_WORD: Final[str] = "emuctl"
 
 #: Cold-start daemon banner marker (position-skip; never a discovery row).
 _BANNER_MARKER: Final[str] = "*"
@@ -87,19 +83,6 @@ def _require_config(config: EmuctlConfig | None) -> EmuctlConfig:
             constraint="must be an EmuctlConfig or None",
         )
     return config
-
-
-def _classify_probe_failure(stderr_excerpt: str) -> str:
-    """Map a failed probe's stderr to the pinned probe-reason vocabulary.
-
-    stderr tokens only — stdout is never consulted (pure).
-    """
-    lowered = stderr_excerpt.lower()
-    if "unauthorized" in lowered:
-        return "unauthorized"
-    if "offline" in lowered:
-        return "offline"
-    return "disconnected"
 
 
 class AdbController(_AdbMiddleLayer):
@@ -168,28 +151,13 @@ class AdbController(_AdbMiddleLayer):
     async def is_reachable(self, *, timeout: TimeoutParam = DEFAULT) -> ProbeResult:
         """Probe as data — never raises on observation failure (probes exemption).
 
-        Device-scoped ``shell echo``; the decision keys on exit status plus a
-        stderr-token scan only (stdout is never consulted). ``CancelledError``
-        propagates unmodified. No gate, no closed-check: a closed transport
-        reports what it observes, as data.
+        INHERITED from the core-side middle layer (§6 promotion tier): the
+        shared device-scoped ``shell echo`` probe, unchanged for plain ADB.
+        This explicit super() delegation is the conformance anchor — the
+        private probe copy (probe word + stderr classifier + catch-all
+        mapping) now lives once in ``emuctl.port.AdbController``.
         """
-        budget = resolve_timeout(timeout, QUERY_TIMEOUT, operation="is_reachable")
-        try:
-            await self._run_adb(
-                ["shell", "echo", _PROBE_WORD],
-                binary=False,
-                operation="is_reachable",
-                timeout=budget,
-            )
-        except OperationTimeoutError:
-            return ProbeResult(ok=False, reason="timeout")
-        except ExecutableNotFoundError:
-            return ProbeResult(ok=False, reason="no-adb")
-        except VendorCommandError as exc:
-            return ProbeResult(ok=False, reason=_classify_probe_failure(exc.stderr_excerpt))
-        except Exception:
-            return ProbeResult(ok=False, reason="disconnected")
-        return ProbeResult(ok=True, reason="ok")
+        return await super().is_reachable(timeout=timeout)
 
     async def aclose(self) -> None:
         """Idempotent; releases transport only (never stops the emulator)."""

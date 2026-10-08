@@ -220,6 +220,12 @@ def test_discover_online_reports_stub_adapters_honestly(
         b"ABCDEF123456\toffline\n"
         b"ZYX987\tunauthorized\n"
     )
+    memuc_fixture = (
+        b"read failed\n"
+        b"0,MEmu 1,Default Android,0,0\n"
+        b"1,pyclashbot-136,Default Medium Android,1,4200\n"
+        b"garbage without commas\n"
+    )
 
     class _FakeHandle:
         def __init__(self) -> None:
@@ -236,7 +242,7 @@ def test_discover_online_reports_stub_adapters_honestly(
             return 0
 
         async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
-            return (fixture, b"")
+            return (memuc_fixture if any("listvms" in a for a in calls[-1]) else fixture, b"")
 
     async def _spawn(argv: Sequence[str]) -> _FakeHandle:
         calls.append(list(argv))
@@ -247,11 +253,9 @@ def test_discover_online_reports_stub_adapters_honestly(
 
     adb_module = importlib.import_module("emuctl.backends.adb")
     monkeypatch.setattr(adb_module, "ProcessExecutor", _scripted_executor)
-    for name in (
-        "emuctl.backends.memu",
-        "emuctl.backends.bluestacks.bs5",
-        "emuctl.backends.bluestacks.air",
-    ):
+    memu_module = importlib.import_module("emuctl.backends.memu")
+    monkeypatch.setattr(memu_module, "ProcessExecutor", _scripted_executor)
+    for name in ("emuctl.backends.bluestacks.bs5", "emuctl.backends.bluestacks.air"):
         sys.modules.pop(name, None)
     report = asyncio.run(discover())
     assert report.offline is False
@@ -266,14 +270,25 @@ def test_discover_online_reports_stub_adapters_honestly(
         "adb:ZYX987",
     ]
     assert [r.running for r in by_id[BackendId.ADB].instances] == [True, True, False, False]
-    assert len(calls) == 1 and calls[0][-1] == "devices"  # scripted, offline
+    assert len(calls) == 2  # scripted, offline: adb devices + memuc listvms
+    assert calls[0][-1] == "devices" and "listvms" in calls[1]
     assert all("daemon" not in str(row.ref) for row in by_id[BackendId.ADB].instances)
-    # Windows-resolvable stubs report honestly; Air is macOS-only so a
+    # MEMU is now a live adapter: its enumeration reads listvms rows
+    # offline — name-keyed refs, running from the running column only,
+    # unparseable lines ("read failed", comma-less noise) skipped.
+    assert by_id[BackendId.MEMU].available is True
+    assert by_id[BackendId.MEMU].reason == "ok"
+    assert [str(r.ref) for r in by_id[BackendId.MEMU].instances] == [
+        "memu:MEmu 1",
+        "memu:pyclashbot-136",
+    ]
+    assert [r.running for r in by_id[BackendId.MEMU].instances] == [False, True]
+    assert [r.details["index"] for r in by_id[BackendId.MEMU].instances] == ["0", "1"]
+    # Remaining docstring stubs report honestly; Air is macOS-only so a
     # Windows host reports its platform refusal instead.
-    for backend in (BackendId.MEMU, BackendId.BLUESTACKS):
-        assert by_id[backend].available is False
-        assert by_id[backend].reason == "adapter-unavailable"
-        assert by_id[backend].instances == ()
+    assert by_id[BackendId.BLUESTACKS].available is False
+    assert by_id[BackendId.BLUESTACKS].reason == "adapter-unavailable"
+    assert by_id[BackendId.BLUESTACKS].instances == ()
     assert by_id[BackendId.BLUESTACKS_AIR].reason == "platform-unsupported"
     for backend in (BackendId.GOOGLE_PLAY, BackendId.AVD):
         assert by_id[backend].reason == "not-implemented-this-version"
