@@ -14,8 +14,11 @@ Interpretation decisions (CONTRACT §1 wins; these fill its silences):
   abstract.
 - ``restart()`` phases call the public gated methods (gate-consistent funnel),
   except ``_is_running`` (no public twin — ``is_running`` is §8-deferred) and
-  the sync ``_attach()`` hook. ``configure`` runs only when CONFIGURE is
-  declared — an explicit capability check, never a silent no-op.
+  the sync ``_attach()`` hook. The configure phase funnels through
+  ``configure()`` unconditionally: a BOOT-without-CONFIGURE adapter surfaces
+  the derived ``FeatureNotSupportedError`` from that gate (§1 invariant 3,
+  never a silent skip) and must override ``restart()`` wholesale to opt out
+  (§1.6 sanctions the override).
 - ``restart()`` maps deadline expiry to ``EmulatorNotReadyError`` with reason
   ``"timeout"`` and other mid-phase failures to phase-token reasons; the
   contract's example tokens (``timeout``, ``start_failed``,
@@ -37,13 +40,15 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import dis
 import enum
 import inspect
 import logging
 import os
 import time
+import types
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
-from typing import Any, Final, NamedTuple, TypeVar, cast
+from typing import Any, Final, NamedTuple, TypeVar
 
 from emuctl._identification import InstanceRecord, InstanceRef
 from emuctl.config.model import ConfigSpec, CreateSpec
@@ -138,15 +143,101 @@ MECHANICS: Final[dict[CapabilityFlag, tuple[str, ...]]] = {
 }
 
 
-def _is_stub_body(func: object) -> bool:
-    """True when `func` is a `...`/`pass`/docstring-only stub, not a real body.
+#: Opcodes permitted in a raise-only mechanic body besides the raise itself:
+#: coroutine framing plus the implicit cleanup epilogue 3.11+ appends to every
+#: coroutine (`RETURN_GENERATOR` … `CALL_INTRINSIC_1`/`RERAISE`), loads of the
+#: exception object and its constructor arguments (globals, locals, constants,
+#: closures, attribute reads — never stores), and pure value construction
+#: (calls, containers, string formatting, operators). Anything else — returns,
+#: awaits, stores, imports, jumps — marks a real body. Version-hedged
+#: (`PRECALL`/`CALL_FUNCTION` for ≤3.11, `PUSH_NULL` for ≥3.13); an
+#: unrecognized opcode fails toward "concrete", so a future-VM raise form
+#: would need allowlisting here.
+_RAISE_ONLY_OPS: Final[frozenset[str]] = frozenset(
+    {
+        "RETURN_GENERATOR",
+        "POP_TOP",
+        "RESUME",
+        "CACHE",
+        "NOP",
+        "CALL_INTRINSIC_1",
+        "RERAISE",
+        "LOAD_GLOBAL",
+        "LOAD_NAME",
+        "LOAD_FAST",
+        "LOAD_CONST",
+        "LOAD_DEREF",
+        "LOAD_CLOSURE",
+        "LOAD_CLASSDEREF",
+        "COPY_FREE_VARS",
+        "MAKE_CELL",
+        "PUSH_NULL",
+        "LOAD_ASSERTION_ERROR",
+        "LOAD_ATTR",
+        "LOAD_METHOD",
+        "LOAD_SUPER_ATTR",
+        "CALL",
+        "PRECALL",
+        "CALL_FUNCTION",
+        "CALL_FUNCTION_EX",
+        "CALL_FUNCTION_KW",
+        "KW_NAMES",
+        "BUILD_TUPLE",
+        "BUILD_LIST",
+        "BUILD_MAP",
+        "BUILD_CONST_KEY_MAP",
+        "BUILD_STRING",
+        "FORMAT_VALUE",
+        "FORMAT_SIMPLE",
+        "FORMAT_WITH_SPEC",
+        "CONVERT_VALUE",
+        "BINARY_OP",
+        "BINARY_SUBSCR",
+        "UNARY_POSITIVE",
+        "UNARY_NEGATIVE",
+        "UNARY_NOT",
+        "UNARY_INVERT",
+        "COMPARE_OP",
+        "IS_OP",
+        "CONTAINS_OP",
+        "RAISE_VARARGS",
+    }
+)
 
-    A real body references globals/attributes (imported helpers, self
-    mechanics) or binds non-trivial constants; a stub only loads None,
-    Ellipsis, or its own docstring. `co_names` carries the attribute/global
-    check so one-line delegations (`return await self._vendor_run(...)`)
-    count as concrete.
+
+def _is_raise_only_body(func: object) -> bool:
+    """True when `func`'s only effect is raising (never returns or awaits).
+
+    `dis`-based: the stream must contain an explicit `RAISE_VARARGS` and every
+    opcode must be framing, a load, or pure value construction (see
+    _RAISE_ONLY_OPS). Genuine one-line delegations
+    (`return await self._vendor_run(...)`) carry `GET_AWAITABLE` /
+    `RETURN_VALUE` and stay concrete. Conditional raises (jump opcodes) and
+    non-disassemblable callables read as concrete — conservative misses.
     """
+    code = getattr(func, "__code__", None)
+    if not isinstance(code, types.CodeType):
+        return False
+    try:
+        opnames = [ins.opname for ins in dis.get_instructions(code)]
+    except Exception:
+        return False
+    return "RAISE_VARARGS" in opnames and all(op in _RAISE_ONLY_OPS for op in opnames)
+
+
+def _is_stub_body(func: object) -> bool:
+    """True when `func` is a `...`/`pass`/docstring-only stub — or a raise-only
+    body — not a real body.
+
+    Recognized stub forms: `...` / `pass` / docstring-only bodies (constants
+    only, no global/attribute references), plus straight-line raise-only
+    bodies (`raise NotImplementedError(...)`, `raise <global>`, bare `raise`;
+    see _is_raise_only_body). A real body delegates, returns, or awaits —
+    one-line delegations (`return await self._vendor_run(...)`) count as
+    concrete via `co_names` and the opcode check alike.
+    """
+    if _is_raise_only_body(func):
+        return True
     code = getattr(func, "__code__", None)
     if code is None:
         return False
@@ -190,13 +281,21 @@ class AsyncEmulatorController(abc.ABC):
         """Bind the ref `connect()` resolved. No discovery, no boot, no attach.
 
         Never raises EmulatorNotReadyError. `adapter_kwargs` is reserved for
-        subclass transport knobs (consumed by the adapter's own __init__);
-        leftovers reaching this layer are ignored for forward compatibility.
+        subclass transport knobs: adapters consume their own before calling
+        `super().__init__()` — leftovers reaching this layer raise
+        InvalidArgumentError naming the unknown keys (fail-fast on typos;
+        never silently ignored).
         """
         if not isinstance(ref, InstanceRef):
             raise InvalidArgumentError(
                 parameter="ref",
                 constraint="must be an InstanceRef (connect() resolves it)",
+            )
+        if adapter_kwargs:
+            raise InvalidArgumentError(
+                parameter=", ".join(sorted(adapter_kwargs)),
+                constraint="unknown adapter kwargs "
+                "(each adapter consumes its own before super().__init__())",
             )
         self._ref = ref
         self._closed = False
@@ -205,8 +304,11 @@ class AsyncEmulatorController(abc.ABC):
     def __init_subclass__(cls, /, **kw: object) -> None:
         """Wiring-time gate (zero I/O): every mechanic named for each declared
         flag is a concrete member somewhere in the MRO (not a `...` body).
-        Violations fail loudly at class definition with a TypeError naming
-        the missing mechanics.
+        Raise-only bodies (`raise NotImplementedError`) count as stubs.
+        Declaring CREATE additionally requires a concrete `_get_instance`
+        override (the create() existence pre-check seam); the port default
+        stays for non-CREATE controllers only. Violations fail loudly at class
+        definition with a TypeError naming the missing mechanics.
         """
         super().__init_subclass__(**kw)
         features = cls.FEATURES
@@ -226,6 +328,10 @@ class AsyncEmulatorController(abc.ABC):
             missing = [name for name in MECHANICS[flag] if _mechanic_problem(cls, name) is not None]
             if missing:
                 problems.append(f"{flag.value!r} needs {', '.join(missing)}")
+        if CapabilityFlag.CREATE in features:
+            seam = _mechanic_problem(cls, "_get_instance")
+            if seam is not None:
+                problems.append(f"'create' needs a concrete '_get_instance' override ({seam})")
         if problems:
             raise TypeError(
                 f"{cls.__qualname__} declares FEATURES "
@@ -407,7 +513,9 @@ class AsyncEmulatorController(abc.ABC):
 
         Never False, never internal retries, not idempotent. Phases share one
         remaining deadline (no per-phase config at v0): stop-if-running →
-        configure-while-stopped → start → _attach → settle (first screenshot
+        configure-while-stopped (always funnels through configure(); an
+        undeclared CONFIGURE surfaces the gate — wholesale override is the
+        opt-out) → start → _attach → settle (first screenshot
         decodes non-empty) → [app: launch + bounded spawn-verify] → terminal
         check (ready(...) if given, else spawn-present-if-app, else
         screenshot-decodes).
@@ -488,22 +596,14 @@ class AsyncEmulatorController(abc.ABC):
                 raise EmulatorNotReadyError(reason=reason, cause=exc) from exc
 
         async def attach(budget_left: float | None) -> None:
-            produced: object = self._attach()
-            if inspect.isawaitable(produced):
-                pending = cast("Coroutine[Any, Any, None]", produced)
-                if budget_left is None:
-                    await pending
-                else:
-                    await asyncio.wait_for(pending, budget_left)
+            self._attach()  # sync concrete no-op hook (§1); never awaited
 
         # 1. stop-if-running
         if await phase("restart", "stop_failed", self._is_running):
             await phase("restart", "stop_failed", lambda left: self.stop(timeout=left))
-        # 2. configure-while-stopped (declared capability only — never silent)
-        if self.has_feature(CapabilityFlag.CONFIGURE):
-            await phase(
-                "restart", "configure_failed", lambda left: self.configure(None, timeout=left)
-            )
+        # 2. configure-while-stopped (unconditional funnel — the configure()
+        # gate owns the refusal when CONFIGURE is undeclared; §1 invariant 3)
+        await phase("restart", "configure_failed", lambda left: self.configure(None, timeout=left))
         # 3. start
         await phase("restart", "start_failed", lambda left: self.start(timeout=left))
         # 4. _attach

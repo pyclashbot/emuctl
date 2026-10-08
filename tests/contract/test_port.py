@@ -203,6 +203,43 @@ class BareFake(AsyncEmulatorController):
         return b""
 
 
+class BootConfigureFake(AsyncEmulatorController):
+    """BOOT + CONFIGURE, no SCREENSHOT: restart reaches the settle gate."""
+
+    FEATURES = frozenset({CapabilityFlag.BOOT, CapabilityFlag.CONFIGURE})
+
+    def __init__(self, ref: InstanceRef, *, running: bool = False) -> None:
+        super().__init__(ref)
+        self.calls: list[tuple[str, object]] = []
+        self._running = running
+
+    async def _vendor_run(self, argv: Sequence[str], *, binary: bool = False) -> bytes | str:
+        return b""
+
+    async def _is_running(self, timeout: float | None) -> bool:
+        self.calls.append(("_is_running", timeout))
+        return self._running
+
+    async def _start(self, timeout: float | None) -> None:
+        self.calls.append(("_start", timeout))
+
+    async def _stop(self, timeout: float | None) -> None:
+        self.calls.append(("_stop", timeout))
+
+    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> None:
+        self.calls.append(("_configure", timeout))
+
+
+class BootConfigureScreenshotFake(BootConfigureFake):
+    """BOOT + CONFIGURE + SCREENSHOT, no APPS: restart reaches the app gate."""
+
+    FEATURES = frozenset({CapabilityFlag.BOOT, CapabilityFlag.CONFIGURE, CapabilityFlag.SCREENSHOT})
+
+    async def _screenshot(self, timeout: float | None) -> bytes:
+        self.calls.append(("_screenshot", timeout))
+        return _png()
+
+
 class GateOrderFake(BootOnlyFake):
     """Spy: records _require calls against mechanic execution order."""
 
@@ -324,6 +361,87 @@ def test_stub_body_counts_as_missing() -> None:
     assert "_click" in str(excinfo.value)
 
 
+_UNWIRED_INPUT = NotImplementedError("unwired input")
+
+
+def test_raise_not_implemented_counts_as_stub() -> None:
+    with pytest.raises(TypeError) as excinfo:
+
+        class NieInput(AsyncEmulatorController):
+            FEATURES = frozenset({CapabilityFlag.INPUT})
+
+            async def _vendor_run(
+                self, argv: Sequence[str], *, binary: bool = False
+            ) -> bytes | str:
+                return b""
+
+            async def _click(
+                self, x: int, y: int, *, count: int, interval: float, timeout: float | None
+            ) -> None:
+                raise NotImplementedError("no click yet")
+
+            async def _swipe(
+                self,
+                x1: int,
+                y1: int,
+                x2: int,
+                y2: int,
+                *,
+                duration_ms: int,
+                timeout: float | None,
+            ) -> None:
+                raise NotImplementedError
+
+            async def _key(self, code: str | int, timeout: float | None) -> None:
+                raise _UNWIRED_INPUT
+
+            async def _text(self, value: str, timeout: float | None) -> None:
+                raise NotImplementedError(f"no text for {value!r}")
+
+    message = str(excinfo.value)
+    assert "_click" in message
+    assert "_swipe" in message
+    assert "_key" in message
+    assert "_text" in message
+
+
+def test_one_line_delegation_counts_as_concrete() -> None:
+    class DelegatingBoot(AsyncEmulatorController):
+        FEATURES = frozenset({CapabilityFlag.BOOT})
+
+        async def _vendor_run(self, argv: Sequence[str], *, binary: bool = False) -> bytes | str:
+            return b""
+
+        async def _start(self, timeout: float | None) -> None:
+            await self._vendor_run(["start"])
+
+        async def _stop(self, timeout: float | None) -> None:
+            await self._vendor_run(["stop"])
+
+        async def _is_running(self, timeout: float | None) -> bool:
+            await self._vendor_run(["is-running"])
+            return False
+
+    assert isinstance(DelegatingBoot(_ref()), AsyncEmulatorController)
+
+
+def test_create_without_get_instance_override_fails_at_definition() -> None:
+    with pytest.raises(TypeError) as excinfo:
+
+        class CreateWithoutSeam(AsyncEmulatorController):
+            FEATURES = frozenset({CapabilityFlag.CREATE})
+
+            async def _vendor_run(
+                self, argv: Sequence[str], *, binary: bool = False
+            ) -> bytes | str:
+                return b""
+
+            async def _create(self, spec: CreateSpec, timeout: float | None) -> InstanceRef:
+                return InstanceRef(backend=self._ref.backend, key=spec.name)
+
+    assert "_get_instance" in str(excinfo.value)
+
+
 def test_bad_features_types_fail_at_definition() -> None:
     with pytest.raises(TypeError):
         type("StringFeatures", (AsyncEmulatorController,), {"FEATURES": {"boot"}})
@@ -394,6 +512,24 @@ def test_construction_binds_identity_without_io() -> None:
 def test_construction_rejects_non_ref() -> None:
     with pytest.raises(InvalidArgumentError):
         BootOnlyFake("adb:127.0.0.1:5555")  # ty: ignore[invalid-argument-type]
+
+
+def test_construction_rejects_unknown_adapter_kwargs() -> None:
+    class KwargsFake(BootOnlyFake):
+        """Adapter-shaped: consumes known knobs, forwards the rest to the base."""
+
+        def __init__(
+            self, ref: InstanceRef, *, known_knob: str = "default", **kwargs: object
+        ) -> None:
+            self.known_knob = known_knob
+            AsyncEmulatorController.__init__(self, ref, **kwargs)
+            self.calls: list[tuple[str, object]] = []
+            self._running = False
+
+    with pytest.raises(InvalidArgumentError) as excinfo:
+        KwargsFake(_ref(), adb_pth=5037)  # typo'd kwarg reaches the base
+    assert excinfo.value.parameter == "adb_pth"
+    assert KwargsFake(_ref(), known_knob="v").known_knob == "v"  # consumed knobs pass
 
 
 def test_close_idempotent_and_guards_ops() -> None:
@@ -530,12 +666,30 @@ def test_restart_terminal_spawn_present_when_app_without_ready() -> None:
     ]
 
 
-def test_restart_without_screenshot_capability_surfaces_gate() -> None:
+def test_restart_without_configure_capability_surfaces_gate() -> None:
     fake = BootOnlyFake(_ref(), running=False)
     with pytest.raises(FeatureNotSupportedError) as excinfo:
         asyncio.run(fake.restart())
+    assert excinfo.value.feature == "configure"
+    assert _names(fake) == ["_is_running"]  # stop skipped (not running); configure gate fires
+
+
+def test_restart_without_screenshot_capability_surfaces_gate() -> None:
+    fake = BootConfigureFake(_ref(), running=False)
+    with pytest.raises(FeatureNotSupportedError) as excinfo:
+        asyncio.run(fake.restart())
     assert excinfo.value.feature == "screenshot"
-    assert _names(fake) == ["_is_running", "_start"]  # configure skipped: undeclared
+    assert [name for name, _ in fake.calls] == ["_is_running", "_configure", "_start"]
+
+
+def test_restart_app_without_apps_capability_surfaces_gate_raw() -> None:
+    # A strictly BOOT-only fake fails earlier at the configure gate; this fake
+    # clears configure + settle so the APPS gate itself fires — raw, never
+    # wrapped in EmulatorNotReadyError.
+    fake = BootConfigureScreenshotFake(_ref(), running=False)
+    with pytest.raises(FeatureNotSupportedError) as excinfo:
+        asyncio.run(fake.restart(app="com.example"))
+    assert excinfo.value.feature == "apps"
 
 
 def test_restart_without_boot_gates_first() -> None:
@@ -583,6 +737,31 @@ def test_restart_mid_phase_device_state_is_not_ready() -> None:
         asyncio.run(fake.restart())
     assert excinfo.value.reason == "stop_failed"
     assert excinfo.value.cause is marker
+
+
+def test_restart_mid_phase_operation_timeout_maps_to_timeout() -> None:
+    marker = OperationTimeoutError(operation="restart", deadline=1.0, elapsed=1.0)
+    fake = FullFake(_ref(), running=False, fail={"_start": marker})
+    with pytest.raises(EmulatorNotReadyError) as excinfo:
+        asyncio.run(fake.restart())
+    assert excinfo.value.reason == "timeout"
+    assert excinfo.value.cause is marker
+
+
+def test_restart_timeout_none_threads_none_into_every_phase() -> None:
+    fake = FullFake(_ref(), running=True)
+    assert asyncio.run(fake.restart(timeout=None)) is None
+    assert _names(fake) == [
+        "_is_running",
+        "_stop",
+        "_configure",
+        "_start",
+        "_attach",
+        "_screenshot",  # settle
+        "_screenshot",  # terminal screenshot-decodes
+    ]
+    assert fake.calls != []
+    assert all(budget is None for _, budget in fake.calls)  # no deadline conversions
 
 
 def test_restart_settle_rejects_undecodable_frame() -> None:
