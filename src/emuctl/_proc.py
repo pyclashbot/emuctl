@@ -108,6 +108,21 @@ async def _default_spawn(argv: Sequence[str]) -> _ProcessHandle:
     )
 
 
+async def _default_spawn_detached(argv: Sequence[str]) -> _ProcessHandle:
+    """Real DETACHED spawner: argv-only exec, outputs discarded (DEVNULL).
+
+    A GUI child (an emulator player binary) writes nothing anyone reads; its
+    stdout/stderr are therefore DEVNULL — no pipe fill can ever deadlock it.
+    """
+    return await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=DEVNULL,
+        stderr=DEVNULL,
+        stdin=DEVNULL,
+        creationflags=_creationflags(),
+    )
+
+
 def _validate_argv(argv: Sequence[str]) -> list[str]:
     """Enforce argv-only: a non-empty sequence of str, never a bare string."""
     if isinstance(argv, str) or not isinstance(argv, Sequence):
@@ -137,8 +152,14 @@ class ProcessExecutor:
     def __init__(self, *, _spawn: _SpawnFn | None = None) -> None:
         """Bind the spawner. `_spawn` is THE private injection seam (see module
         docstring): tests pass a transcript-replaying fake; production uses
-        the real argv-only spawner. Not exported, never a registry."""
+        the real argv-only spawner. Not exported, never a registry. The same
+        seam (when injected) also serves :meth:`spawn_detached`, so tests
+        replay GUI launches too; production detached spawns use the DEVNULL
+        spawner above."""
         self._spawn_fn: _SpawnFn = _spawn if _spawn is not None else _default_spawn
+        self._spawn_detached_fn: _SpawnFn = (
+            self._spawn_fn if _spawn is not None else _default_spawn_detached
+        )
         self._live: set[_ProcessHandle] = set()
 
     def _track(self, proc: _ProcessHandle) -> None:
@@ -228,6 +249,36 @@ class ProcessExecutor:
         finally:
             if proc is not None:
                 self._untrack(proc)
+
+    async def spawn_detached(
+        self, argv: Sequence[str], *, operation: str = "spawn_detached"
+    ) -> _ProcessHandle:
+        """Fire-and-forget DETACHED child spawn: the §6 single-place owner of
+        launches whose child must OUTLIVE the call (emulator GUI players).
+
+        The returned handle is deliberately NOT tracked: ``close()`` sweeps
+        only tracked children, so a detached emulator is never terminated or
+        killed by executor teardown (close() never stops the emulator, §1).
+        There is no timeout and no await of the child — the caller holds the
+        handle for run-state observation only. stdout/stderr go to DEVNULL
+        (the production spawner): a GUI child can never be held by an
+        un-drained pipe. argv-only validation identical to ``run()`` fires
+        BEFORE any I/O (a bare string or non-str element raises
+        ``InvalidArgumentError``); Windows console suppression matches
+        ``run()`` (``CREATE_NO_WINDOW``). Dynamic strings are DEBUG-narrated
+        through ``log.sanitize`` only.
+
+        Returns the same structural handle type as the ``_spawn`` seam
+        (``terminate``/``kill``/``wait``/``communicate``/``returncode``/
+        ``pid``); the emitter is never awaited past spawn.
+        """
+        args = _validate_argv(argv)
+        logger.debug(
+            "proc spawn-detached op=%s argv=%s",
+            sanitize(operation),
+            [sanitize(a) for a in args],
+        )
+        return await self._spawn_detached_fn(args)
 
     async def close(self) -> None:
         """Idempotent: abandon every still-tracked straggler, then return.

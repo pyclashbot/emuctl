@@ -255,8 +255,17 @@ def test_discover_online_reports_stub_adapters_honestly(
     monkeypatch.setattr(adb_module, "ProcessExecutor", _scripted_executor)
     memu_module = importlib.import_module("emuctl.backends.memu")
     monkeypatch.setattr(memu_module, "ProcessExecutor", _scripted_executor)
-    for name in ("emuctl.backends.bluestacks.bs5", "emuctl.backends.bluestacks.air"):
-        sys.modules.pop(name, None)
+    # The BlueStacks family rows are LIVE conf-FILE readers now (no vendor
+    # stdout parsing — files are sanctioned, stdout prose is not): script the
+    # path resolution to an honest no-candidate store so the family rows read
+    # deterministically offline (same scripted-fake shape as the ADB/MEmu
+    # fixtures above — no real BlueStacks install is consulted).
+    stub_paths = types.ModuleType("_stub_paths")
+    stub_paths.__dict__["conf_path"] = lambda cfg, platform=None: None
+    stub_paths.__dict__["mim_meta_path"] = lambda cfg, platform=None: None
+    for backed in ("emuctl.backends.bluestacks.bs5", "emuctl.backends.bluestacks.air"):
+        sys.modules[backed] = importlib.import_module(backed)
+        monkeypatch.setattr(sys.modules[backed], "_paths", stub_paths)
     report = asyncio.run(discover())
     assert report.offline is False
     by_id = {status.backend: status for status in report.backends}
@@ -273,6 +282,12 @@ def test_discover_online_reports_stub_adapters_honestly(
     assert len(calls) == 2  # scripted, offline: adb devices + memuc listvms
     assert calls[0][-1] == "devices" and "listvms" in calls[1]
     assert all("daemon" not in str(row.ref) for row in by_id[BackendId.ADB].instances)
+    # The BlueStacks 5 row is a live conf-file reader: honest empty enumeration
+    # on the scripted no-candidate store (never adapter-unavailable, never a
+    # vendor probe; run state is conf-invisible → rows would set running False).
+    assert by_id[BackendId.BLUESTACKS].available is True
+    assert by_id[BackendId.BLUESTACKS].reason == "ok"
+    assert by_id[BackendId.BLUESTACKS].instances == ()
     # MEMU is now a live adapter: its enumeration reads listvms rows
     # offline — name-keyed refs, running from the running column only,
     # unparseable lines ("read failed", comma-less noise) skipped.
@@ -286,23 +301,30 @@ def test_discover_online_reports_stub_adapters_honestly(
     assert [r.details["index"] for r in by_id[BackendId.MEMU].instances] == ["0", "1"]
     # Remaining docstring stubs report honestly; Air is macOS-only so a
     # Windows host reports its platform refusal instead.
-    assert by_id[BackendId.BLUESTACKS].available is False
-    assert by_id[BackendId.BLUESTACKS].reason == "adapter-unavailable"
-    assert by_id[BackendId.BLUESTACKS].instances == ()
     assert by_id[BackendId.BLUESTACKS_AIR].reason == "platform-unsupported"
     for backend in (BackendId.GOOGLE_PLAY, BackendId.AVD):
         assert by_id[backend].reason == "not-implemented-this-version"
 
 
-def test_discover_row_per_refusal_mode(macos_host: Any) -> None:
-    # macOS host, real deps: memu is platform-gated; air resolves to a stub.
+def test_discover_row_per_refusal_mode(macos_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    # macOS host: memu is platform-gated; air RESOLVES now but its conf-file
+    # enumeration reads through scripted no-candidate paths (offline honesty
+    # — no real /Applications/BlueStacks.app is consulted).
+    importlib = __import__("importlib")
     for name in ("emuctl.backends.memu", "emuctl.backends.bluestacks.air"):
         sys.modules.pop(name, None)
+    stub_paths = types.ModuleType("_stub_paths")
+    stub_paths.__dict__["conf_path"] = lambda cfg, platform=None: None
+    stub_paths.__dict__["mim_meta_path"] = lambda cfg, platform=None: None
+    air = importlib.import_module("emuctl.backends.bluestacks.air")
+    monkeypatch.setattr(air, "_paths", stub_paths)
     report = asyncio.run(discover([BackendId.MEMU, BackendId.BLUESTACKS_AIR]))
     by_id = {status.backend: status for status in report.backends}
     assert by_id[BackendId.MEMU].reason == "platform-unsupported"
     assert by_id[BackendId.MEMU].available is False
-    assert by_id[BackendId.BLUESTACKS_AIR].reason == "adapter-unavailable"
+    assert by_id[BackendId.BLUESTACKS_AIR].reason == "ok"
+    assert by_id[BackendId.BLUESTACKS_AIR].available is True
+    assert by_id[BackendId.BLUESTACKS_AIR].instances == ()
 
 
 def test_discover_convention_violation_is_adapter_unavailable(

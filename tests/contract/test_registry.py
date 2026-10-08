@@ -368,14 +368,14 @@ def test_key_structural_rule_still_lives_in_identity() -> None:
 
 
 #: §7.10 conformance walk: one row per spec-table step. `implemented` flips
-#: to True in the adapter PR that ships the row's module; all False today
-#: (only docstring stubs exist), so the test pins the honest not-implemented
-#: state and the full assertions activate row-by-row later.
+#: to True in the adapter PR that ships the row's module: ADB + MEmu + the
+#: BlueStacks family shipped in their adapter PRs; GOOGLE_PLAY/AVD stay
+#: honest not-implemented (spec None).
 CONFORMANCE_ROWS = [
     (BackendId.ADB, True),
     (BackendId.MEMU, True),
-    (BackendId.BLUESTACKS, False),
-    (BackendId.BLUESTACKS_AIR, False),
+    (BackendId.BLUESTACKS, True),
+    (BackendId.BLUESTACKS_AIR, True),
     (BackendId.GOOGLE_PLAY, False),
     (BackendId.AVD, False),
 ]
