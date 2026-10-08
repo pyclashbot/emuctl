@@ -373,7 +373,7 @@ def test_key_structural_rule_still_lives_in_identity() -> None:
 #: state and the full assertions activate row-by-row later.
 CONFORMANCE_ROWS = [
     (BackendId.ADB, True),
-    (BackendId.MEMU, False),
+    (BackendId.MEMU, True),
     (BackendId.BLUESTACKS, False),
     (BackendId.BLUESTACKS_AIR, False),
     (BackendId.GOOGLE_PLAY, False),
@@ -382,7 +382,9 @@ CONFORMANCE_ROWS = [
 
 
 @pytest.mark.parametrize(("backend", "implemented"), CONFORMANCE_ROWS)
-def test_spec_row_conformance(reg: Any, backend: BackendId, implemented: bool) -> None:
+def test_spec_row_conformance(
+    reg: Any, backend: BackendId, implemented: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """§7.10 — every spec row's module is importable via the registry's own
     machinery (`load_adapter`), exposes `spec.adapter_attr` as a port
     subclass, and exposes module-level `list_instances`/`get_instance`."""
@@ -410,6 +412,11 @@ def test_spec_row_conformance(reg: Any, backend: BackendId, implemented: bool) -
         )
         return
     assert spec is not None
+    # The walk verifies module existence + exports, not dependency-install
+    # state (that is selection's truth, pinned elsewhere): dep probing is
+    # stubbed so the [memu]/[bluestacks] rows conform offline too — the
+    # loader never imports the vendored dep for its side effects (§7).
+    monkeypatch.setattr(reg, "_dep_available", lambda name: True)
     adapter = reg.load_adapter(spec)
     assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)
     module = sys.modules[spec.module]

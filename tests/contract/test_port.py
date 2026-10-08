@@ -570,7 +570,16 @@ def test_timeout_groups_resolve_to_pinned_constants() -> None:
     asyncio.run(fake.is_app_installed("com.example"))
     assert fake.calls[-1] == ("_is_app_installed", QUERY_TIMEOUT)
     asyncio.run(fake.create(CreateSpec(name="n")))
-    assert fake.calls[-1] == ("_create", PROVISION_TIMEOUT)
+    # §2 one-deadline: _create receives the REMAINING provision slice (the
+    # pre-check ran first) — ≤ the pinned constant, ≈ full at fake I/O speed
+    create_slice = fake.calls[-1][1]
+    assert fake.calls[-1][0] == "_create"
+    assert isinstance(create_slice, float)
+    # Windows timer granularity (~15.6 ms default tick) can read the
+    # pre-check's elapsed as zero, leaving the slice at the deadline
+    # float's own ulp — sometimes an ulp ABOVE the constant
+    assert 0 < create_slice <= PROVISION_TIMEOUT + 1e-9
+    assert create_slice > PROVISION_TIMEOUT - 0.1  # pre-check was ~free
     asyncio.run(fake.install_apk("game.apk"))
     assert fake.calls[-1] == ("_install_apk", APP_TIMEOUT)
 
@@ -886,7 +895,14 @@ def test_create_ignores_bound_identity_and_returns_new_ref() -> None:
     new_ref = asyncio.run(fake.create(CreateSpec(name="fresh-vm")))
     assert new_ref == InstanceRef(backend=BackendId.ADB, key="fresh-vm")
     assert new_ref != fake.identity
-    assert ("_create", PROVISION_TIMEOUT) in fake.calls
+    create_slice = next(v for name, v in fake.calls if name == "_create")
+    # remaining slice of the ONE shared provision budget (§2), not a fresh one
+    assert isinstance(create_slice, float)
+    # Windows timer granularity (~15.6 ms default tick) can read the
+    # pre-check's elapsed as zero, leaving the slice at the deadline
+    # float's own ulp — sometimes an ulp ABOVE the constant
+    assert 0 < create_slice <= PROVISION_TIMEOUT + 1e-9
+    assert create_slice > PROVISION_TIMEOUT - 0.1
 
 
 def test_create_precheck_refuses_existing_name() -> None:

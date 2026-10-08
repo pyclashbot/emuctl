@@ -12,6 +12,7 @@ Interpretation decisions (CONTRACT §1 wins; these fill its silences):
   wiring gate (``__init_subclass__``) is the enforcement site, so a minimal
   adapter declaring one flag stays instantiable. Only ``_vendor_run`` is
   abstract.
+
 - ``restart()`` phases call the public gated methods (gate-consistent funnel),
   except ``_is_running`` (no public twin — ``is_running`` is §8-deferred) and
   the sync ``_attach()`` hook. The configure phase funnels through
@@ -28,8 +29,8 @@ Interpretation decisions (CONTRACT §1 wins; these fill its silences):
   module-level discovery seam in later PRs.
 - ``is_reachable()`` is ungated: gating it would contradict the probes
   exemption ("never raises"). The port default has no observation seam and
-  returns data; the concrete ADB adapter overrides it with the real transport
-  probe.
+  returns data; :class:`AdbController` (below) overrides it with the real
+  transport probe so every ADB-speaking adapter inherits the shared probe.
 - ``AdbController`` (§1's ``class AdbController(AsyncEmulatorController,
   abc.ABC)``) lives HERE, core-side and port-adjacent: §6's sharing tiers pin
   the ADB-family middle layer so every ADB-speaking adapter can inherit it
@@ -37,11 +38,15 @@ Interpretation decisions (CONTRACT §1 wins; these fill its silences):
   over raw ADB (interaction verbs, screenshot, app verbs, install, the
   scoping machinery ``_run_adb``/``_device_argv``/``_server_argv`` and the
   serial layer-3 re-check) implemented against the transport state the
-  concrete adapter binds in its ``__init__``. Remotely backend-specific
-  truth — the FEATURES set, the concrete ``_vendor_run`` through the
-  ``_proc.py`` executor, the construction binding of ``AdbConfig``,
-  ``is_reachable``, and the module-level ``BackendDiscovery`` convention
-  functions — stays in the backend module (``emuctl.backends.adb``).
+  concrete adapter binds in its ``__init__`` — and, per §6's promotion tier,
+  the shared echo-probe (``is_reachable``, the probe word, and the
+  stderr-failure classifier) that two+ ADB-speaking families (plain ADB and
+  MEmu) already want; backend adapters now inherit the probe instead of
+  carrying private copies. Remotely backend-specific truth — the FEATURES
+  set, the concrete ``_vendor_run`` through the ``_proc.py`` executor, the
+  construction binding of ``AdbConfig``, and the module-level
+  ``BackendDiscovery`` convention functions — stays in the backend module
+  (``emuctl.backends.adb``).
   ``_vendor_run`` stays abstract here, keeping this class uninstantiable.
 - Bounded spawn-verify (§1 ``start_app`` / §2 "one deadline per call,
   distributed internally"): the launch and the ``pidof`` verify share the
@@ -412,9 +417,12 @@ class AsyncEmulatorController(abc.ABC):
     async def _get_instance(self, ref: InstanceRef, timeout: float | None) -> InstanceRecord | None:
         """Existence probe backing create()'s pre-check. Default: absent (None).
 
-        Backend adapters override this to consult their module-level
-        discovery seam (`get_instance`); the port layer cannot reach backend
-        modules (§6 layers contract), so the default observes nothing.
+        Backend adapters override this to consult their discovery seam; the
+        override MUST honor the passed deadline (the caller's slice — create()
+        and MEmu's lazy transport derivation both share it; a fresh
+        query-group hard-code would violate §2's one-deadline rule). The port
+        layer cannot reach backend modules (§6 layers contract), so the
+        default observes nothing.
         """
         return None
 
@@ -432,7 +440,12 @@ class AsyncEmulatorController(abc.ABC):
         ...
 
     async def _create(self, spec: CreateSpec, timeout: float | None) -> InstanceRef:  # ty: ignore[empty-body]
-        """Provision a new instance; returns the new instance's ref."""
+        """Provision a new instance; returns the new instance's ref.
+
+        ``timeout`` is the REMAINING slice of create()'s ONE shared provision
+        deadline (create() resolves the budget once and threads the remaining
+        time — §2; ``None`` = explicit unbounded).
+        """
         ...
 
     async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> None:
@@ -489,6 +502,11 @@ class AsyncEmulatorController(abc.ABC):
         Begins with an existence pre-check through the discovery seam
         (`_get_instance`): an existing name raises InvalidArgumentError
         (parameter="spec.name", constraint="already provisioned").
+
+        §2 deadline discipline: the provision budget is resolved ONCE here
+        and the pre-check + the provisioning mechanic share it — `_create`
+        is handed the REMAINING slice (never a fresh full budget), so the
+        provable wall time of create() never exceeds the caller's budget.
         """
         self._require(CapabilityFlag.CREATE)
         self._ensure_open()
@@ -498,10 +516,24 @@ class AsyncEmulatorController(abc.ABC):
                 constraint="must be a CreateSpec (name is required at v0)",
             )
         budget = resolve_timeout(timeout, PROVISION_TIMEOUT, operation="create")
+        start = time.monotonic()
+        deadline = None if budget is None else start + budget
         candidate = InstanceRef(backend=self._ref.backend, key=spec.name)
         if await self._get_instance(candidate, budget) is not None:
             raise InvalidArgumentError(parameter="spec.name", constraint="already provisioned")
-        return await self._create(spec, budget)
+        left: float | None = None
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                # Pre-check consumed the budget: expiry is a typed failure
+                # (§2), never a non-positive slice handed to the mechanic.
+                raise OperationTimeoutError(
+                    operation="create",
+                    deadline=deadline,
+                    elapsed=time.monotonic() - start,
+                )
+        # The remaining slice — `left` is the shared provision deadline (§2).
+        return await self._create(spec, left)
 
     async def configure(
         self, spec: ConfigSpec | None = None, *, timeout: TimeoutParam = DEFAULT
@@ -615,6 +647,9 @@ class AsyncEmulatorController(abc.ABC):
                         elapsed=time.monotonic() - start,
                     ),
                 ) from exc
+            # TRACKED PAIR with emuctl.backends.memu.MemuController.restart()'s
+            # phase() re-raise list (§6 sharing tiers — keep both files in
+            # sync when editing either list).
             except (
                 FeatureNotSupportedError,
                 ControllerClosedError,
@@ -875,6 +910,27 @@ def _stderr_excerpt(stderr: bytes) -> str:
     return sanitize(stderr.decode("utf-8", errors="replace"))
 
 
+#: Probe word for the shared ADB-family transport probe: ``shell echo
+#: <word>``; the output is ignored (never parsed). Promoted to core per §6's
+#: sharing tiers (two+ ADB-speaking families — plain ADB and MEmu — use it).
+_PROBE_WORD: Final[str] = "emuctl"
+
+
+def _classify_probe_failure(stderr_excerpt: str) -> str:
+    """Map a failed probe's stderr to the pinned probe-reason vocabulary.
+
+    stderr tokens only — stdout is never consulted (pure). Core-side (§6
+    promotion): every ADB-speaking adapter inherits this classifier through
+    ``AdbController.is_reachable`` instead of carrying a private copy.
+    """
+    lowered = stderr_excerpt.lower()
+    if "unauthorized" in lowered:
+        return "unauthorized"
+    if "offline" in lowered:
+        return "offline"
+    return "disconnected"
+
+
 class AdbController(AsyncEmulatorController, abc.ABC):
     """§1's ONE ADB middle layer (core-side, port-adjacent per §6).
 
@@ -895,8 +951,9 @@ class AdbController(AsyncEmulatorController, abc.ABC):
     transport state — the annotations below are bound by the concrete
     adapter's ``__init__`` from the resolved ``EmuctlConfig`` (§1:
     ``config.adb`` is the ONLY system-server selector); this layer only
-    reads them. FEATURES, ``is_reachable``, and discovery remain
-    backend-module truth.
+    reads them. FEATURES and discovery remain backend-module truth;
+    ``is_reachable`` is the SHARED probe implemented at this layer (§6
+    promotion tier) and inherited as-is.
     """
 
     #: Transport state, bound by the concrete adapter's __init__ (read-only here).
@@ -1203,3 +1260,59 @@ class AdbController(AsyncEmulatorController, abc.ABC):
         assert isinstance(out, str)
         wanted = f"package:{pkg}"
         return any(line.strip() == wanted for line in out.splitlines())
+
+    async def is_reachable(self, *, timeout: TimeoutParam = DEFAULT) -> ProbeResult:
+        """Probe as data — never raises, never gated (probes exemption).
+
+        The SHARED ADB-family transport probe (§6 promotion tier: implemented
+        once at this middle layer; backend adapters inherit it, their
+        transport hooks — e.g. lazy serial resolution — engage through the
+        overridden ``_run_adb``). Device-scoped ``shell echo``; the decision
+        keys on exit status plus a stderr-token scan only (stdout is never
+        consulted): rc 0 → "ok"; budget expiry → "timeout"; missing binary →
+        "no-adb"; nonzero rc → stderr-token scan (unauthorized/offline/
+        disconnected); anything else (including a stale backend ref) →
+        "disconnected". Two backend facts map through the shared catch-all:
+        a stale backend ref (surfacing as the identity error from a lazy
+        resolution inside ``_run_adb``) and any unclassified vendor failure
+        are probe DATA, never raises.
+
+        The whole probe (transport resolution included — it happens inside
+        one ``_run_adb`` call) is wall-clock bounded by the ONE query budget:
+        with a finite budget the call itself is wrapped, so provable wall
+        time never exceeds the caller's slice. ``CancelledError`` propagates
+        unmodified (the executor owns abandonment). No gate, no closed-check:
+        a closed transport reports what it observes, as data.
+        """
+        budget = resolve_timeout(timeout, QUERY_TIMEOUT, operation="is_reachable")
+        try:
+            if budget is None:
+                await self._run_adb(
+                    ["shell", "echo", _PROBE_WORD],
+                    binary=False,
+                    operation="is_reachable",
+                    timeout=None,
+                )
+            else:
+                await asyncio.wait_for(
+                    self._run_adb(
+                        ["shell", "echo", _PROBE_WORD],
+                        binary=False,
+                        operation="is_reachable",
+                        timeout=budget,
+                    ),
+                    budget,
+                )
+            # asyncio.TimeoutError aliases TimeoutError on 3.11+; kept explicit
+            # for the probes exemption's readability (both map to "timeout").
+        except OperationTimeoutError:
+            return ProbeResult(ok=False, reason="timeout")
+        except TimeoutError:
+            return ProbeResult(ok=False, reason="timeout")
+        except ExecutableNotFoundError:
+            return ProbeResult(ok=False, reason="no-adb")
+        except VendorCommandError as exc:
+            return ProbeResult(ok=False, reason=_classify_probe_failure(exc.stderr_excerpt))
+        except Exception:
+            return ProbeResult(ok=False, reason="disconnected")
+        return ProbeResult(ok=True, reason="ok")
