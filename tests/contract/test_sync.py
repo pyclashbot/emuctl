@@ -91,6 +91,28 @@ def _thread_names() -> set[str]:
     return {t.name for t in threading.enumerate()}
 
 
+def _wait_for_thread_teardown(deadline_s: float = 5.0) -> None:
+    """Bounded wait for portal-thread OS teardown to settle after close().
+
+    close() joins the portal coroutine, but on a loaded runner the pinned
+    portal thread (or a lingering AnyIO to_thread worker it used) can outlive
+    the call by a scheduling beat. Poll (50 ms) until both vanish; fail if
+    they outlive the window — the contract is that close() JOINS the thread,
+    so leaving a survivor past the deadline is a real failure.
+    """
+
+    def _survivors() -> set[str]:
+        return {name for name in _thread_names() if PORTAL_THREAD_NAME in name or "AnyIO" in name}
+
+    deadline = time.monotonic() + deadline_s
+    while _survivors():
+        assert time.monotonic() < deadline, (
+            f"{PORTAL_THREAD_NAME!r}/AnyIO teardown did not settle within "
+            f"{deadline_s}s after close() (threads: {sorted(_thread_names())})"
+        )
+        time.sleep(0.05)
+
+
 class _FakeController(AsyncEmulatorController):
     """In-memory fake of the port: records every op + the budget the async
     layer resolved (timeout parity evidence), optional failure, optional
@@ -527,7 +549,10 @@ def test_close_is_idempotent_permanent_and_joins_the_thread() -> None:
         assert PORTAL_THREAD_NAME in _thread_names()
         controller.close()
         controller.close()  # idempotent
+        _wait_for_thread_teardown()  # bounded join-pin, no racy snapshot
         assert PORTAL_THREAD_NAME not in _thread_names()
+        assert not any("AnyIO" in name for name in _thread_names())
+        assert _thread_names() == before  # exactly MainThread
         assert controller._closed  # permanent
         with pytest.raises(ControllerClosedError):
             controller.screenshot()
@@ -562,6 +587,8 @@ def test_cm_exit_closes_and_rejects_later_ops() -> None:
     with EmulatorController(_FakeController()) as controller:
         png = controller.screenshot()
     assert png is not None and len(png) > 8
+    _wait_for_thread_teardown()  # bounded join-pin, no racy snapshot
+    assert not any("AnyIO" in name for name in _thread_names())
     assert _thread_names() == before
     with pytest.raises(ControllerClosedError):
         controller.click(1, 2)
@@ -680,7 +707,8 @@ def test_close_vs_first_call_race_all_outcomes_typed_and_no_leak() -> None:
         for outcome in outcomes:
             assert outcome is None or isinstance(outcome, ControllerClosedError), outcome
         assert controller._closed
-        assert PORTAL_THREAD_NAME not in _thread_names()
+        _wait_for_thread_teardown()  # per-iteration bounded join-pin
+        assert _thread_names() == before
         controller.close()  # idempotent, joins nothing leaked
     assert _thread_names() == before
 
