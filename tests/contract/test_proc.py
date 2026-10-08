@@ -2,10 +2,13 @@
 
 import asyncio
 import logging
+import os
 import pickle
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
+from typing import Any
 
 import pytest
 
@@ -229,13 +232,7 @@ def test_argv_debug_logged_sanitized(caplog: pytest.LogCaptureFixture) -> None:
 
 
 def test_process_result_picklable() -> None:
-    import importlib
-
-    # Resolve in-test: the suite's logger-silence test recycles sys.modules,
-    # so the top-level binding may predate the registered module object that
-    # pickle looks up. import_module returns exactly what pickle will find.
-    proc_mod = importlib.import_module("emuctl._proc")
-    result = proc_mod.ProcessResult(stdout=b"x", stderr=b"y", returncode=3)
+    result = ProcessResult(stdout=b"x", stderr=b"y", returncode=3)
     assert pickle.loads(pickle.dumps(result)) == result  # noqa: S301 - round-tripping our own bytes
 
 
@@ -263,3 +260,154 @@ def test_real_process_success_and_cancel_evidence() -> None:
             await task
 
     asyncio.run(main())
+
+
+@pytest.mark.parametrize("bad_timeout", [0, 0.0, -1, -0.5, float("inf"), float("nan")])
+def test_nonpositive_timeout_rejected_before_spawn(bad_timeout: float) -> None:
+    calls: list[list[str]] = []
+
+    async def spawn(argv: Sequence[str]) -> FakeProcess:
+        calls.append(list(argv))
+        raise AssertionError("spawn must not run on invalid timeout")
+
+    executor = ProcessExecutor(_spawn=spawn)
+    with pytest.raises(InvalidArgumentError):
+        asyncio.run(executor.run(["adb", "devices"], operation="probe", timeout=bad_timeout))
+    assert calls == []
+
+
+def test_hanging_spawn_is_bounded_by_deadline() -> None:
+    async def hanging_spawn(argv: Sequence[str]) -> FakeProcess:
+        await asyncio.sleep(30.0)
+        raise AssertionError("unreachable")
+
+    executor = ProcessExecutor(_spawn=hanging_spawn)
+    start = time.monotonic()
+    with pytest.raises(OperationTimeoutError) as excinfo:
+        asyncio.run(executor.run(["adb", "wait-for-device"], operation="boot", timeout=0.1))
+    elapsed = time.monotonic() - start
+    assert excinfo.value.elapsed is not None and excinfo.value.elapsed >= 0.1
+    assert elapsed < 5.0
+
+
+def _assert_real_child_dead(proc: Any, *, timeout_s: float = 5.0) -> None:
+    pid = proc.pid
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if proc.returncode is not None:
+            break
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+        time.sleep(0.05)
+    if proc.returncode is None:
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+        raise AssertionError("real child straggler still alive after timeout/cancel")
+
+
+def test_real_process_timeout_leaves_no_straggler() -> None:
+    seen: list[Any] = []
+
+    async def capturing_spawn(argv: Sequence[str]) -> Any:
+        proc = await _proc._default_spawn(argv)
+        seen.append(proc)
+        return proc
+
+    executor = ProcessExecutor(_spawn=capturing_spawn)
+    with pytest.raises(OperationTimeoutError):
+        asyncio.run(
+            executor.run(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                operation="real-timeout-probe",
+                timeout=0.3,
+            )
+        )
+    assert len(seen) == 1
+    _assert_real_child_dead(seen[0])
+
+
+def test_real_process_cancel_leaves_no_straggler() -> None:
+    seen: list[Any] = []
+
+    async def capturing_spawn(argv: Sequence[str]) -> Any:
+        proc = await _proc._default_spawn(argv)
+        seen.append(proc)
+        return proc
+
+    executor = ProcessExecutor(_spawn=capturing_spawn)
+
+    async def main() -> None:
+        task = asyncio.ensure_future(
+            executor.run(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                operation="real-cancel-probe",
+            )
+        )
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+    assert len(seen) == 1
+    _assert_real_child_dead(seen[0])
+
+
+def test_close_during_inflight_then_executor_reusable() -> None:
+    hang = FakeProcess(hang=True)
+    ok = FakeProcess(stdout=b"ok", stderr=b"", returncode=0)
+    calls = 0
+
+    async def spawn(argv: Sequence[str]) -> FakeProcess:
+        nonlocal calls
+        calls += 1
+        return hang if calls == 1 else ok
+
+    executor = ProcessExecutor(_spawn=spawn)
+
+    async def main() -> ProcessResult:
+        task = asyncio.ensure_future(executor.run(["adb", "wait-for-device"], operation="probe"))
+        await asyncio.sleep(0.05)
+        await executor.close()
+        assert hang.terminate_calls >= 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return await executor.run(["adb", "devices"], operation="probe")
+
+    result = asyncio.run(main())
+    assert result == ProcessResult(stdout=b"ok", stderr=b"", returncode=0)
+
+
+def test_second_cancel_during_abandon_still_cancels_and_cleans_up() -> None:
+    marker = asyncio.CancelledError("injected")
+
+    class SlowReap(FakeProcess):
+        async def wait(self) -> int:
+            if self._returncode is None and self.terminate_calls > 0:
+                await asyncio.sleep(0.3)
+                self._returncode = -15
+                return self._returncode
+            return await super().wait()
+
+    proc = SlowReap(fail_with=marker)
+    executor = ProcessExecutor(_spawn=Harness(proc).spawn)
+
+    async def drive() -> None:
+        task = asyncio.ensure_future(executor.run(["adb", "wait-for-device"], operation="probe"))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(drive())
+    assert proc.terminate_calls >= 1
+    assert proc.returncode is not None

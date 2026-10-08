@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from typing import Final
 
@@ -10,8 +9,6 @@ from emuctl.errors import InvalidSerialError
 from emuctl.log import sanitize
 
 __all__ = ["ADB_SERVER_VERBS", "is_valid_serial", "validate_serial"]
-
-logger = logging.getLogger(__name__)
 
 #: Pinned ADB server-verb exclusion list (§1 AdbController): device commands
 #: get automatic `-s <serial>` scoping, but these server verbs never do.
@@ -69,5 +66,4 @@ def validate_serial(s: object) -> None:
         return None
     reason = _rejection_reason(s) if isinstance(s, str) else "must be a string"
     shown = s if isinstance(s, str) else sanitize(repr(s))
-    logger.debug("serial rejected: %s (%s)", sanitize(shown), reason)
     raise InvalidSerialError(serial=shown, detail=reason)

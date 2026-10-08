@@ -27,19 +27,18 @@ def png_dimensions(data: bytes) -> tuple[int, int]:
     """
     if not isinstance(data, bytes):
         raise TypeError(f"png_dimensions requires bytes, got {type(data).__name__}")
-    buf = data
-    if len(buf) < len(_PNG_SIGNATURE) or buf[:8] != _PNG_SIGNATURE:
+    if len(data) < len(_PNG_SIGNATURE) or data[:8] != _PNG_SIGNATURE:
         raise ValueError("not a PNG: bad signature")
-    if len(buf) < _MIN_LENGTH:
-        raise ValueError(f"truncated PNG: {len(buf)} bytes, need at least {_MIN_LENGTH}")
-    length = int.from_bytes(buf[8:12], "big")
-    chunk_type = buf[12:16]
+    if len(data) < _MIN_LENGTH:
+        raise ValueError(f"truncated PNG: {len(data)} bytes, need at least {_MIN_LENGTH}")
+    length = int.from_bytes(data[8:12], "big")
+    chunk_type = data[12:16]
     if chunk_type != _IHDR_TYPE:
         raise ValueError("PNG missing IHDR as first chunk")
     if length != _IHDR_DATA_LENGTH:
         raise ValueError(f"bad IHDR length: {length}")
-    width = int.from_bytes(buf[16:20], "big")
-    height = int.from_bytes(buf[20:24], "big")
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
     if width == 0 or height == 0:
         raise ValueError("PNG IHDR has zero dimension")
     return (width, height)

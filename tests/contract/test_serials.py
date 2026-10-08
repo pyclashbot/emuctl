@@ -29,7 +29,8 @@ def test_valid_serials_accepted(serial: str) -> None:
 def test_no_case_folding_both_cases_are_distinct_but_valid() -> None:
     assert is_valid_serial("ABC") is True
     assert is_valid_serial("abc") is True
-    assert "ABC" != "abc"
+    assert validate_serial("ABC") is None
+    assert validate_serial("abc") is None
 
 
 @pytest.mark.parametrize(
@@ -94,3 +95,12 @@ def test_server_verb_exclusion_list_pinned_and_frozen() -> None:
         == ADB_SERVER_VERBS
     )
     assert isinstance(ADB_SERVER_VERBS, frozenset)
+
+
+def test_public_serial_api_bound_at_package_root() -> None:
+    import emuctl
+
+    assert emuctl.is_valid_serial is is_valid_serial
+    assert emuctl.validate_serial is validate_serial
+    assert "is_valid_serial" in emuctl.__all__
+    assert "validate_serial" in emuctl.__all__

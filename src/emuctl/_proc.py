@@ -181,29 +181,39 @@ class ProcessExecutor:
         args = _validate_argv(argv)
         budget = resolve_timeout(timeout, QUERY_TIMEOUT, operation=operation)
         logger.debug("proc run op=%s argv=%s", sanitize(operation), [sanitize(a) for a in args])
-        proc = await self._spawn_fn(args)
-        self._track(proc)
+        start = time.monotonic()
+        deadline = start + budget if budget is not None else None
+        proc: _ProcessHandle | None = None
         try:
-            start = time.monotonic()
-            deadline = start + budget if budget is not None else None
             try:
                 if budget is None:
+                    proc = await self._spawn_fn(args)
+                    self._track(proc)
                     stdout, stderr = await proc.communicate()
                 else:
-                    stdout, stderr = await asyncio.wait_for(proc.communicate(), budget)
+
+                    async def _spawn_and_communicate() -> tuple[bytes, bytes]:
+                        nonlocal proc
+                        spawned = await self._spawn_fn(args)
+                        proc = spawned
+                        self._track(spawned)
+                        return await spawned.communicate()
+
+                    stdout, stderr = await asyncio.wait_for(_spawn_and_communicate(), budget)
             except TimeoutError:
                 elapsed = time.monotonic() - start
-                logger.debug(
-                    "proc timeout op=%s after=%.2fs; abandoning child", sanitize(operation), elapsed
-                )
-                await self._abandon(proc)
+                if proc is not None:
+                    logger.debug("proc abandon op=%s", sanitize(operation))
+                    await self._abandon(proc)
                 raise OperationTimeoutError(
                     operation=operation, deadline=deadline, elapsed=elapsed
                 ) from None
             except asyncio.CancelledError:
-                logger.debug("proc cancelled op=%s; abandoning child", sanitize(operation))
-                await asyncio.shield(self._abandon(proc))
+                if proc is not None:
+                    logger.debug("proc abandon op=%s", sanitize(operation))
+                    await asyncio.shield(self._abandon(proc))
                 raise
+            assert proc is not None
             returncode = proc.returncode
             if returncode is None:
                 returncode = await proc.wait()
@@ -216,7 +226,8 @@ class ProcessExecutor:
             )
             return ProcessResult(stdout=stdout, stderr=stderr, returncode=returncode)
         finally:
-            self._untrack(proc)
+            if proc is not None:
+                self._untrack(proc)
 
     async def close(self) -> None:
         """Idempotent: abandon every still-tracked straggler, then return.
