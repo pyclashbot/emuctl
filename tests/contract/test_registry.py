@@ -372,7 +372,7 @@ def test_key_structural_rule_still_lives_in_identity() -> None:
 #: (only docstring stubs exist), so the test pins the honest not-implemented
 #: state and the full assertions activate row-by-row later.
 CONFORMANCE_ROWS = [
-    (BackendId.ADB, False),
+    (BackendId.ADB, True),
     (BackendId.MEMU, False),
     (BackendId.BLUESTACKS, False),
     (BackendId.BLUESTACKS_AIR, False),
