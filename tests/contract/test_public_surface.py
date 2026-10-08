@@ -45,14 +45,15 @@ MULTI_INSTANCE_PROMISE = (
 #: Deliberate, exactly-per-contract public surface. NOT exported: registry/
 #: selection machinery (available_backends/get_registry/resolve_backend/
 #: load_adapter/BackendSpec — discover() is the ONLY enumeration path,
-#: §1 invariant 11 + §3 Boundary), the sync facade surface (connect_sync is
-#: §5-derived and lands with the sync PR), §8-deferred members (is_running,
+#: §1 invariant 11 + §3 Boundary), §8-deferred members (is_running,
 #: resolve_target, run_vendor_cmd, stop_app, screen_size), and internals
 #: (sanitize, wait_until, _proc).
 EXPECTED_EXPORTS: frozenset[str] = frozenset(
     {
         # Construction + enumeration (§3/§5).
         "connect",
+        "connect_sync",
+        "EmulatorController",
         "discover",
         "BackendStatus",
         "DiscoveryReport",
@@ -131,7 +132,6 @@ FORBIDDEN_EXPORTS: tuple[str, ...] = (
     "resolve_backend",
     "load_adapter",
     "BackendSpec",
-    "connect_sync",
     "is_running",
     "resolve_target",
     "run_vendor_cmd",
