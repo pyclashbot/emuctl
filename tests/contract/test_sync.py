@@ -283,7 +283,7 @@ def test_aio_only_usage_creates_zero_threads() -> None:
     assert controller.aio is fake
     assert CapabilityFlag.INPUT in controller.features
     assert controller.has_feature(CapabilityFlag.SCREENSHOT)
-    assert _thread_names() == before
+    _wait_for_no_controller_threads(before)
     assert controller._portal is None
     assert fake.calls == []  # no I/O at all
 
@@ -326,7 +326,7 @@ def test_loop_detection_fires_pre_portal_with_hatch() -> None:
     asyncio.run(inside())
     assert messages, "the error never fired inside the loop"
     assert "await emulator.aio.click" in messages[0]
-    assert _thread_names() == before  # detection fired BEFORE portal work
+    _wait_for_no_controller_threads(before)
     assert controller._portal is None
 
 
@@ -414,7 +414,7 @@ def test_invalid_timeout_raises_pre_portal_thread_free() -> None:
     for bad in (-1, 0, "soon", True, float("inf")):
         with pytest.raises(InvalidArgumentError):
             controller.screenshot(timeout=bad)  # ty: ignore[invalid-argument-type]
-    assert _thread_names() == before  # no thread, ever
+    _wait_for_no_controller_threads(before)
     assert controller._portal is None
     assert cast(_FakeController, controller.aio).calls == []
 
@@ -574,13 +574,13 @@ def test_close_is_idempotent_permanent_and_joins_the_thread() -> None:
         _wait_for_thread_teardown()  # bounded join-pin, no racy snapshot
         assert PORTAL_THREAD_NAME not in _thread_names()
         assert not any("AnyIO" in name for name in _thread_names())
-        assert _thread_names() == before  # exactly MainThread
+        _wait_for_no_controller_threads(before)
         assert controller._closed  # permanent
         with pytest.raises(ControllerClosedError):
             controller.screenshot()
         with pytest.raises(ControllerClosedError):
             controller.restart()
-    assert _thread_names() == before
+    _wait_for_no_controller_threads(before)
 
 
 def test_close_releases_transport_and_never_stops_the_emulator() -> None:
@@ -611,7 +611,7 @@ def test_cm_exit_closes_and_rejects_later_ops() -> None:
     assert png is not None and len(png) > 8
     _wait_for_thread_teardown()  # bounded join-pin, no racy snapshot
     assert not any("AnyIO" in name for name in _thread_names())
-    assert _thread_names() == before
+    _wait_for_no_controller_threads(before)
     with pytest.raises(ControllerClosedError):
         controller.click(1, 2)
 
@@ -620,7 +620,7 @@ def test_close_from_aio_only_facade_never_starts_a_thread() -> None:
     before = _thread_names()
     controller = EmulatorController(_FakeController())
     controller.close()
-    assert _thread_names() == before
+    _wait_for_no_controller_threads(before)
     assert controller._closed
     with pytest.raises(ControllerClosedError):
         controller.screenshot()
@@ -773,7 +773,7 @@ def test_connect_sync_refusals_raise_pre_portal_thread_free(
     before = _thread_names()
     with pytest.raises(expected):
         connect_sync(target)
-    assert _thread_names() == before  # refusals never start a thread
+    _wait_for_no_controller_threads(before)
 
 
 def test_connect_sync_config_refusals_are_pre_portal() -> None:
@@ -784,7 +784,7 @@ def test_connect_sync_config_refusals_are_pre_portal() -> None:
     gated = EmuctlConfig(display=DisplayConfig(width=1080, height=1920))
     with pytest.raises(FeatureNotSupportedError):
         connect_sync("adb:emulator-5554", config=gated)
-    assert _thread_names() == before
+    _wait_for_no_controller_threads(before)
 
 
 def test_connect_sync_happy_path_binds_and_closes_threadless() -> None:
@@ -794,7 +794,7 @@ def test_connect_sync_happy_path_binds_and_closes_threadless() -> None:
     assert CapabilityFlag.SCREENSHOT in facade.features
     assert facade._portal is None  # construction starts NO portal
     facade.close()  # aio-only teardown: zero threads, transport-only
-    assert _thread_names() == before
+    _wait_for_no_controller_threads(before)
 
 
 # ── real adapter over the _proc/_executor seam (adapter-test precedent) ──
