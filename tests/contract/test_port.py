@@ -575,7 +575,10 @@ def test_timeout_groups_resolve_to_pinned_constants() -> None:
     create_slice = fake.calls[-1][1]
     assert fake.calls[-1][0] == "_create"
     assert isinstance(create_slice, float)
-    assert 0 < create_slice <= PROVISION_TIMEOUT
+    # Windows timer granularity (~15.6 ms default tick) can read the
+    # pre-check's elapsed as zero, leaving the slice at the deadline
+    # float's own ulp — sometimes an ulp ABOVE the constant
+    assert 0 < create_slice <= PROVISION_TIMEOUT + 1e-9
     assert create_slice > PROVISION_TIMEOUT - 0.1  # pre-check was ~free
     asyncio.run(fake.install_apk("game.apk"))
     assert fake.calls[-1] == ("_install_apk", APP_TIMEOUT)
@@ -895,7 +898,10 @@ def test_create_ignores_bound_identity_and_returns_new_ref() -> None:
     create_slice = next(v for name, v in fake.calls if name == "_create")
     # remaining slice of the ONE shared provision budget (§2), not a fresh one
     assert isinstance(create_slice, float)
-    assert 0 < create_slice <= PROVISION_TIMEOUT
+    # Windows timer granularity (~15.6 ms default tick) can read the
+    # pre-check's elapsed as zero, leaving the slice at the deadline
+    # float's own ulp — sometimes an ulp ABOVE the constant
+    assert 0 < create_slice <= PROVISION_TIMEOUT + 1e-9
     assert create_slice > PROVISION_TIMEOUT - 0.1
 
 
