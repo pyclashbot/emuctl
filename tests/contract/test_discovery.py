@@ -198,8 +198,9 @@ def test_discover_offline_probes_nothing(
 
 
 def test_discover_online_reports_stub_adapters_honestly(windows_host: Any) -> None:
-    # Adapter modules are docstring stubs: the online path must report
-    # "adapter-unavailable" rows, never raise.
+    # Remaining adapter modules are docstring stubs: the online path must
+    # report "adapter-unavailable" rows, never raise. (ADB is implemented, so
+    # its row reflects the live host and is asserted with fakes in test_adb.)
     for name in (
         "emuctl.backends.adb",
         "emuctl.backends.memu",
@@ -212,7 +213,7 @@ def test_discover_online_reports_stub_adapters_honestly(windows_host: Any) -> No
     by_id = {status.backend: status for status in report.backends}
     # Windows-resolvable stubs report honestly; Air is macOS-only so a
     # Windows host reports its platform refusal instead.
-    for backend in (BackendId.ADB, BackendId.MEMU, BackendId.BLUESTACKS):
+    for backend in (BackendId.MEMU, BackendId.BLUESTACKS):
         assert by_id[backend].available is False
         assert by_id[backend].reason == "adapter-unavailable"
         assert by_id[backend].instances == ()
