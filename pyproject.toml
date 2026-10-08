@@ -13,7 +13,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 keywords = ["adb", "android-emulator", "memu", "bluestacks", "avd"]
-dependencies = ["anyio>=4"]
+dependencies = ["anyio>=4.10"]
 
 [project.urls]
 Repository = "https://github.com/pyclashbot/emuctl"

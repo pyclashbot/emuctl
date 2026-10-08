@@ -312,7 +312,7 @@ release = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anyio", specifier = ">=4" },
+    { name = "anyio", specifier = ">=4.10" },
     { name = "click", marker = "extra == 'all'", specifier = ">=8.2" },
     { name = "click", marker = "extra == 'cli'", specifier = ">=8.2" },
     { name = "pymemuc", marker = "extra == 'all'", specifier = ">=0.6,<0.7" },

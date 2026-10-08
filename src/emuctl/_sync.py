@@ -62,9 +62,10 @@ Interpretation decisions (CONTRACT §5 wins; these fill its silences):
   pre-portal, no thread ever started — then forward it VERBATIM so the
   async port resolves DEFAULT against its own group constant (same groups,
   pinned in the timing table; asserted by conformance).
-- ``close()`` detection of "called from the portal's own thread" keys on
-  anyio's recorded event-loop-thread ident (read-only use of a private
-  attribute, hedged); in that branch the drain is driven directly on the
+- ``close()`` detection of "called from the portal's own thread" keys on the
+  portal loop captured at portal start time (a clean anyio-supported
+  snapshot: ``start_task_soon(asyncio.get_running_loop)`` once, no reads of
+  anyio privates); in that branch the drain is driven directly on the
   already-running loop (non-blocking schedule) because no blocking call
   may wait on the portal from inside it. Worker threads spawned by
   ``to_thread`` (the ReadyCheck path) are NOT the portal thread: they take
@@ -86,7 +87,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import anyio
 from anyio import CancelScope
-from anyio.from_thread import BlockingPortal, start_blocking_portal
+from anyio.from_thread import start_blocking_portal
 
 from emuctl._discovery import _resolve_config, _resolve_target
 from emuctl.config.model import ensure_config_supported
@@ -114,6 +115,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from contextlib import AbstractContextManager
 
+    from anyio.from_thread import BlockingPortal
+
     from emuctl._identification import InstanceRef
     from emuctl.config.model import ConfigSpec, CreateSpec, EmuctlConfig
     from emuctl.port import CapabilityFlag, ProbeResult, ReadyCheck
@@ -129,16 +132,6 @@ PORTAL_THREAD_NAME: Final[str] = "emuctl-portal"
 #: returned an awaitable (misdispatched async path): the probe coroutine is
 #: closed and the predicate re-invoked with the async controller on the loop.
 _MISPATCH: Final[object] = object()
-
-
-def _portal_thread_ident(portal: BlockingPortal) -> int | None:
-    """The ident of the thread running the portal's event loop.
-
-    Reads anyio's per-portal recording (private attribute, hedged via
-    getattr). Used ONLY by ``close()``'s from-portal-thread deadlock guard.
-    """
-    ident: Any = getattr(portal, "_event_loop_thread_id", None)
-    return ident if isinstance(ident, int) else None
 
 
 def _check_timeout(timeout: TimeoutParam, group: float, operation: str) -> None:
@@ -222,16 +215,10 @@ class EmulatorController:
     """
 
     def __init__(self, controller: AsyncEmulatorController) -> None:
-        if not isinstance(controller, AsyncEmulatorController):
-            raise InvalidArgumentError(
-                parameter="controller",
-                constraint="must be an AsyncEmulatorController "
-                "(EmulatorController is built only by connect_sync())",
-            )
         self._ctl = controller
         self._portal_cm: AbstractContextManager[BlockingPortal] | None = None
         self._portal: BlockingPortal | None = None
-        self._portal_ident: int | None = None
+        self._portal_loop: asyncio.AbstractEventLoop | None = None
         self._closed = False
         self._portal_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -248,25 +235,41 @@ class EmulatorController:
     # ── the funnel ──
 
     def _ensure_portal(self) -> BlockingPortal:
-        """Lazily start THE one portal for this facade (thread-safe)."""
+        """Lazily start THE one portal for this facade (thread-safe).
+
+        A racing ``close()`` snapshots and clears portal state under
+        :attr:`_portal_lock` after raising the closed flag, so a call that
+        loses that race either drains the freshly-started portal itself
+        (no leak) or finds the state cleared here (raises).
+        """
+        if self._closed:
+            raise ControllerClosedError()
         portal = self._portal
         if portal is not None:
             return portal
         with self._portal_lock:
-            if self._portal is None:
-                self._portal_cm = start_blocking_portal(backend="asyncio", name=PORTAL_THREAD_NAME)
-                self._portal = self._portal_cm.__enter__()
-                self._portal_ident = _portal_thread_ident(self._portal)
-                logger.debug("portal started thread=%s", PORTAL_THREAD_NAME)
-            return self._portal
+            portal = self._portal
+            if portal is not None:
+                return portal
+            if self._closed:
+                raise ControllerClosedError()
+            self._portal_cm = start_blocking_portal(backend="asyncio", name=PORTAL_THREAD_NAME)
+            self._portal = portal = self._portal_cm.__enter__()
+            # Capture the portal's running loop ONCE, on the portal loop
+            # itself (clean anyio mechanism — no anyio private state).
+            self._portal_loop = portal.start_task_soon(asyncio.get_running_loop).result()
+            logger.debug("portal started thread=%s", PORTAL_THREAD_NAME)
+            return portal
 
     def _call(self, op: str, /, *args: Any, **kwargs: Any) -> Any:
         """The SOLE funnel from the sync surface to the portal loop.
 
         Order LOCKED by §5: closed check → running-loop detection (neither
-        starts any thread) → lazy portal start → portal call. Cancellation
-        caused by a racing ``close()`` converts to ``ControllerClosedError``
-        (§5's abandoned-caller rule); other exceptions cross unchanged.
+        starts any thread) → lazy portal start → re-check against a racing
+        ``close()`` → portal call. Cancellation or anyio's portal-stopping
+        ``RuntimeError`` shapes caused by a racing ``close()`` convert to
+        ``ControllerClosedError`` (§5's abandoned-caller rule); other
+        exceptions cross unchanged.
         """
         if self._closed:
             raise ControllerClosedError()
@@ -280,12 +283,17 @@ class EmulatorController:
                 f"escape hatch: `await emulator.aio.{op}(...)` instead"
             )
         portal = self._ensure_portal()
+        if self._closed:
+            # Lost a race with close(): the loser always gets the typed error.
+            raise ControllerClosedError()
         try:
             return portal.call(self._call_on_loop, op, args, kwargs)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
                 raise  # abandon: the portal task keeps running (§5)
-            if self._closed and isinstance(exc, CancelledError):
+            if self._closed and isinstance(exc, (CancelledError, RuntimeError)):
+                # Close-race shapes: the cancelled task funnel, or anyio's
+                # "portal is not running" / "event loop closed" RuntimeError.
                 raise ControllerClosedError() from exc
             raise
 
@@ -300,11 +308,6 @@ class EmulatorController:
     def aio(self) -> AsyncEmulatorController:
         """The native async view; never starts the portal (§5)."""
         return self._ctl
-
-    @property
-    def identity(self) -> InstanceRef:
-        """§1 zero-I/O declared attribute, portal-free."""
-        return self._ctl.identity
 
     @property
     def features(self) -> frozenset[CapabilityFlag]:
@@ -423,12 +426,27 @@ class EmulatorController:
             await self._ctl.aclose()
 
     async def _drain_and_stop(self, portal: BlockingPortal) -> None:
-        """From-portal-thread close drain: release, then trigger the portal's
-        cancel-first shutdown from inside the loop (non-blocking for close())."""
+        """From-portal-thread close drain: release transport in a shielded
+        step, then trigger the portal's cancel-first shutdown from inside the
+        loop (both are non-blocking for ``close()``, which returns without
+        waiting; the CM join happens on the helper thread)."""
         with CancelScope(shield=True):
             await self._ctl.aclose()
         with CancelScope(shield=True):
             await portal.stop(cancel_remaining=True)
+
+    @staticmethod
+    def _exit_portal_cm(cm: AbstractContextManager[BlockingPortal]) -> None:
+        """Join the portal thread — from a HELPER thread, never the portal's
+        own (the CM's ``__exit__`` is a blocking portal call + join; that is
+        exactly what the from-portal-loop path must not do).
+        """
+        try:
+            cm.__exit__(None, None, None)
+        except RuntimeError:
+            # Portal already stopping/stopped (teardown shapes in the CM's
+            # own stop call); the join in its ``finally`` already ran.
+            logger.debug("portal CM exit dismissed a teardown shape")
 
     def close(self) -> None:
         """Permanent shutdown: idempotent, cancel-first, transport-only, and
@@ -444,34 +462,46 @@ class EmulatorController:
             if self._closed:
                 return
             self._closed = True
-        cm = self._portal_cm
+            # Snapshot AND clear the portal state under the same lock that
+            # guards lazy start: a first-op that loses this race either
+            # started before us (we drain its portal here — no leak) or
+            # finds the state cleared in _ensure_portal() (typed refusal).
+            with self._portal_lock:
+                cm = self._portal_cm
+                portal = self._portal
+                loop = self._portal_loop
+                if cm is not None:
+                    self._portal = None
+                    self._portal_cm = None
+                    self._portal_loop = None
         if cm is None:
             # ``.aio``-only facade (portal never started, zero threads):
             # drain the release on a throwaway loop (anyio confined here).
             anyio.run(self._drain_close)
             return
-        portal = self._portal
-        assert portal is not None
-        if _portal_thread_ident(portal) == threading.get_ident():
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:  # pragma: no cover - cannot happen on that thread
-                loop = None
-            if loop is not None:
-                # Deadlock guard: called from the portal's own loop thread —
-                # no blocking call may wait on the portal from inside it; drive
-                # the drain directly on the already-running loop instead and
-                # return without joining (the drain + shutdown run there).
-                loop.create_task(self._drain_and_stop(portal))
-                return
+        if portal is None:  # unreachable: _portal is set with _portal_cm
+            raise ControllerClosedError()
+        caller_loop: asyncio.AbstractEventLoop | None = None
+        with contextlib.suppress(RuntimeError):
+            caller_loop = asyncio.get_running_loop()
+        if loop is not None and caller_loop is loop:
+            # Deadlock guard: called from the portal's own loop thread (the
+            # loop was captured at portal start) — no blocking call may wait
+            # on the portal from inside it. The transport release drains as
+            # a non-blocking task on the already-running loop, and the CM
+            # exit (stop + join) runs on a helper thread; close() returns
+            # without blocking.
+            caller_loop.create_task(self._drain_and_stop(portal))
+            threading.Thread(
+                target=self._exit_portal_cm, args=(cm,), name="emuctl-portal-join"
+            ).start()
+            return
         portal.start_task_soon(self._drain_close)
         # cancel-first (§5); RuntimeError = portal already stopping,
         # CancelledError = the stop task self-cancelled during group teardown.
         with contextlib.suppress(RuntimeError, CancelledError):
             portal.call(portal.stop, True)
         cm.__exit__(None, None, None)  # joins the portal thread
-        self._portal = None
-        self._portal_cm = None
         logger.debug("facade closed ref=%s", sanitize(str(self._ctl.identity)))
 
     # ── CM shape (§5: __enter__/__exit__ only; start nothing, boot explicit) ──

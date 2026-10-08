@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from typing import Any, cast
 
 import pytest
+from anyio.from_thread import BlockingPortal
 
 from emuctl._identification import BackendId, InstanceRef
 from emuctl._proc import ProcessExecutor
@@ -236,7 +237,6 @@ def test_aio_only_usage_creates_zero_threads() -> None:
     controller = EmulatorController(fake)
     before = _thread_names()
     assert controller.aio is fake
-    assert controller.identity == REF
     assert CapabilityFlag.INPUT in controller.features
     assert controller.has_feature(CapabilityFlag.SCREENSHOT)
     assert _thread_names() == before
@@ -623,6 +623,87 @@ def test_op_on_dead_facade_is_typed_even_for_internal_drain() -> None:
             controller.create(CreateSpec(name="x"))
 
 
+def test_close_from_portal_loop_predicate_completes_without_deadlock() -> None:
+    """The docstring's claimed shape: close() invoked from a predicate running
+    ON the portal loop completes (non-blocking drain, no deadlock), the portal
+    drains, and the abandoned caller gets the typed error."""
+    deadline = time.monotonic() + 5.0
+    with _facade() as controller:
+        controller.is_app_installed("com.example")  # portal started
+
+        async def closing_pred(_controller: Any) -> bool:
+            controller.close()
+            await asyncio.sleep(0.05)  # let the non-blocking drain run first
+            return True
+
+        with pytest.raises(ControllerClosedError):
+            controller.restart(ready=closing_pred)
+        assert controller._closed
+        while PORTAL_THREAD_NAME in _thread_names():
+            assert time.monotonic() < deadline, "portal thread never drained"
+            time.sleep(0.01)
+    assert controller._closed
+    with pytest.raises(ControllerClosedError):
+        controller.screenshot()
+
+
+def test_close_vs_first_call_race_all_outcomes_typed_and_no_leak() -> None:
+    """Stress pin: close() racing the first op; the loser always raises
+    ``ControllerClosedError``, and no portal thread ever survives."""
+    before = _thread_names()
+    for _ in range(25):
+        controller = EmulatorController(_FakeController())
+        barrier = threading.Barrier(2)
+        outcomes: list[BaseException | None] = []
+
+        def opener(controller=controller, barrier=barrier, outcomes=outcomes) -> None:
+            barrier.wait(2)
+            try:
+                controller.screenshot(timeout=0.2)
+            except BaseException as exc:  # noqa: BLE001 - the pinned loser shape
+                outcomes.append(exc)
+            else:
+                outcomes.append(None)
+
+        def closer(controller=controller, barrier=barrier) -> None:
+            barrier.wait(2)
+            controller.close()
+
+        opener_thread = threading.Thread(target=opener)
+        closer_thread = threading.Thread(target=closer)
+        opener_thread.start()
+        closer_thread.start()
+        opener_thread.join(5.0)
+        closer_thread.join(5.0)
+        assert not opener_thread.is_alive()
+        assert not closer_thread.is_alive()
+        for outcome in outcomes:
+            assert outcome is None or isinstance(outcome, ControllerClosedError), outcome
+        assert controller._closed
+        assert PORTAL_THREAD_NAME not in _thread_names()
+        controller.close()  # idempotent, joins nothing leaked
+    assert _thread_names() == before
+
+
+def test_keyboard_interrupt_abandons_and_facade_stays_usable(monkeypatch: Any) -> None:
+    """An interrupt through the funnel is abandon (§5): the op raises KI and
+    the still-running facade remains usable afterwards."""
+    with _facade() as controller:
+        controller.screenshot()  # portal started
+
+        def interrupted(_self: Any, _fn: Any, *args: Any, **kwargs: Any) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(BlockingPortal, "call", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            controller.screenshot()
+        monkeypatch.undo()
+        png = controller.screenshot()  # the facade is NOT poisoned
+        assert png.startswith(b"\x89PNG")
+        controller.close()
+    assert controller._closed
+
+
 # ── connect_sync (§5 construction, gate chain run synchronously) ──
 
 
@@ -660,7 +741,6 @@ def test_connect_sync_happy_path_binds_and_closes_threadless() -> None:
     before = _thread_names()
     facade = connect_sync("adb:127.0.0.1:5555")
     assert isinstance(facade, EmulatorController)
-    assert facade.identity == InstanceRef(backend=BackendId.ADB, key="127.0.0.1:5555")
     assert CapabilityFlag.SCREENSHOT in facade.features
     assert facade._portal is None  # construction starts NO portal
     facade.close()  # aio-only teardown: zero threads, transport-only
