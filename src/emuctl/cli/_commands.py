@@ -50,6 +50,7 @@ Interpretation decisions (CONTRACT §5 wins; these fill its silences):
 from __future__ import annotations
 
 import importlib.metadata
+import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -387,7 +388,22 @@ async def run(argv: Sequence[str] | None = None) -> int:
         # §5's silent 141: keep the interpreter's own shutdown flush from
         # re-raising against the dead sink (Windows lacks SIGPIPE, so the
         # stray flush otherwise turns the pinned exit into the default 120).
-        silence_broken_pipe()
+        if silence_broken_pipe():
+            # A REAL process-level stdout/stderr fd was silenced, which means
+            # a teardown flush against the dead pipe was possible. On Windows
+            # (no SIGPIPE: the process survives the failed write) Python's
+            # shutdown then re-flushes the buffered streams into the closed
+            # pipe, the "ValueError: I/O operation on closed pipe" error path
+            # fires, and the interpreter overrides OUR exit code with the
+            # default 120. The devnull dup2 makes those flushes harmless, but
+            # the only POSIX-identical, race-free ending is to never run
+            # shutdown at all: terminate the process HERE with the pinned 141
+            # (§5's "silent exit 141" contract) so no atexit / GC / stream
+            # finalization can rewrite it. POSIX is byte-identical anyway —
+            # it already died at SIGPIPE before reaching this line — and
+            # in-process callers (CliRunner / fake streams with no fileno)
+            # never take this branch, so tests keep running normally.
+            os._exit(EXIT_BROKEN_PIPE)
         return EXIT_BROKEN_PIPE
     except KeyboardInterrupt:
         # §5: "KeyboardInterrupt ⇒ 130 always, no traceback".

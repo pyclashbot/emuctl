@@ -83,7 +83,7 @@ class PipeClosed(Exception):
     """
 
 
-def silence_broken_pipe() -> None:
+def silence_broken_pipe() -> bool:
     """Point the real ``sys.stdout`` file descriptor at ``os.devnull`` after a
     broken-pipe write (the canonical Python recipe, §5's silent 141).
 
@@ -95,12 +95,23 @@ def silence_broken_pipe() -> None:
     unaffected: with SIGPIPE restored to ``SIG_DFL`` the process is already
     dead at the signal before this helper ever runs, and in-process callers
     (mock streams without a ``fileno``) simply fall through.
+
+    Returns whether a REAL process-level fd was silenced. Callers use this to
+    decide the hard-shutdown path: only a real fd can produce a teardown flush
+    that rewrites the exit code, so only a real fd justifies abandoning
+    interpreter shutdown (see :func:`emuctl.cli._commands.run`). CliRunner /
+    fake streams have no ``fileno`` and never reach the interpreter's own
+    flush, so they yield ``False`` and in-process control keeps flowing.
     """
-    with contextlib.suppress(AttributeError, ValueError, OSError):
-        fileno = sys.stdout.fileno()
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, fileno)
-        os.close(devnull)
+    silenced = False
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError, OSError):
+            fileno = stream.fileno()
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, fileno)
+            os.close(devnull)
+            silenced = True
+    return silenced
 
 
 def _stdout() -> Any:
