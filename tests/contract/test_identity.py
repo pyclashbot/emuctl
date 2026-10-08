@@ -87,28 +87,35 @@ def test_bare_targets_rejected_with_prefix_hint(bare: str) -> None:
     assert excinfo.value.error_code == "invalid_argument"
 
 
-def test_host_port_without_prefix_names_unknown_id_with_prefix_hint() -> None:
-    # "127.0.0.1:5555" is head:key-shaped, so per the §3 selection order the
-    # head is an unknown backend id — with the prefix hint carried in detail.
-    with pytest.raises(BackendNotFoundError) as excinfo:
+def test_host_port_without_prefix_rejected_with_prefix_hint() -> None:
+    # §3: bare host:port is a non-canonical shape — InvalidArgumentError with
+    # the canonical-prefix hint, never BackendNotFoundError or shape inference.
+    with pytest.raises(InvalidArgumentError) as excinfo:
         InstanceRef.parse("127.0.0.1:5555")
-    assert excinfo.value.backend_id == "127.0.0.1"
-    assert "backend:key" in (excinfo.value.detail or "")
+    assert excinfo.value.parameter == "target"
+    assert "backend:key" in excinfo.value.constraint
+    assert "adb:127.0.0.1:5555" in excinfo.value.constraint
+    assert excinfo.value.error_code == "invalid_argument"
 
 
-def test_transport_id_serial_without_prefix_names_unknown_id() -> None:
-    # Same head:key logic for the documented `transport_id:N` serial shape:
-    # no shape inference — the head is simply not a known backend id.
-    with pytest.raises(BackendNotFoundError) as excinfo:
+def test_transport_id_serial_without_prefix_rejected_with_prefix_hint() -> None:
+    # Same §3 bare-shape rule for the documented `transport_id:N` serial shape:
+    # no shape inference — uniformly InvalidArgumentError with the hint.
+    with pytest.raises(InvalidArgumentError) as excinfo:
         InstanceRef.parse("transport_id:5")
-    assert excinfo.value.backend_id == "transport_id"
-    assert "backend:key" in (excinfo.value.detail or "")
+    assert excinfo.value.parameter == "target"
+    assert "backend:key" in excinfo.value.constraint
+    assert excinfo.value.error_code == "invalid_argument"
 
 
-def test_unknown_backend_prefix_raises_not_found() -> None:
-    with pytest.raises(BackendNotFoundError) as excinfo:
+def test_unknown_backend_prefix_rejected_with_prefix_hint() -> None:
+    # Parse failures are uniformly InvalidArgumentError; BackendNotFoundError
+    # remains the domain of BackendId.from_string + registry selection.
+    with pytest.raises(InvalidArgumentError) as excinfo:
         InstanceRef.parse("foo:bar")
-    assert excinfo.value.backend_id == "foo"
+    assert excinfo.value.parameter == "target"
+    assert "backend:key" in excinfo.value.constraint
+    assert excinfo.value.error_code == "invalid_argument"
 
 
 @pytest.mark.parametrize("bad", ["adb:", ":myvm", ":", ""])

@@ -6,6 +6,14 @@ redefined). Key validation seam: construction enforces the structural rules
 selection time once the spec table lands in a later PR — this module performs
 no backend import (STATIC core→backend imports would violate the §6 layers
 contract), so there is deliberately no registry hook here yet.
+
+Parse rule (§3): ``InstanceRef.parse`` accepts canonical ``backend:key`` with
+a KNOWN backend only. Every other input — colon-less bare shapes (bare
+serial/name) AND colon-containing bare shapes (``host:port``,
+``transport_id:N``) AND unknown ``head:key`` prefixes — is an
+``InvalidArgumentError`` with the canonical-prefix hint. No shape inference.
+``BackendNotFoundError`` is the domain of ``BackendId.from_string`` and
+registry selection, never of ``parse``.
 """
 
 from __future__ import annotations
@@ -102,9 +110,13 @@ class InstanceRef:
 
         A bare serial, host:port, or name (no ``backend:`` prefix) is an
         ``InvalidArgumentError`` telling the caller to prefix (e.g.
-        ``'adb:127.0.0.1:5555'``) — no shape inference, no fan-out. A
-        ``head:key`` shape with an unknown head raises ``BackendNotFoundError``
-        (per the §3 selection order) with the prefix hint in ``detail``.
+        ``'adb:127.0.0.1:5555'``) — no shape inference, no fan-out. The same
+        ``InvalidArgumentError`` covers colon-containing bare shapes (e.g.
+        ``'127.0.0.1:5555'``, ``'transport_id:5'``) and unknown ``head:key``
+        prefixes: parse never infers a backend from shape, and parse failures
+        are uniformly ``InvalidArgumentError``. ``BackendNotFoundError``
+        remains the domain of ``BackendId.from_string`` and registry
+        selection.
         """
         if not isinstance(text, str) or ":" not in text:
             raise InvalidArgumentError(
@@ -124,12 +136,10 @@ class InstanceRef:
         try:
             backend = BackendId.from_string(head)
         except BackendNotFoundError:
-            raise BackendNotFoundError(
-                backend_id=head,
-                detail=(
-                    "use canonical 'backend:key' form "
-                    "(e.g. 'adb:127.0.0.1:5555'); "
-                    "a bare serial, host:port, or name needs its backend prefix"
+            raise InvalidArgumentError(
+                parameter="target",
+                constraint=(
+                    f"use canonical 'backend:key' form (e.g. 'adb:127.0.0.1:5555'); got {text!r}"
                 ),
             ) from None
         return cls(backend=backend, key=key)

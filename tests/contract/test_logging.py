@@ -24,11 +24,16 @@ def test_import_is_silent_and_null_handler_idempotent(capsys) -> None:  # type: 
     for name in stale:
         del sys.modules[name]
     try:
-        import emuctl  # noqa: F811
-        import emuctl.errors  # noqa: F401,F811
-        import emuctl.log  # noqa: F401,F811
-        import emuctl.timing  # noqa: F401,F811
-        import emuctl.waits  # noqa: F401,F811
+        import pkgutil
+
+        import emuctl  # noqa: F401
+
+        submodule_names = sorted(
+            module.name for module in pkgutil.walk_packages(emuctl.__path__, prefix="emuctl.")
+        )
+        assert len(submodule_names) > 5
+        for dotted in submodule_names:
+            importlib.import_module(dotted)
 
         out, err = capsys.readouterr()
     finally:

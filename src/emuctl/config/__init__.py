@@ -94,6 +94,8 @@ _FALSE_TOKENS: Final[frozenset[str]] = frozenset({"false", "0"})
 
 def _shown(value: object) -> str | int | float | bool | None:
     """Project an arbitrary TOML value into the ConfigError value payload."""
+    if isinstance(value, RendererMode):
+        return value.value
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return None
@@ -149,13 +151,7 @@ def _coerce_leaf(leaf: str, value: object, *, layer: str) -> str | int | bool | 
     kind = _LEAVES[leaf]
 
     def fail(expected: str) -> ConfigValidationError:
-        if isinstance(value, RendererMode):
-            shown: str | int | float | bool | None = value.value
-        elif value is None or isinstance(value, (str, int, float, bool)):
-            shown = value
-        else:
-            shown = None
-        return ConfigValidationError(layer=layer, path=leaf, value=shown, expected=expected)
+        return ConfigValidationError(layer=layer, path=leaf, value=_shown(value), expected=expected)
 
     if value is None:
         return None
@@ -325,8 +321,7 @@ def _read_toml_file(path: Path, *, layer: str) -> Mapping[str, object]:
         ) from None
 
 
-def _apply_project_file(path: Path, out: _Collector) -> None:
-    data = _read_toml_file(path, layer="project")
+def _apply_project_file(path: Path, data: Mapping[str, object], out: _Collector) -> None:
     if path.name == "pyproject.toml":
         tool = data.get("tool")
         if not isinstance(tool, Mapping):
@@ -338,26 +333,26 @@ def _apply_project_file(path: Path, out: _Collector) -> None:
     _walk_mapping(out, data, layer="project", prefix="")
 
 
-def _find_project_file(cwd: Path) -> Path | None:
+def _find_project_file(cwd: Path) -> tuple[Path, Mapping[str, object]] | None:
     """Walk cwd → parents; per dir `emuctl.toml` wins over `[tool.emuctl]`.
 
     The FIRST dir containing either is authoritative; outer dirs are ignored.
-    Pure apart from existence probes at the discovered candidate paths.
+    A present-but-broken file (unreadable or unparseable) raises ConfigError
+    loudly — the walk never masks a user's broken authoritative file. Only
+    absence (layer not present) or a VALID pyproject.toml lacking the
+    `[tool.emuctl]` table is skipped.
     """
     for directory in (cwd, *cwd.parents):
         candidate = directory / "emuctl.toml"
         if candidate.is_file():
-            return candidate
+            data = _read_toml_file(candidate, layer="project")
+            return (candidate, data)
         pyproject = directory / "pyproject.toml"
         if pyproject.is_file():
-            try:
-                with open(pyproject, "rb") as handle:
-                    data = tomllib.load(handle)
-            except (OSError, tomllib.TOMLDecodeError):
-                continue
+            data = _read_toml_file(pyproject, layer="project")
             tool = data.get("tool")
             if isinstance(tool, Mapping) and isinstance(tool.get("emuctl"), Mapping):
-                return pyproject
+                return (pyproject, data)
     return None
 
 
@@ -479,9 +474,9 @@ def resolve_config(
                 _walk_mapping(
                     out, _read_toml_file(user_path, layer="user"), layer="user", prefix=""
                 )
-            project_path = _find_project_file(base)
-            if project_path is not None:
-                _apply_project_file(project_path, out)
+            found = _find_project_file(base)
+            if found is not None:
+                _apply_project_file(found[0], found[1], out)
     _apply_env(environ, out)
     out.apply_flags(dict(flags) if flags else {}, "flags")
     return ResolvedConfig(config=_build_config(out), warnings=tuple(out.warnings))
