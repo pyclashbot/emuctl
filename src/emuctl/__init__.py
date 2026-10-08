@@ -19,19 +19,29 @@ data types):
   the public security control.
 - Screenshot data (§4): :func:`png_dimensions`.
 
-Import discipline (§6 lazy package rule / §1 invariant 11): importing this
+Import discipline (§6 rule 3 — "dynamic adapter imports happen ONLY via
+`load_adapter`, never ad-hoc" — plus §6's import-linter bullet "the lazy
+loader's dynamic import is deliberately invisible to it"): importing this
 package loads NO ``emuctl.backends.*`` modules — adapters are imported
 lazily, only inside :func:`connect` / :func:`discover`, exclusively through
 the registry's ``load_adapter``. No I/O, no handlers, no stdout at import
 (§2 logging discipline; consumers attach handlers to the ``"emuctl"``
 logger).
+
+Sequencing honesty: this surface is the §5 construction path plus the
+§3/§4 data types. It is the v0 basis the first stacked PRs built against;
+the sync facade's full member list and the §8 deferred members are
+sequenced per the contract (§5's sync members arrive with the sync PR;
+§8 items re-add only on a named consumer trigger) — read this docstring
+and ``tests/contract/test_public_surface.py`` as the pinned truth, not a
+claim of literal one-to-one §5 member parity at every intermediate commit.
 """
 
-import logging
+from logging import NullHandler, getLogger
 
-_package_logger = logging.getLogger(__name__)
-if not any(isinstance(h, logging.NullHandler) for h in _package_logger.handlers):
-    _package_logger.addHandler(logging.NullHandler())
+_package_logger = getLogger(__name__)
+if not any(isinstance(h, NullHandler) for h in _package_logger.handlers):
+    _package_logger.addHandler(NullHandler())
 
 from emuctl._discovery import (  # noqa: E402
     BackendStatus,
@@ -102,7 +112,12 @@ from emuctl.timing import (  # noqa: E402
     SNAPSHOT_TIMEOUT,
 )
 
+# __all__ convention: grouped in CONTRACT section order (§2 errors/timing →
+# §1 port pins → §3 identity/discovery → §4 config → §5 surfaces), then
+# sorted within each group. The pinned membership lives in
+# tests/contract/test_public_surface.py (EXPECTED_EXPORTS).
 __all__: list[str] = [
+    # §2 — errors + timing.
     "APP_TIMEOUT",
     "AdbConfig",
     "AdbController",

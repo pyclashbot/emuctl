@@ -14,6 +14,12 @@ offline parameter today, so offline enumeration is un-implementable). Cold
 
 Interpretation decisions (CONTRACT §3 wins; these fill its silences):
 
+- `discover(backends=…)` accepts a sequence-or-None selector ONLY: §3's
+  pinned signature (`backends=None` defaulting to the full registry) names
+  no scalar form, so a bare `str`/`BackendId` is a typed refusal
+  (`InvalidArgumentError(parameter="backends")`) — a str would otherwise
+  silently decompose into an empty selection.
+
 - `connect()` lives here (this module's title line pins it): canonical
   targets ONLY (`InstanceRef` or `'backend:key'` string — bare shapes are
   uniformly `InvalidArgumentError` via `InstanceRef.parse`), refusals raise
@@ -227,12 +233,25 @@ async def connect(
 
 def _wanted_ids(backends: Iterable[BackendId | str] | None) -> list[BackendId]:
     """Normalize the `discover` selector: unknown ids raise NOW
-    (`BackendNotFoundError`), never as per-backend rows."""
+    (`BackendNotFoundError`), never as per-backend rows. A bare scalar
+    (`"adb"` / `BackendId.ADB`) is a typed `InvalidArgumentError` — §3 pins
+    no scalar form (`backends=None` defaults, anything else is a sequence);
+    refusing protects callers who pass one backend thinking it is accepted.
+    """
     if backends is None:
         # Function-local: §6 forbids core→backends static imports.
         from emuctl.backends._registry import get_registry
 
         return sorted(get_registry(), key=lambda item: item.value)
+    if isinstance(backends, (str, BackendId)):
+        # A str is iterable itself, so without this gate "adb" would silently
+        # decompose into the empty sequence [] — a footgun, unwrapped here.
+        raise InvalidArgumentError(
+            parameter="backends",
+            constraint="must be a sequence of BackendId values or canonical "
+            "backend-id strings (e.g. [BackendId.ADB]), or None for all backends "
+            "— a bare scalar is not a valid selector",
+        )
     wanted: list[BackendId] = []
     for raw in backends:
         item = raw if isinstance(raw, BackendId) else BackendId.from_string(raw)

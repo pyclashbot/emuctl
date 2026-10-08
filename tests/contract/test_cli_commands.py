@@ -204,6 +204,18 @@ def test_version_json_document_key_order_is_deterministic() -> None:
     assert list(json.loads(out)) == ["schema_version", "emuctl_version"]
 
 
+def test_version_resolves_no_config() -> None:
+    """Interpretation ledger (`_commands`, "``version`` resolves NO config"):
+    version is the cheapest early probe, so even a --config PATH pointing at
+    an unreadable file (which would be a typed ConfigError exit 3 for any
+    other verb) is never opened for it — exit 0, clean stdout document."""
+    code, out, err = _run(["--json", "--config", "/nonexistent/emuctl.toml", "version"])
+    assert code == EXIT_OK, err
+    document = _doc(out)
+    assert document["schema_version"] == 1
+    assert err == ""
+
+
 # ── arity refusals (§5: "arity PER VERB") ──
 
 

@@ -22,11 +22,12 @@ import pytest
 
 import emuctl
 from emuctl._discovery import BackendStatus, DiscoveryReport
-from emuctl._identification import BackendId, InstanceRef
+from emuctl._identification import BackendId, InstanceRecord, InstanceRef
 from emuctl._platforms import Platform
 from emuctl.config.model import DisplayConfig, EmuctlConfig, MemuConfig
 from emuctl.errors import (
     BackendNotAvailableError,
+    ExtrasMissingError,
     FeatureNotSupportedError,
     InstanceNotFoundError,
     InvalidArgumentError,
@@ -42,12 +43,16 @@ MULTI_INSTANCE_PROMISE = (
     "N independent controllers per process are supported; no global registry, locks, or kills."
 )
 
-#: Deliberate, exactly-per-contract public surface. NOT exported: registry/
-#: selection machinery (available_backends/get_registry/resolve_backend/
-#: load_adapter/BackendSpec — discover() is the ONLY enumeration path,
-#: §1 invariant 11 + §3 Boundary), §8-deferred members (is_running,
-#: resolve_target, run_vendor_cmd, stop_app, screen_size), and internals
-#: (sanitize, wait_until, _proc).
+#: Deliberate public surface (the §5 construction path + §3/§4 data types —
+#: sequenced per the contract, NOT a literal one-to-one "exactly-per-contract"
+#: claim: §5's full sync-facade member list arrives with the sync PR and §5/§8
+#: deferrals stay withdrawn). NOT exported, in three groups: registry/selection
+#: machinery (available_backends/get_registry/resolve_backend/load_adapter/
+#: BackendSpec — discover() is the ONLY enumeration path, §1 invariant 11 +
+#: §3 Boundary), library internals (sanitize, wait_until, TimeoutParam,
+#: resolve_timeout, BACKEND_STATUS_REASONS, MECHANICS, PROBE_REASONS, the
+#: _proc module itself), and §8-deferred members (is_running, resolve_target,
+#: run_vendor_cmd, stop_app, screen_size).
 EXPECTED_EXPORTS: frozenset[str] = frozenset(
     {
         # Construction + enumeration (§3/§5).
@@ -124,21 +129,29 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
     }
 )
 
-#: Names that must NEVER resolve on the package (enumeration machinery, §8
-#: deferrals, internals).
+#: Names that must NEVER resolve on the package, in the three groups above:
 FORBIDDEN_EXPORTS: tuple[str, ...] = (
+    # §6/§3 registry + selection machinery
     "available_backends",
     "get_registry",
     "resolve_backend",
     "load_adapter",
     "BackendSpec",
+    # library internals (§6 implementation; §1/mechanics constants)
+    "sanitize",
+    "wait_until",
+    "TimeoutParam",
+    "resolve_timeout",
+    "BACKEND_STATUS_REASONS",
+    "MECHANICS",
+    "PROBE_REASONS",
+    "_proc",
+    # §8 deferrals
     "is_running",
     "resolve_target",
     "run_vendor_cmd",
     "stop_app",
     "screen_size",
-    "sanitize",
-    "wait_until",
 )
 
 
@@ -166,16 +179,37 @@ def test_public_surface_is_exactly_the_contract_list() -> None:
     assert missing == [], f"exports advertised but unresolvable: {missing}"
 
 
-@pytest.mark.parametrize("name", sorted(EXPECTED_EXPORTS))
-def test_every_export_is_freshly_importable(name: str) -> None:
-    value = getattr(importlib.import_module("emuctl"), name)
-    assert value is not None
+def test_connect_and_discover_signatures_are_pinned() -> None:
+    """The two §3/§5 entry functions carry the contract's keyword-only
+    `config=None` shape — pinned via inspect.signature (replaces a
+    tautological attribute-existence pin: the import-silence subprocess test
+    above already proves fresh-interpreter importability)."""
+    import inspect
+
+    connect_sig = inspect.signature(emuctl.connect)
+    assert list(connect_sig.parameters) == ["target", "config"]
+    assert connect_sig.parameters["config"].default is None
+    assert connect_sig.parameters["config"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    discover_sig = inspect.signature(emuctl.discover)
+    assert list(discover_sig.parameters) == ["backends", "config", "offline"]
+    assert discover_sig.parameters["config"].default is None
+    assert discover_sig.parameters["config"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert discover_sig.parameters["offline"].default is False
+    assert discover_sig.parameters["offline"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_registry_machinery_is_not_public() -> None:
     """discover() is the ONLY enumeration path (§1 invariant 11, §3 Boundary):
     registry/selection functions never leak onto the package."""
+    #: Submodule names: a foreign test importing ``emuctl._proc`` binds it as a
+    #: parent attribute via the import protocol — that is ambient, NOT an
+    #: export; membership is pinned through ``__all__`` separately below.
+    module_only = {"_proc"}
     for name in FORBIDDEN_EXPORTS:
+        if name in module_only:
+            assert name not in emuctl.__all__, name
+            continue
         assert not hasattr(emuctl, name), name
         assert name not in emuctl.__all__, name
 
@@ -307,17 +341,6 @@ def _install_fake_module(
     monkeypatch.setitem(sys.modules, module_name, module)
 
 
-def _adb_record(key: str) -> Any:
-    from emuctl._identification import InstanceRecord
-
-    return InstanceRecord(
-        ref=InstanceRef(backend=BackendId.ADB, key=key),
-        running=True,
-        serial=key,
-        details={"transport": "adb"},
-    )
-
-
 def test_connect_binds_identity_and_touches_no_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -350,12 +373,85 @@ def test_connect_config_gate_refuses_at_construction(
     assert excinfo.value.feature == "configure"
 
 
+# ── §3 refusal-order + scalars through the package surface ──
+
+
+def test_connect_spec_none_refusal_reason_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The google-play row is spec None ⇒ the typed refusal is
+    BackendNotAvailableError with EXACTLY the §2/§3 not-implemented token
+    (never "platform-unsupported", never a BackendNotFoundError)."""
+    with pytest.raises(BackendNotAvailableError) as excinfo:
+        asyncio.run(emuctl.connect("google-play:anything"))
+    assert excinfo.value.reason == "not-implemented-this-version"
+
+
+@pytest.mark.parametrize("scalar", ["adb", BackendId.ADB])
+def test_discover_scalar_selector_refused_through_package_surface(
+    scalar: str | BackendId,
+) -> None:
+    """§3 pins no scalar form for discover's `backends`: the same typed
+    refusal the internal suite pins (test_discovery) fires through the
+    package surface — a str would otherwise decompose into an empty pick."""
+    with pytest.raises(InvalidArgumentError) as excinfo:
+        asyncio.run(emuctl.discover(scalar))
+    assert excinfo.value.parameter == "backends"
+
+
+def test_discover_row_per_refusal_mode_is_the_boundary_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The enumeration/refusal boundary, pinned as ONE pair: spec-None rows
+    become BackendStatus DATA on discover (never a raise), while the same
+    address constructs nothing — connect() raises instead (§3)."""
+    report = asyncio.run(emuctl.discover([BackendId.GOOGLE_PLAY]))
+    (row,) = report.backends
+    assert row.available is False
+    assert row.reason == "not-implemented-this-version"
+    with pytest.raises(BackendNotAvailableError) as excinfo:
+        asyncio.run(emuctl.connect("google-play:anything"))
+    assert excinfo.value.reason == "not-implemented-this-version"
+
+
+def test_selection_order_platform_before_deps_through_package_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deps-arm cases and the §3 fixed refusal ORDER through the package:
+    on a non-Windows host memu refuses platform-unsupported EVEN WITH its dep
+    also missing (platform wins), and on Windows the dep arm raises
+    ExtrasMissingError naming `[memu]`."""
+    from emuctl.backends import _registry
+
+    monkeypatch.setattr(_registry, "current_platform", lambda: Platform.MACOS)
+    monkeypatch.setattr(_registry, "_dep_available", lambda name: False)
+    with pytest.raises(BackendNotAvailableError) as excinfo:
+        asyncio.run(emuctl.connect("memu:pyclashbot-136"))
+    assert excinfo.value.reason == "platform-unsupported"
+
+    monkeypatch.setattr(_registry, "current_platform", lambda: Platform.WINDOWS)
+    with pytest.raises(ExtrasMissingError) as excinfo2:
+        asyncio.run(emuctl.connect("memu:pyclashbot-136"))
+    assert excinfo2.value.extra == "memu"
+
+
+def test_distinct_keys_mean_independent_controllers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§3's parallel-controller promise, distinct-keys arm: two controllers
+    for DIFFERENT refs in one process share nothing (no registry, no locks,
+    no state bleed) — the same-ref pair is pinned above."""
+    _install_fake_module(monkeypatch, "emuctl.backends.adb", "AdbController")
+    _IoFreeDummy.constructed = []
+    first = asyncio.run(emuctl.connect("adb:emulator-5554"))
+    second = asyncio.run(emuctl.connect("adb:emulator-5556"))
+    assert first is not second
+    assert first.identity != second.identity
+    assert _IoFreeDummy.constructed == ["adb:emulator-5554", "adb:emulator-5556"]
+
+
 def test_discover_rows_via_package_surface(monkeypatch: pytest.MonkeyPatch) -> None:
     """discover() through the package enumerates the scripted fake's rows,
     isolated per backend, with the JSON-safe projection intact (§5's CLI
     shape is fed from this surface)."""
-    from emuctl._identification import InstanceRecord
-
     rows = tuple(
         InstanceRecord(
             ref=InstanceRef(backend=BackendId.ADB, key=key),

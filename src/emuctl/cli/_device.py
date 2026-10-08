@@ -27,6 +27,15 @@ Interpretation decisions (CONTRACT §5 wins; these fill its silences):
 - ``screenshot -o FILE`` reports the captured geometry through §4's core
   ``png_dimensions`` helper (the consumer-facing shape reader), never a
   second PNG decode.
+- Configuration keys are validated/coerced through ``emuctl.config``'s
+  private members (``_LEAVES`` / ``_coerce_leaf(key, token, layer="flags")``)
+  — a deliberate §6-rule-2-style boundary crossing: §5's "one-key ConfigSpec
+  overlay" must validate EXACTLY like the §4 flags/leaf grammar, and that
+  truth lives once in the config layer. This private import (function-local,
+  ``layer="flags"``) is preferable to duplicating or broadly re-exporting the
+  leaf table; recorded here as the interpretation ledger for this PR's
+  review (no refactor planned — it reopens only if the overlay grammar
+  diverges from the flag grammar).
 """
 
 from __future__ import annotations

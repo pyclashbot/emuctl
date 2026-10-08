@@ -164,6 +164,20 @@ def test_discover_unknown_ids_raise(backends: list[Any], windows_host: Any) -> N
         asyncio.run(discover(backends))
 
 
+@pytest.mark.parametrize("scalar", ["adb", BackendId.ADB])
+def test_discover_refuses_a_bare_scalar_selector(
+    scalar: str | BackendId, windows_host: Any
+) -> None:
+    """§3 pins NO scalar form for `backends` (sequence-or-None only). A str is
+    itself iterable, so without the typed refusal `discover("adb")` would
+    silently decompose into an empty selection — _discovery's ``_wanted_ids``
+    raises the typed ``InvalidArgumentError`` instead (§3's pinned signature
+    reads)."""
+    with pytest.raises(InvalidArgumentError) as excinfo:
+        asyncio.run(discover(scalar))
+    assert excinfo.value.parameter == "backends"
+
+
 def test_discover_offline_probes_nothing(
     windows_host: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

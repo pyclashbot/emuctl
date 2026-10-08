@@ -2,14 +2,22 @@ name: Release
 
 # python-semantic-release job-based setup per the official UV integration guide
 # (https://python-semantic-release.readthedocs.io/en/latest/configuration/configuration-guides/uv_integration.html)
+# Release gating (§6 "Commitizen `cz check` for conventional-commit gates
+# alongside python-semantic-release"): the release runs only AFTER a successful
+# CI run of the same commit (workflow_run + conclusion gate) — never in
+# parallel with it.
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
 jobs:
   build:
     name: Build next version artifacts
     runs-on: ubuntu-latest
+    # The gate: CI must have SUCCEEDED for the same commit before any release
+    # work runs downstream (skipped here ⇒ skipped release ⇒ skipped deploy).
+    if: github.event.workflow_run.conclusion == 'success'
     permissions:
       contents: read
     outputs:
