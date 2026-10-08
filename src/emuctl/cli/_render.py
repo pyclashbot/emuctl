@@ -260,12 +260,32 @@ def emit_raw(data: bytes) -> None:
     A closed sink raises :class:`PipeClosed` (→ exit 141, silent).
     """
     stream = getattr(sys.stdout, "buffer", None)
+    with contextlib.suppress(BrokenPipeError, OSError, ValueError):
+        # Flush any pending text-layer bytes first so ordering is preserved.
+        sys.stdout.flush()
     try:
-        if stream is None:  # pragma: no cover - text-only capture surfaces
-            stream = _stdout()
-        stream.write(data)
-        stream.flush()
-    except BrokenPipeError as exc:
-        raise PipeClosed from exc
-    except ValueError as exc:  # closed file object
+        # When a real process-level fd exists, write via the UNBUFFERED
+        # ``os.write`` syscall: a dead pipe fails with ``BrokenPipeError``/
+        # ``OSError`` IMMEDIATELY here (deterministically, incl. Windows,
+        # where a buffered write can succeed into the pipe buffer and the
+        # death only surfaces at shutdown flush — forcing exit 120).
+        io = getattr(sys.stdout, "buffer", _stdout())
+        fd = -1
+        try:
+            fd = io.fileno()
+        except (AttributeError, OSError, ValueError):
+            fd = -1
+        if fd >= 0:
+            view = memoryview(data)
+            os.write(fd, view[:0])  # canary: raises immediately on a dead pipe
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.write(fd, b"")  # no-op write still errors if the pipe died now
+        else:
+            if stream is None:  # pragma: no cover - text-only capture surfaces
+                stream = _stdout()
+            stream.write(data)
+            stream.flush()
+    except (BrokenPipeError, OSError, ValueError) as exc:
         raise PipeClosed from exc
