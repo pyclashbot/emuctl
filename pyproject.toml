@@ -1,0 +1,112 @@
+[project]
+name = "emuctl"
+version = "0.1.0"
+description = "A higher-level, vendor-agnostic Android emulator controller library."
+readme = "README.md"
+authors = [{ name = "Martin Miglio", email = "martin@pyclashbot.app" }]
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+classifiers = [
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["adb", "android-emulator", "memu", "bluestacks", "avd"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/pyclashbot/emuctl"
+Contract = "https://github.com/pyclashbot/emuctl/blob/main/CONTRACT.md"
+
+[project.optional-dependencies]
+memu = ["pymemuc>=0.6,<0.7"]
+bluestacks = []
+google-play = []
+avd = []
+cli = ["click>=8.2"]
+all = ["pymemuc>=0.6,<0.7", "click>=8.2"]
+
+[dependency-groups]
+dev = ["pytest>=8", "import-linter>=2.15", "pre-commit>=4"]
+lint = ["ruff>=0.14", "ty>=0.0", "commitizen>=4"]
+release = ["python-semantic-release>=10", "griffe>=1"]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.10"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "emuctl"
+
+[tool.importlinter]
+root_package = "emuctl"
+
+# import-linter's `layers` contract requires sibling layers, but emuctl.backends is a
+# subpackage of emuctl ("shared descendants" error) — this forbidden contract is the
+# idiomatic equivalent of CONTRACT §6's rule: core never statically imports backends
+# (the lazy loader's dynamic import is deliberately invisible to it).
+[[tool.importlinter.contracts]]
+name = "Core never imports backends"
+type = "forbidden"
+source_modules = ["emuctl"]
+forbidden_modules = ["emuctl.backends"]
+
+[[tool.importlinter.contracts]]
+name = "Backend families are independent"
+type = "independence"
+include_external_packages = false
+modules = [
+  "emuctl.backends.adb",
+  "emuctl.backends.memu",
+  "emuctl.backends.bluestacks",
+  "emuctl.backends.google_play",
+  "emuctl.backends.avd",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "T20", "TID", "S"]
+ignore = ["S101"]  # assert in tests is fine
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"subprocess".msg = "GO through emuctl._proc.run_process; direct subprocess use is banned outside _proc.py."
+
+[tool.ruff.lint.per-file-ignores]
+# the single sanctioned subprocess import point (TID251 exemption is file-wide — keep banned-api single-entry)
+"src/emuctl/_proc.py" = ["TID251"]
+"tests/**" = ["TID251", "S602", "S603", "S607", "T201"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+update_changelog_on_bump = true
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+commit_parser = "conventional"
+tag_format = "v$version"
+commit_author = "github-actions[bot] <actions@github.com>"
+# UV recipe (PSR docs: configuration-guides/uv_integration): refresh the lock for the new
+# version, stage it into the release commit, then build. uv is on PATH via setup-uv in CI.
+build_command = """
+  uv lock --upgrade-package "$PACKAGE_NAME"
+  git add uv.lock
+  uv build
+"""
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["emulator: hardware-attached tests, opt-in via -m emulator (not CI)"]

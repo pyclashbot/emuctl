@@ -1,0 +1,18 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+*.egg-info/
+.coverage*
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+uv.lock.bak
+
+# worktrees / scratch (repo AGENTS.md convention)
+.tmp-*/
+
+# editors
+.idea/
+.vscode/
