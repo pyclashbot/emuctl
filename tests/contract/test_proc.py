@@ -125,7 +125,9 @@ def test_timeout_abandons_child_and_raises_operation_timeout() -> None:
     exc = excinfo.value
     assert exc.operation == "boot"
     assert exc.deadline is not None and exc.elapsed is not None
-    assert exc.elapsed >= 0.1
+    # Windows timer granularity (≈15.6 ms default tick) can report an elapsed
+    # a hair under the nominal budget even though the full budget was awaited.
+    assert exc.elapsed >= 0.1 - 0.02
     assert exc.elapsed < 5.0
     assert proc.terminate_calls == 1
     assert proc.returncode is not None  # reaped, no straggler
@@ -288,7 +290,9 @@ def test_hanging_spawn_is_bounded_by_deadline() -> None:
     with pytest.raises(OperationTimeoutError) as excinfo:
         asyncio.run(executor.run(["adb", "wait-for-device"], operation="boot", timeout=0.1))
     elapsed = time.monotonic() - start
-    assert excinfo.value.elapsed is not None and excinfo.value.elapsed >= 0.1
+    # Windows timer granularity (≈15.6 ms default tick) can report an elapsed
+    # a hair under the nominal budget even though the full budget was awaited.
+    assert excinfo.value.elapsed is not None and excinfo.value.elapsed >= 0.1 - 0.02
     assert elapsed < 5.0
 
 

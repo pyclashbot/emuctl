@@ -834,8 +834,13 @@ def test_restart_phases_share_one_shrinking_deadline() -> None:
     slices = {name: budget for name, budget in fake.calls if isinstance(budget, float)}
     assert slices["_is_running"] == pytest.approx(1.0, abs=0.05)
     assert all(budget <= 1.0 for budget in slices.values())
-    assert slices["_stop"] < slices["_is_running"]
-    assert slices["_start"] < slices["_stop"] - 0.05
+    # Each slice is the remaining-budget arithmetic (deadline − measured now).
+    # Windows timer granularity (≈15.6 ms default tick) can read a
+    # sub-granularity slice as costing zero, so the measured slice equals the
+    # previous one exactly — assert the shrink weakly, with an epsilon, not a
+    # strict wall-clock `<`.
+    assert slices["_stop"] <= slices["_is_running"] + 1e-6
+    assert slices["_start"] <= slices["_stop"] - 0.05 + 1e-6
 
 
 def test_restart_cancellation_propagates_unmodified() -> None:

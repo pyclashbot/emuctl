@@ -31,7 +31,9 @@ Interpretation decisions (CONTRACT §5 wins; these fill its silences):
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, Final
@@ -52,6 +54,7 @@ __all__ = [
     "json_safe",
     "render_suggestion",
     "shown",
+    "silence_broken_pipe",
 ]
 
 #: §5's output-contract anchor: every pinned JSON document carries it.
@@ -78,6 +81,26 @@ class PipeClosed(Exception):
     to :data:`emuctl.cli._exitmap.EXIT_BROKEN_PIPE` (141) with no traceback
     and no stderr noise (§5's pipe discipline).
     """
+
+
+def silence_broken_pipe() -> None:
+    """Point the real ``sys.stdout`` file descriptor at ``os.devnull`` after a
+    broken-pipe write (the canonical Python recipe, §5's silent 141).
+
+    Why: Windows has no SIGPIPE, so the broken pipe surfaces as an ordinary
+    ``BrokenPipeError`` — and then the interpreter's shutdown flush of the
+    still-buffered stdout re-raises it, turning the pinned exit 141 into the
+    default 120 ("Exception ignored"). Redirecting the underlying descriptor
+    makes every stray teardown flush land in the null device. POSIX is
+    unaffected: with SIGPIPE restored to ``SIG_DFL`` the process is already
+    dead at the signal before this helper ever runs, and in-process callers
+    (mock streams without a ``fileno``) simply fall through.
+    """
+    with contextlib.suppress(AttributeError, ValueError, OSError):
+        fileno = sys.stdout.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, fileno)
+        os.close(devnull)
 
 
 def _stdout() -> Any:

@@ -563,10 +563,34 @@ def test_log_config_is_consumed_by_the_cli_only(
 
 def _config_file(tmp_path: Path, log_path: Path) -> Path:
     """A one-line emuctl.toml pinning the log destination (§4's flag-only
-    --config escape hatch)."""
+    --config escape hatch).
+
+    The path is a TOML LITERAL string (`'…'`): in a basic string, every
+    backslash of a Windows path (`C:\\Users\\…`) is an escape sequence
+    (`\\UXXXX`) and the layer reads as broken — a POSIX-only illusion that
+    paths contain no backslash. Literal strings are backslash-transparent.
+    """
     path = tmp_path / "emuctl.toml"
-    path.write_text(f'[log]\nlevel = "debug"\nfile = "{log_path}"\n', encoding="utf-8")
+    path.write_text(f"[log]\nlevel = 'debug'\nfile = '{log_path}'\n", encoding="utf-8")
     return path
+
+
+def test_config_file_paths_are_toml_literal_strings(tmp_path: Path) -> None:
+    """Regression: a Windows-style backslash path embedded in the `--config`
+    TOML must survive the layer read (lexically pinned on every platform —
+    literal-string quoting, not basic-string escape sequences)."""
+    from emuctl.config import resolve_config
+
+    conf = tmp_path / "emuctl.toml"
+    conf.write_text(
+        r"""[log]
+file = 'C:\Users\runneradmin\Lib\emuctl.log'
+""",
+        encoding="utf-8",
+    )
+    resolved = resolve_config(config_file=str(conf))
+    assert resolved.warnings == ()
+    assert resolved.config.log.file == r"C:\Users\runneradmin\Lib\emuctl.log"
 
 
 def test_list_emits_one_bare_array(monkeypatch: pytest.MonkeyPatch) -> None:

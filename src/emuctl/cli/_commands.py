@@ -68,6 +68,7 @@ from emuctl.cli._render import (
     emit_line,
     emit_result,
     shown,
+    silence_broken_pipe,
 )
 from emuctl.errors import EmuctlError, InvalidArgumentError
 from emuctl.log import sanitize
@@ -383,6 +384,10 @@ async def run(argv: Sequence[str] | None = None) -> int:
             outcome = await outcome
         return int(outcome if outcome is not None else EXIT_OK)
     except PipeClosed:
+        # §5's silent 141: keep the interpreter's own shutdown flush from
+        # re-raising against the dead sink (Windows lacks SIGPIPE, so the
+        # stray flush otherwise turns the pinned exit into the default 120).
+        silence_broken_pipe()
         return EXIT_BROKEN_PIPE
     except KeyboardInterrupt:
         # §5: "KeyboardInterrupt ⇒ 130 always, no traceback".
