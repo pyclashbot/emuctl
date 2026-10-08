@@ -302,14 +302,42 @@ async def test_start_argv_is_detached_launch(air_module: Any, tmp_path: Path) ->
 
 
 @_sync
-async def test_start_instanceless_conf_launches_plain(air_module: Any, tmp_path: Path) -> None:
-    """A conf with NO instance keys (Air's coldest shape): no invented
-    --instance flag; the single VM launches plainly."""
+async def test_start_stale_identity_raises_typed_zero_io(air_module: Any, tmp_path: Path) -> None:
+    """§3's stale-ref rule in _start: a bound key that maps to NO instance
+    raises the typed ``InstanceNotFoundError`` BEFORE any I/O — the vendor's
+    launch-the-default-VM fallback is banned (identity rules)."""
     tools, conf = _make_env(tmp_path, conf_text='bst.other="1"\n')
     calls: list[list[str]] = []
-    ctl = _make(air_module, calls, _air_responder(calls), config=_config(tools, conf))
-    await ctl.start()
-    assert calls == [[str(tools / "BlueStacks")]]
+    ctl = _make(
+        air_module,
+        calls,
+        _air_responder(calls),
+        key="no-such",
+        config=_config(tools, conf),
+    )
+    with pytest.raises(InstanceNotFoundError):
+        await ctl.start()
+    assert calls == []  # zero I/O
+    assert ctl._spawned is None
+
+
+@_sync
+@pytest.mark.parametrize(
+    ("leaf", "value"),
+    [("resources.cpus", 0), ("resources.memory_mb", 0), ("display.width", -1)],
+)
+async def test_configure_out_of_range_leaf_refused_before_io(
+    air_module: Any, tmp_path: Path, leaf: str, value: int
+) -> None:
+    """§4 strict typed primitives (the memu ``_TABLE_INTS`` bounded-table
+    precedent, shared family table): an out-of-range overlay leaf is a typed
+    ``ConfigValidationError`` and NOTHING is written."""
+    tools, conf = _make_env(tmp_path)
+    before = conf.read_text(encoding="utf-8")
+    ctl = _make(air_module, [], _air_responder([]), config=_config(tools, conf))
+    with pytest.raises(ConfigValidationError):
+        await ctl.configure({leaf: value}, timeout=None)
+    assert conf.read_text(encoding="utf-8") == before
 
 
 @_sync
@@ -561,6 +589,40 @@ async def test_restart_ready_false_is_menu_not_reached(air_module: Any, tmp_path
     with pytest.raises(EmulatorNotReadyError) as excinfo:
         await ctl.restart(ready=lambda _ctl: False, timeout=None)  # type: ignore[misc,return-value]
     assert excinfo.value.reason == "menu_not_reached"
+
+
+@_sync
+async def test_restart_with_app_and_ready(air_module: Any, tmp_path: Path) -> None:
+    """Air's app-path leg (mirror of bs5's): ``restart(app=..., ready=...)``
+    funnels start_app's launch + bounded spawn-verify under the shared
+    deadline through hd-adb."""
+    tools, conf = _make_env(tmp_path)
+    calls: list[list[str]] = []
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        head = Path(argv[0]).name
+        if head == "BlueStacks":
+            return _SpawnedHandle()
+        if head == "pgrep":
+            return _FakeHandle(returncode=1)
+        if head == "hd-adb":
+            if "screencap" in argv:
+                return _FakeHandle(stdout=_png(), returncode=0)
+            if "pidof" in argv:
+                return _FakeHandle(stdout=b"4242\n", returncode=0)
+            return _FakeHandle(returncode=0)
+        return _FakeHandle()
+
+    ctl = _make(air_module, calls, respond, config=_config(tools, conf))
+
+    def ready(_controller: Any) -> bool:
+        return True
+
+    await ctl.restart(app="com.sky.dawn", ready=ready, timeout=None)  # type: ignore[misc,return-value]
+    tails = [" ".join(call[1:]) for call in calls if Path(call[0]).name == "hd-adb"]
+    assert any("monkey" in tail for tail in tails)
+    assert any("pidof" in tail for tail in tails)  # bounded spawn-verify (§1)
+    assert "connect" in calls[2]
 
 
 @_sync

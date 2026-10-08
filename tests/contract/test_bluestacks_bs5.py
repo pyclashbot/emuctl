@@ -678,6 +678,25 @@ async def test_configure_unknown_and_foreign_keys(bt_module: Any, tmp_path: Path
 
 
 @_sync
+@pytest.mark.parametrize(
+    ("leaf", "value"),
+    [("resources.cpus", 0), ("resources.memory_mb", 0), ("display.width", -1)],
+)
+async def test_configure_out_of_range_leaf_refused_before_io(
+    bt_module: Any, tmp_path: Path, leaf: str, value: int
+) -> None:
+    """§4 strict typed primitives (the memu ``_TABLE_INTS`` bounded-table
+    precedent): an out-of-range overlay leaf is a typed
+    ``ConfigValidationError`` and NOTHING is written."""
+    root, conf, _mim = _make_env(tmp_path)
+    before = conf.read_text(encoding="utf-8")
+    ctl = _make(bt_module, [], _ok(), config=_config(root, conf))
+    with pytest.raises(ConfigValidationError):
+        await ctl.configure({leaf: value}, timeout=None)
+    assert conf.read_text(encoding="utf-8") == before
+
+
+@_sync
 async def test_configure_none_reapplies_bound_config(bt_module: Any, tmp_path: Path) -> None:
     """``spec=None``: every non-None leaf of the bound config (§1.8) — here
     bluestacks.settings.high_fps + a renderer."""
@@ -732,6 +751,21 @@ async def test_configure_missing_conf_is_typed_unreadable(bt_module: Any, tmp_pa
         await ctl.configure({"display.renderer": "dx"}, timeout=None)
     assert excinfo.value.reason == "unreadable"
     assert calls == []
+
+
+def test_meta_parse_skips_noninstance_rows(bt_module: Any) -> None:
+    """_meta.parse's skip branch: rows missing a usable Name/InstanceName
+    (MIM FOLDER rows et al.) are skipped, never laundered into the
+    display→internal identity map."""
+    meta = bt_module._meta.parse(
+        '{"Organization": ['
+        '{"Name": "Folder", "InstanceName": ""},'
+        '{"Name": "", "InstanceName": "Rogue"},'
+        '{"Name": "Tiramisu64", "InstanceName": "Tiramisu64"}]}'
+    )
+    assert [(entry.name, entry.internal, entry.is_open) for entry in meta.entries] == [
+        ("Tiramisu64", "Tiramisu64", False)
+    ]
 
 
 # ── discovery rows (conf-FILE reads; offline; honest emptiness) ──

@@ -56,9 +56,9 @@ Interpretation decisions (CONTRACT wins; these fill its silences):
   store, then ``hd-adb connect`` against the private 5041 server) →
   settle → [app] → terminal. InstanceNotFoundError propagates raw
   (identity, not readiness — memu.py's reasoned addition).
-- ``_start`` is a DETACHED spawn through the executor's ``_spawn`` seam
-  (the child outlives the call — an awaited ``communicate()`` would block
-  until the emulator exits and then reap it; a GUI launch must not go
+- ``_start`` is a DETACHED spawn through the executor's ``spawn_detached``
+  member (the child outlives the call — an awaited ``communicate()`` would
+  block until the emulator exits and then reap it; a GUI launch must not go
   through ``ProcessExecutor.run``). The handle is retained UNTRACKED on
   ``self`` (protection from GC pipe decay); ``aclose()`` releases it
   without terminating — close() never stops the emulator (§1).
@@ -518,7 +518,7 @@ class BlueStacks5Controller(_AdbMiddleLayer):
         internal, _port = self._target_and_port()
         argv = _require_argv([self._player_path(), "--instance", internal])
         logger.debug("bluestacks start argv=%s", [sanitize(a) for a in argv])
-        self._spawned = await self._executor._spawn_fn(argv)
+        self._spawned = await self._executor.spawn_detached(argv, operation="bluestacks start")
         return None
 
     async def _stop(self, timeout: float | None) -> None:

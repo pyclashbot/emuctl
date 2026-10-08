@@ -49,8 +49,12 @@ Interpretation decisions (CONTRACT wins; these fill its silences):
 - Renderer: ``display.renderer`` AUTO → VULKAN (§4 macOS pin) resolved in
   ``_configure`` exactly like bs5 resolves to DirectX; the translator
   table is the SHARED family one (:mod:`emuctl.backends.bluestacks._conf`).
-- The launch is a DETACHED spawn through the executor's ``_spawn`` seam
-  (same reasoning as bs5._start — the GUI child outlives the call).
+- The launch is a DETACHED spawn through the executor's
+  ``spawn_detached`` member (same reasoning as bs5._start — the GUI child
+  outlives the call), behind a strict identity gate: a bound key mapping
+  to no instance raises the typed ``InstanceNotFoundError`` before I/O
+  (the vendor's launch-the-default-VM fallback is banned, §3 stale-ref
+  rule).
 """
 
 from __future__ import annotations
@@ -374,8 +378,10 @@ class BlueStacksAirController(_AdbMiddleLayer):
 
     def _launch_argv(self, internal: str) -> list[str]:
         """``<player> --instance <internal>`` — the vendor's macOS launch
-        argv (bluestacks.py:561-566); a single-instance with no internal
-        names launches plainly (no invented flags)."""
+        argv (bluestacks.py:561-566). ``internal`` always arrives resolved
+        (``_start`` raises before I/O when the bound key maps to nothing);
+        the no-flag plain launch only serves a hypothetical empty internal,
+        never an invented fallback launch."""
         argv = [self._tool(_PLAYER_NAME)]
         if internal:
             argv += ["--instance", internal]
@@ -408,16 +414,19 @@ class BlueStacksAirController(_AdbMiddleLayer):
 
     async def _start(self, timeout: float | None) -> None:
         """DETACHED launch (see bs5._start's reasoning): the GUI child
-        outlives the call; spawned through the executor's ``_spawn`` seam,
-        argv-only, never awaited."""
+        outlives the call; spawned through the executor's
+        ``spawn_detached`` member, argv-only, never awaited.
+
+        Identity first (§3 stale-ref rule, like every other phase): a bound
+        key that maps to no instance raises the typed
+        ``InstanceNotFoundError`` BEFORE any I/O — the vendor's
+        fallback-to-default-VM launch is banned (provisioning-as-identity
+        laundering, §Identity)."""
         del timeout  # the spawn seam is immediate; boot is not await-based
-        try:
-            internal, _port = self._target_and_port()
-        except InstanceNotFoundError:
-            internal = ""  # an instanceless conf still launches its (single) VM
+        internal, _port = self._target_and_port()
         argv = _require_argv(self._launch_argv(internal))
         logger.debug("bluestacks-air start argv=%s", [sanitize(a) for a in argv])
-        self._spawned = await self._executor._spawn_fn(argv)
+        self._spawned = await self._executor.spawn_detached(argv, operation="bluestacks-air start")
         return None
 
     async def _stop(self, timeout: float | None) -> None:

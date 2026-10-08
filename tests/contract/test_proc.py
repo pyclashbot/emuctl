@@ -413,3 +413,63 @@ def test_second_cancel_during_abandon_still_cancels_and_cleans_up() -> None:
     asyncio.run(drive())
     assert proc.terminate_calls >= 1
     assert proc.returncode is not None
+
+
+# ── spawn_detached: the executor-owned fire-and-forget GUI launch (§6) ──
+
+
+def test_spawn_detached_argv_validation_matches_run() -> None:
+    calls: list[list[str]] = []
+
+    async def spawn(argv: Sequence[str]) -> FakeProcess:
+        calls.append(list(argv))
+        raise AssertionError("spawn must not run on invalid argv")
+
+    executor = ProcessExecutor(_spawn=spawn)
+    with pytest.raises(InvalidArgumentError):
+        asyncio.run(executor.spawn_detached("player --instance x"))
+    with pytest.raises(InvalidArgumentError):
+        asyncio.run(executor.spawn_detached(["player", 5]))  # ty: ignore[invalid-argument-type]
+    assert calls == []
+
+
+def test_spawn_detached_is_untracked_and_never_swept() -> None:
+    """The returned handle is deliberately untracked: ``close()`` must NOT
+    abandon it (terminate/kill stay untouched) — and it must never be
+    awaited (a ``communicate()`` on this fake would hang for 30 s; the bottle
+    proves no drain happened)."""
+    proc = FakeProcess(hang=True)
+    harness = Harness(proc)
+    executor = ProcessExecutor(_spawn=harness.spawn)
+
+    async def main() -> None:
+        spawned = await executor.spawn_detached(["player", "--instance", "x"])
+        assert spawned is proc
+        assert harness.seen == [["player", "--instance", "x"]]
+        await executor.close()  # sweeps tracked children — NOT this one
+
+    asyncio.run(main())
+    assert proc.terminate_calls == 0
+    assert proc.kill_calls == 0
+    assert proc.returncode is None  # never reaped; the GUI child keeps its life
+
+
+def test_spawn_detached_default_spawner_discards_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production detached shape: stdout/stderr DEVNULL (a GUI child can
+    never deadlock on un-drained pipes), argv verbatim, no-window flags."""
+    captured: dict[str, object] = {}
+
+    async def fake_create(*argv: str, **kwargs: object) -> FakeProcess:
+        captured["argv"] = list(argv)
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    asyncio.run(_proc._default_spawn_detached(["player", "--instance", "x"]))
+    assert captured["argv"] == ["player", "--instance", "x"]
+    assert captured["stdout"] == _proc.DEVNULL
+    assert captured["stderr"] == _proc.DEVNULL
+    assert captured["creationflags"] == _proc._creationflags()
+    assert "timeout" not in captured  # fire-and-forget: fire() only, forget() by caller

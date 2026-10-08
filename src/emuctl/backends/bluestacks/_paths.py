@@ -180,9 +180,3 @@ def mim_meta_path(cfg: BlueStacksConfig, *, platform: Platform | None = None) ->
     if host is Platform.MACOS:
         return _MACOS_CONF_BASE.joinpath(*_MACOS_MIM_META_REL)
     return None
-
-
-#: Bundled-lived tool names per host (single site; used by both family
-#: adapters via ``tool_path`` above).
-PLAYER_NAME: Final[dict[str, str]] = dict(_PLAYER_NAME)
-HD_ADB_NAME: Final[dict[str, str]] = dict(_HD_ADB_NAME)

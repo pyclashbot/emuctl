@@ -331,6 +331,30 @@ def _int(key: str, value: object) -> int:
     return value
 
 
+#: Int leaves → minimum bound (translate-time range table; the memu.py
+#: ``_TABLE_INTS`` bounded-table precedent: every overlay leaf is re-checked
+#: here so an out-of-range value can never reach the vendor store). All
+#: BlueStacks family ranges are lower-bounded only — maxima are None.
+_INT_BOUNDS: Final[Mapping[str, int]] = {
+    "display.width": 1,
+    "display.height": 1,
+    "display.dpi": 1,
+    "display.fps": 1,
+    "resources.cpus": 1,
+    "resources.memory_mb": 1,
+}
+
+
+def _bounded_int(key: str, value: object) -> int:
+    """Type + range check for a table int leaf (minimum ``_INT_BOUNDS[key]``;
+    the same typed ``ConfigValidationError`` MEmu raises for range breaks)."""
+    checked = _int(key, value)
+    minimum = _INT_BOUNDS[key]
+    if checked < minimum:
+        raise _fail(key, checked, f"an int >= {minimum}")
+    return checked
+
+
 def _str_pair(key: str, value: str, internal: str) -> tuple[str, str]:
     return (f"bst.instance.{internal}.{key}", value)
 
@@ -343,6 +367,9 @@ def translate(
     The overlay/bound source is already classified (see
     :func:`overlay_entries`); translation validates VALUES strictly —
     unknown renderer spellings and type/range breaks are typed refusals.
+    Range checking runs EVERY int leaf through :data:`_INT_BOUNDS`
+    (the memu.py ``_TABLE_INTS`` bounded-table precedent), so an
+    out-of-range overlay value is refused BEFORE any store write.
     The custom-resolution absorb fires once, after width/height are known
     to both exist. A None entry targets nothing (leave as-is), per §4's
     overlay semantics.
@@ -353,9 +380,9 @@ def translate(
         if value is None:
             continue
         if key == "display.width":
-            width = _int(key, value)
+            width = _bounded_int(key, value)
         elif key == "display.height":
-            height = _int(key, value)
+            height = _bounded_int(key, value)
 
     new_doc = doc
     for key, value in entries:
@@ -371,15 +398,17 @@ def translate(
         elif key == "display.height":
             new_doc = new_doc.with_entry(*_str_pair("fb_height", str(height), internal))
         elif key == "display.dpi":
-            new_doc = new_doc.with_entry(*_str_pair("dpi", str(_int(key, value)), internal))
+            new_doc = new_doc.with_entry(*_str_pair("dpi", str(_bounded_int(key, value)), internal))
         elif key == "display.fps":
-            new_doc = new_doc.with_entry(*_str_pair("max_fps", str(_int(key, value)), internal))
+            new_doc = new_doc.with_entry(
+                *_str_pair("max_fps", str(_bounded_int(key, value)), internal)
+            )
         elif key == "resources.cpus":
-            new_doc = new_doc.with_entry(*_str_pair("cpus", str(_int(key, value)), internal))
+            new_doc = new_doc.with_entry(
+                *_str_pair("cpus", str(_bounded_int(key, value)), internal)
+            )
         elif key == "resources.memory_mb":
-            ram = _int(key, value)
-            if ram <= 0:
-                raise _fail(key, ram, "an int > 0")
+            ram = _bounded_int(key, value)
             new_doc = new_doc.with_entry(*_str_pair("ram", str(ram), internal))
         elif key == "bluestacks.settings.vsync":
             if not isinstance(value, bool):
