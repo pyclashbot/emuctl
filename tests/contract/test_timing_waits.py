@@ -125,7 +125,9 @@ def test_wait_until_expiry_raises_operation_timeout() -> None:
     # deadline is the absolute monotonic deadline (start + budget), not the duration.
     assert exc.deadline == pytest.approx(before + 0.15, abs=1.0)
     assert exc.deadline is not None and exc.deadline > 0.15
-    assert exc.elapsed is not None and exc.elapsed >= 0.15
+    # Windows timer granularity (≈15.6 ms default tick) can report an elapsed
+    # a hair under the nominal budget even though the full budget was awaited.
+    assert exc.elapsed is not None and exc.elapsed >= 0.15 - 0.02
     assert exc.elapsed < 5.0
 
 
