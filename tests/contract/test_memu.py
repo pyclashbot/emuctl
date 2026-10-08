@@ -17,6 +17,7 @@ import asyncio
 import functools
 import struct
 import sys
+import time
 import types
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
 from typing import Any
@@ -652,6 +653,35 @@ async def test_create_polls_to_typed_timeout(memu_module: Any) -> None:
     assert len([argv for argv in calls if "listvms" in argv]) > 2  # polled
 
 
+@_sync
+async def test_observed_boundary_raises_typed_deadline_error(memu_module: Any) -> None:
+    """Positive-budget invariant at the _observed boundary (§2): an already
+    exhausted deadline raises the TYPED deadline error — wait_until never
+    sees a non-positive timeout (that confusion is InvalidArgumentError)."""
+    ctl = _make(memu_module, [], _ok())
+    start = time.monotonic()
+    deadline = start - 0.5  # exhausted before the wait even begins
+    with pytest.raises(OperationTimeoutError) as excinfo:
+        await ctl._observed(
+            lambda: ...,  # never awaited — the boundary fires first
+            operation="create",
+            start=start,
+            deadline=deadline,
+        )
+    assert excinfo.value.operation == "create"
+
+
+@_sync
+async def test_get_instance_honors_the_passed_deadline(memu_module: Any) -> None:
+    """§2 one-deadline: the pre-check/derivation seam honors the CALLER'S
+    slice — a slow never-answering listvms is cut at the passed budget."""
+    ctl = _make(memu_module, [], lambda argv: _FakeHandle(hang=True))
+    ref = InstanceRef(backend=BackendId.MEMU, key=NAME)
+    with pytest.raises(OperationTimeoutError) as excinfo:
+        await ctl._get_instance(ref, 0.1)
+    assert excinfo.value.operation == "get_instance"
+
+
 # ── configure: translation table walk (§4) ──
 
 
@@ -786,6 +816,12 @@ async def test_configure_strict_value_refusals(memu_module: Any) -> None:
     ctl = _make(memu_module, calls, _ok())
     with pytest.raises(ConfigValidationError):
         await ctl.configure({"memu.settings.window_mode": "minimized"})
+    # speculative alias spellings were cut: only vendor ints + the three
+    # CSV-readable spellings (default/last/custom) remain
+    with pytest.raises(ConfigValidationError):
+        await ctl.configure({"memu.settings.window_mode": "last-time"})
+    with pytest.raises(ConfigValidationError):
+        await ctl.configure({"memu.settings.window_mode": "lasttime"})
     with pytest.raises(ConfigValidationError):
         await ctl.configure({"resources.cpus": 0})
     with pytest.raises(ConfigValidationError):
@@ -884,6 +920,74 @@ async def test_is_reachable_on_stale_ref_is_data(memu_module: Any) -> None:
     ctl = _make(memu_module, [], _rows_responder([(0, ROWS_ABSENT)]))
     probe = await ctl.is_reachable()
     assert (probe.ok, probe.reason) == (False, "disconnected")
+
+
+@_sync
+async def test_is_reachable_probe_is_the_promoted_core_one(memu_module: Any) -> None:
+    """§6 promotion: MEmu does NOT override the probe — MemuController's
+    is_reachable IS the core AdbController's function (its transport facts
+    engage through the overridden _run_adb instead)."""
+    import emuctl.port as port
+
+    assert memu_module.MemuController.is_reachable is port.AdbController.is_reachable
+    calls: list[list[str]] = []
+    ctl = _make(memu_module, calls, _probe_responder())
+    await ctl.is_reachable()
+    assert [argv for argv in calls if "echo" in argv][-1][-1] == "emuctl"
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (b"adb: device offline", "offline"),
+        (b"error: device unauthorized", "unauthorized"),
+        (b"", "disconnected"),
+    ],
+)
+@_sync
+async def test_memu_probe_stderr_walk_matches_core_classifier(
+    memu_module: Any, stderr: bytes, expected: str
+) -> None:
+    """The MEmu stderr → reason mapping is the CORE classifier's shape
+    (promotion invariant); every emitted reason stays in the closed
+    vocabulary."""
+    ctl = _make(memu_module, [], _probe_responder(echo_rc=1, stderr=stderr))
+    probe = await ctl.is_reachable()
+    assert (probe.ok, probe.reason) == (False, expected)
+    from emuctl.port import PROBE_REASONS
+
+    assert probe.reason in PROBE_REASONS
+
+
+@_sync
+async def test_memu_probe_reason_walk_stays_closed(memu_module: Any) -> None:
+    """Every reason the MEmu probe paths emit across scenarios is a member
+    of port.PROBE_REASONS (same conformance walk as test_adb's)."""
+    from emuctl.port import PROBE_REASONS
+
+    scenarios: list[tuple[str, Callable[[list[str]], _FakeHandle] | None]] = [
+        ("ok", _probe_responder()),
+        ("offline", _probe_responder(echo_rc=1, stderr=b"adb: device offline")),
+        ("unauthorized", _probe_responder(echo_rc=1, stderr=b"error: device unauthorized")),
+    ]
+    reasons: set[str] = set()
+    for expected, respond in scenarios:
+        assert respond is not None
+        ctl = _make(memu_module, [], respond)
+        probe = await ctl.is_reachable()
+        reasons.add(probe.reason)
+        assert probe.reason == expected
+    # missing memuc binary (no explicit path + no winreg) → "no-adb" data
+    ctl = _make(memu_module, [], _ok(), config=EmuctlConfig())
+    probe = await ctl.is_reachable()
+    reasons.add(probe.reason)
+    assert probe.reason == "no-adb"
+    ctl = _make(memu_module, [], _rows_responder([(0, ROWS_ABSENT)]))
+    reasons.add((await ctl.is_reachable()).reason)  # stale ref: "disconnected"
+    ctl = _make(memu_module, [], lambda argv: _FakeHandle(hang=True))
+    reasons.add((await ctl.is_reachable(timeout=0.05)).reason)  # budget expiry
+    assert {"ok", "disconnected", "timeout"} <= reasons
+    assert reasons <= PROBE_REASONS
 
 
 # ── restart: §1.6 wholesale override with vendor-ordered attach ──
@@ -1030,6 +1134,31 @@ async def test_restart_on_stale_ref_raises_instance_not_found(memu_module: Any) 
 
 
 @_sync
+async def test_restart_concurrent_aclose_propagates_controller_closed_raw(
+    memu_module: Any,
+) -> None:
+    """The port pins ControllerClosedError RAW propagation (concurrent
+    aclose mid-restart is a wiring/state error, never readiness data):
+    flipping the aclose flag mid-flight surfaces it from a phase
+    unmodified — never laundered into EmulatorNotReadyError."""
+    calls: list[list[str]] = []
+    holder: dict[str, Any] = {}
+    base = _restart_responder()
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        ctl = holder.get("ctl")
+        if ctl is not None and not ctl._closed:
+            ctl._closed = True  # aclose()'s first observable effect
+        return base(argv)
+
+    ctl = _make(memu_module, calls, respond)
+    holder["ctl"] = ctl
+    with pytest.raises(ControllerClosedError) as excinfo:
+        await ctl.restart()
+    assert not isinstance(excinfo.value, EmulatorNotReadyError)
+
+
+@_sync
 async def test_restart_skips_stop_when_not_running(memu_module: Any) -> None:
     calls: list[list[str]] = []
     cfg = _config(memu=MemuConfig(memuc_path=MEMUC, settings=MemuSettings(hide_toolbar=True)))
@@ -1075,7 +1204,7 @@ async def test_timeout_group_defaults(memu_module: Any) -> None:
     await ctl.is_reachable()
     assert spy.seen["start"] == LIFECYCLE_TIMEOUT
     assert spy.seen["stop"] == LIFECYCLE_TIMEOUT
-    assert spy.seen["list_instances"] == QUERY_TIMEOUT  # probe's rows lookup
+    assert spy.seen["get_instance"] == QUERY_TIMEOUT  # probe's rows lookup
     assert abs((spy.seen["is_reachable"] or 0.0) - QUERY_TIMEOUT) < 0.1
 
 

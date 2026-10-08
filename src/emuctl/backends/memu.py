@@ -42,32 +42,52 @@ memuc argv discipline (vendor evidence, pymemuc source):
   ``get_adb_connection`` resolves ports only by parsing ``connected to
   …`` stdout prose (pymemuc/_command.py:662-696), which §1.9 bans — so
   the transport serial follows the MEmu ADB-ports convention: instance
-  ``i`` listens on ``127.0.0.1:21503 + 10*i`` (21503 is the documented
-  first-instance MEmu default; stride 10 is the multi-instance
-  convention). Pinned here as this module's documented interpretation
-  decision.
+  ``i`` listens on ``127.0.0.1:21503 + 10*i``. DOCUMENTED-INTERPRETATION
+  status, stated honestly: 21503 as the first-instance default is pinned
+  as THIS MODULE's interpretation — no vendored citation exists in
+  pymemuc's source or docs, and live MEmu Windows evidence is still
+  pending; stride 10 is the multi-instance convention. The constant stays
+  single-sited and every wrong-port failure is typed (VendorCommandError
+  via the probe/runner), never silent.
 
 Interpretation decisions (CONTRACT wins; these fill its silences):
 
 - ``restart()`` is a §1.6-sanctioned WHOLESALE override: the port's
   one-attempt phase chain (stop-if-running → configure-while-stopped →
-  start → attach → settle → [app] → terminal) with the vendor ordering
-  inserted as an extra attach step — the port's ``_attach`` hook is a
-  SYNCHRONOUS no-op (never awaited), and the ``adb connect
-  127.0.0.1:<port>`` server registration is inherently async I/O, so the
-  override runs it as an awaited ``attach_failed``-mapped phase. Plain
-  ``start()`` promises boot only, never ADB readiness (restart() is THE
-  verified boot primitive; contract §3 boundary).
+  start → connect-attach → settle → [app] → terminal) with the vendor
+  ordering inserted as an extra attach step. The port's ``_attach`` hook is
+  a SYNCHRONOUS no-op (never awaited) and is deliberately NOT invoked here —
+  the ``adb connect 127.0.0.1:<port>`` server registration is inherently
+  async I/O, so the override's awaited ``attach_failed``-mapped phase
+  replaces it entirely. Plain ``start()`` promises boot only, never ADB
+  readiness (restart() is THE verified boot primitive; contract §3
+  boundary).
 - ``_is_running`` observes the running COLUMN of ``listvms`` rows (bound
   name → row); a bound name absent from the rows is a stale ref ⇒
   ``InstanceNotFoundError`` (§3 identity lifetime), never a laundered
   False (§1.4: a failed observation raises, it never becomes data).
+- ``get_instance`` (the discovery seam) returns a row-keyed record; the
+  controller's ``_get_instance`` pre-check/transport-derivation seam
+  funnels through the SAME ``listvms`` row fetch — and honors the
+  CALLER'S deadline (the provision budget on create()'s pre-check, the
+  op slice on lazy transport derivation; a fresh query-group hard-code
+  would violate §2's one-deadline rule), unlike the module-level
+  ``get_instance`` discovery function, which stays query-bounded (§3).
+- The transport probe (``is_reachable``) is INHERITED from the core-side
+  middle layer (§6 promotion tier): the echo probe, the probe word, and
+  the stderr-failure classifier live once in
+  ``emuctl.port.AdbController``. MEmu's behavior survives through its
+  ``_run_adb`` lazy-resolution override: a stale bound ref surfaces as
+  the identity error during lazy resolution inside ``_run_adb`` and maps
+  through the shared catch-all to "disconnected" (data, never a raise).
 - Creation success is observed, never parsed: after ``memuc create``
   (returncode gate only — memuc's ``SUCCESS`` prose is consumed, never
   obeyed), a bounded ``wait_until`` poll of the ``listvms`` rows waits
-  for a row with a NEW index (the fresh VM), then renames it; every step
-  shares the ONE provision budget (§2: one deadline per call,
-  distributed internally).
+  for a row with a NEW index (the fresh VM), then renames it; create()
+  resolves the provision budget ONCE at the port entry (pre-check
+  included) and threads the REMAINING slice into ``_create`` (§2: one
+  deadline per call, distributed internally; the deadline is never
+  re-established with a fresh clock after the pre-check).
 - ``configure()`` translation table (§4): vendor keys
   ``graphics_render_mode`` (int 0=OpenGL / 1=DirectX),
   ``resolution_width`` / ``resolution_height`` / ``vbox_dpi`` with
@@ -125,6 +145,7 @@ from emuctl.config.model import (
 )
 from emuctl.errors import (
     ConfigValidationError,
+    ControllerClosedError,
     EmulatorNotReadyError,
     ExecutableNotFoundError,
     FeatureNotSupportedError,
@@ -135,7 +156,7 @@ from emuctl.errors import (
 )
 from emuctl.log import sanitize
 from emuctl.port import AdbController as _AdbMiddleLayer
-from emuctl.port import CapabilityFlag, ProbeResult, ReadyCheck, _stderr_excerpt
+from emuctl.port import CapabilityFlag, ReadyCheck, _stderr_excerpt
 from emuctl.timing import (
     DEFAULT,
     LIFECYCLE_TIMEOUT,
@@ -168,9 +189,6 @@ _REGISTRY_KEYS: Final[tuple[str, ...]] = (
 #: MEmu ADB-port convention constants (see module docstring).
 _ADB_PORT_BASE: Final[int] = 21503
 _ADB_PORT_STRIDE: Final[int] = 10
-
-#: Probe word for the transport reachability check (stdout never read).
-_PROBE_WORD: Final[str] = "emuctl"
 
 # ── translation table (§4; all ranges mirror the config model) ──
 
@@ -205,15 +223,15 @@ _TABLE_BOOLS: Final[Mapping[str, str]] = {
 }
 
 #: Window-mode spellings → ``start_window_mode`` int enum tokens
-#: (vendor CSV: 2=Custom, 1=Last time, 0=Default).
+#: (vendor CSV: 2=Custom, 1=Last time, 0=Default). Vendor ints kept +
+#: exactly the three readable spellings the CSV names — no speculative
+#: aliases.
 _WINDOW_MODES: Final[Mapping[str, str]] = {
     "0": "0",
     "1": "1",
     "2": "2",
     "default": "0",
     "last": "1",
-    "last-time": "1",
-    "lasttime": "1",
     "custom": "2",
 }
 
@@ -555,22 +573,6 @@ def _adb_serial(index: int) -> str:
     return f"127.0.0.1:{_ADB_PORT_BASE + index * _ADB_PORT_STRIDE}"
 
 
-def _classify_probe_failure(stderr_excerpt: str) -> str:
-    """Map a failed probe's stderr to the pinned probe-reason vocabulary.
-
-    stderr tokens only (stdout never consulted). Identical shape to
-    emuctl.backends.adb's — the helper would need §6 promotion into core
-    once a third ADB-speaking family needs it; the independence contract
-    bans the sideways import it would otherwise require.
-    """
-    lowered = stderr_excerpt.lower()
-    if "unauthorized" in lowered:
-        return "unauthorized"
-    if "offline" in lowered:
-        return "offline"
-    return "disconnected"
-
-
 # ── the concrete adapter ──
 
 
@@ -725,11 +727,43 @@ class MemuController(_AdbMiddleLayer):
                     elapsed=time.monotonic() - start,
                 )
             return
-        await wait_until(predicate, operation=operation, timeout=deadline - time.monotonic())
+        # Positive-budget invariant at the boundary (§2): a non-positive
+        # remainder is expiry NOW — the typed deadline error — never a
+        # non-positive timeout handed to wait_until (which would confuse
+        # the confusion with an InvalidArgumentError the caller can't act on).
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise OperationTimeoutError(
+                operation=operation,
+                deadline=deadline,
+                elapsed=time.monotonic() - start,
+            )
+        await wait_until(predicate, operation=operation, timeout=left)
 
     async def _get_instance(self, ref: InstanceRef, timeout: float | None) -> InstanceRecord | None:
-        """create()'s pre-check seam, wired to the module-level discovery."""
-        return await get_instance(self._config, ref, _executor=self._executor)
+        """create()'s pre-check seam + lazy-transport lookup, row-keyed.
+
+        Honors the CALLER'S deadline via the same bounded ``listvms`` row
+        fetch (§2's one-deadline rule): the provision budget on create()'s
+        pre-check, the op slice on lazy transport derivation, the restart
+        attach remainder — never a fresh query-group hard-code.
+        """
+        if not isinstance(ref, InstanceRef):
+            raise InvalidArgumentError(
+                parameter="ref",
+                constraint="must be an InstanceRef",
+            )
+        if ref.backend is not BackendId.MEMU:
+            return None
+        for row in await self._rows("get_instance", timeout):
+            if row.title == ref.key:
+                return InstanceRecord(
+                    ref=InstanceRef(backend=BackendId.MEMU, key=row.title),
+                    running=row.running,
+                    serial=None,
+                    details={"index": str(row.index), "pid": str(row.pid)},
+                )
+        return None
 
     async def _ensure_transport(self, timeout: float | None) -> None:
         """Lazily derive the ADB transport serial (one bounded rows lookup).
@@ -817,6 +851,25 @@ class MemuController(_AdbMiddleLayer):
         Bounded and scoped: never ``stopall`` (a contract-BANNED global
         sweep), never a process-table walk. Stopping an already-stopped
         VM is the vendor's failure, raised honestly (§1.4).
+
+        Accepted interpretation — rc-only success gate, residual risk
+        documented: the CONTRACT pins no stdout cross-check and no
+        post-stop running-column observation for standalone ``stop()``
+        (§1.4 sanctions "vendor failure at a nonzero rc raised honestly";
+        there is no pinned cross-check surface), so success of the kill
+        is provable ONLY as the vendor's rc 0 for this call. Historically
+        rc-gated stops have been insufficient evidence (pymemuc's
+        ``_control.py:52/:88`` stop paths gate on rc alone, and memuc is
+        known to return rc 0 on an already-stopped VM before it fails —
+        the reviewers' cited asymmetry); this module therefore treats
+        "rc 0 but the VM still runs" as an UNSURFACED residual risk of
+        the vendor interface, accepted rather than silently laundered:
+        restart()'s funnel re-observes via ``_is_running`` (verbatim
+        phase 1), so a failed kill inside restart() is re-detected there
+        and mapped to "stop_failed"; a standalone ``stop()`` caller who
+        needs certainty re-checks ``_is_running`` policy-side (§8's
+        public is_running is the named follow-up surface). No
+        stopall-style cross-check workaround is invented to presets.
         """
         await self._memuc_run(
             ["-n", self._ref.key, "stop"],
@@ -840,6 +893,13 @@ class MemuController(_AdbMiddleLayer):
     async def _create(self, spec: CreateSpec, timeout: float | None) -> InstanceRef:
         """``memuc create <version>`` → bounded fresh-row observation →
         ``memuc -i <index> rename <name>``.
+
+        ``timeout`` is the REMAINING slice of create()'s ONE shared
+        provision deadline — the port's ``create()`` resolves the budget
+        once (including the pre-check's elapsed time) and threads the
+        remainder here, so the wall-clock cost of create() provably never
+        exceeds the caller's provision budget (§2; mirror of
+        ``configure()``'s ``_headroom`` slices).
 
         Never parses vendor stdout for control flow: the create returncode
         gate and the bounded ``listvms`` observation (a row with a NEW
@@ -947,6 +1007,20 @@ class MemuController(_AdbMiddleLayer):
         "stop_failed" | "configure_failed" | "start_failed" |
         "attach_failed" | "settle_failed" | "app_start_failed" |
         "app_not_installed" | "menu_not_reached" | "ready_check_failed".
+        Raw-propagation additions (documented reason vocabulary of THIS
+        override, additive to the port's): ``InstanceNotFoundError``
+        propagates raw from any phase — a stale bound ref is IDENTITY
+        failure (§3), not readiness, so it must surface under its own
+        name, never laundered into EmulatorNotReadyError.
+
+        TRACKED PAIR with emuctl.port.AsyncEmulatorController.restart()'s
+        phase() re-raise list (§6 sharing tiers — keep BOTH files in sync
+        when editing either list): the port propagates
+        FeatureNotSupported/ControllerClosed/InvalidArgument raw; THIS
+        copy additionally keeps InstanceNotFoundError raw as reasoned
+        above, and restores ControllerClosedError raw propagation so a
+        concurrent ``aclose()`` mid-restart surfaces under contract terms
+        (the port pins it; a wiring/state error is never readiness data).
         """
         self._require(CapabilityFlag.BOOT)
         self._ensure_open()
@@ -1005,15 +1079,27 @@ class MemuController(_AdbMiddleLayer):
                         elapsed=time.monotonic() - start,
                     ),
                 ) from exc
-            except (FeatureNotSupportedError, InvalidArgumentError, InstanceNotFoundError):
+            # TRACKED PAIR with emuctl.port.AsyncEmulatorController.restart()'
+            # s phase() re-raise list (§6 sharing tiers — keep both in sync;
+            # this copy adds InstanceNotFoundError raw, see the docstring).
+            except (
+                FeatureNotSupportedError,
+                ControllerClosedError,
+                InvalidArgumentError,
+                InstanceNotFoundError,
+            ):
                 raise
             except Exception as exc:
                 raise EmulatorNotReadyError(reason=reason, cause=exc) from exc
 
         async def attach(budget_left: float | None) -> None:
-            """The vendor-ordered connect phase (§1's _attach hook is a
-            sync no-op — see class docs)."""
-            self._attach()
+            """The vendor-ordered connect phase.
+
+            Deliberately does NOT invoke the port's ``_attach`` sync no-op
+            hook (it is never awaited and would be dead here — the async
+            connect work this adapter needs is exactly what replaces it;
+            see the class docstring).
+            """
             record = await self._get_instance(self._ref, budget_left)
             if record is None:
                 raise InstanceNotFoundError(instance_ref=str(self._ref))
@@ -1065,39 +1151,13 @@ class MemuController(_AdbMiddleLayer):
             )
         logger.debug("restart ready ref=%s", sanitize(str(self._ref)))
 
-    # ── transport probe (probes exemption: data, never raises) ──
-
-    async def is_reachable(self, *, timeout: TimeoutParam = DEFAULT) -> ProbeResult:
-        """Probe as data — never raises, never gated (probes exemption).
-
-        Device-scoped ``shell echo`` exactly like the plain-ADB adapter:
-        transport lazy resolution + the probe share the ONE query budget;
-        rc 0 → ok; expiry → "timeout"; missing adb binary → "no-adb";
-        nonzero rc → stderr-token scan (stdout never consulted); anything
-        else (including a stale bound ref) → "disconnected".
-        """
-        budget = resolve_timeout(timeout, QUERY_TIMEOUT, operation="is_reachable")
-        start = time.monotonic()
-        deadline = None if budget is None else start + budget
-        try:
-            left = self._headroom(deadline, start, "is_reachable")
-            await self._ensure_transport(left)
-            probe_left = self._headroom(deadline, start, "is_reachable")
-            await self._run_adb(
-                ["shell", "echo", _PROBE_WORD],
-                binary=False,
-                operation="is_reachable",
-                timeout=probe_left,
-            )
-        except OperationTimeoutError:
-            return ProbeResult(ok=False, reason="timeout")
-        except ExecutableNotFoundError:
-            return ProbeResult(ok=False, reason="no-adb")
-        except VendorCommandError as exc:
-            return ProbeResult(ok=False, reason=_classify_probe_failure(exc.stderr_excerpt))
-        except Exception:
-            return ProbeResult(ok=False, reason="disconnected")
-        return ProbeResult(ok=True, reason="ok")
+    # ── transport probe · INHERITED ──
+    # is_reachable is the core-side AdbController shared probe (§6 promotion
+    # tier): the echo probe, the probe word, and the stderr classifier live
+    # once in emuctl.port. MEmu's transport facts engage through the
+    # overridden _run_adb above — lazy serial resolution inside the runner
+    # (stale bound ref → the identity error → the shared catch-all maps it
+    # to "disconnected" as probe DATA; missing memuc binary → "no-adb").
 
     # ── lifecycle close ──
 
