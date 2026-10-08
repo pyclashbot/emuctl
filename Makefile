@@ -9,9 +9,10 @@ dev:              ## run a dev REPL-ish sanity: sync + test
 	uv sync
 	uv run pytest
 
-lint:             ## ruff format check + ruff lint
+lint:             ## ruff format check + ruff lint + import-linter (§6)
 	uv run ruff format --check .
 	uv run ruff check .
+	uv run lint-imports --no-logo
 
 type-check:       ## ty static check
 	uv run ty check
