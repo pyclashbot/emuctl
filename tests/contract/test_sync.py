@@ -15,7 +15,7 @@ import struct
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -202,7 +202,7 @@ class _FakeController(AsyncEmulatorController):
 
 
 @contextmanager
-def _facade(slow_or_fail: Any = None) -> Iterator[EmulatorController]:
+def _facade(slow_or_fail: Any = None) -> Generator[EmulatorController]:
     """A facade over a fresh fake, closed on exit if still open."""
     fake = _FakeController()
     if slow_or_fail is not None:
