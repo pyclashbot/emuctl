@@ -42,15 +42,20 @@ module-name = "emuctl"
 [tool.importlinter]
 root_package = "emuctl"
 
-# import-linter's `layers` contract requires sibling layers, but emuctl.backends is a
-# subpackage of emuctl ("shared descendants" error) — this forbidden contract is the
-# idiomatic equivalent of CONTRACT §6's rule: core never statically imports backends
-# (the lazy loader's dynamic import is deliberately invisible to it).
+# CONTRACT §6, expressed in import-linter 2.x: `forbidden` cannot express this rule —
+# its forbidden_modules don't accept subpackages of the root ("django, not django.db.models"),
+# which silently no-ops (caught by the guardrail smoke test). The `layers` contract with a
+# container natively supports the nesting, and `exhaustive=true` breaks whenever a module
+# exists that isn't in a declared layer — closing the enumeration hole.
 [[tool.importlinter.contracts]]
-name = "Core never imports backends"
-type = "forbidden"
-source_modules = ["emuctl"]
-forbidden_modules = ["emuctl.backends"]
+name = "Backends may import core; core may never import backends"
+type = "layers"
+containers = ["emuctl"]
+layers = [
+  "backends",
+  "config | log | png | port | errors | timing | waits | _proc | _serials | _identification | _discovery | _platforms",
+]
+exhaustive = true
 
 [[tool.importlinter.contracts]]
 name = "Backend families are independent"
