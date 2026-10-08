@@ -1221,7 +1221,12 @@ async def test_create_carries_the_provision_budget(memu_module: Any) -> None:
     await ctl.create(CreateSpec(name="new-vm"))
     budgets = spy.seen_all["create"]
     assert bool(budgets)  # create + bounded observation, all under ONE budget
-    assert all(b <= PROVISION_TIMEOUT for b in budgets if b is not None)
+    # Windows timer granularity (~15.6 ms default tick) can read the
+    # pre-check's elapsed as zero, leaving the remaining slice at the
+    # deadline float's own ulp — which can round that slice an ulp ABOVE
+    # the constant. Assert the shared-budget invariant with an epsilon,
+    # not a strict float `<=`.
+    assert all(b <= PROVISION_TIMEOUT + 1e-6 for b in budgets if b is not None)
     assert abs((budgets[0] or 0.0) - PROVISION_TIMEOUT) < 0.1
 
 
