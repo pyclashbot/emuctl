@@ -197,11 +197,57 @@ def test_discover_offline_probes_nothing(
         assert by_id[backend].reason == "not-implemented-this-version"
 
 
-def test_discover_online_reports_stub_adapters_honestly(windows_host: Any) -> None:
-    # Adapter modules are docstring stubs: the online path must report
-    # "adapter-unavailable" rows, never raise.
+def test_discover_online_reports_stub_adapters_honestly(
+    windows_host: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Remaining adapter modules are docstring stubs: the online path must
+    # report "adapter-unavailable" rows, never raise. The ADB row is live:
+    # §7 pins the live tier as opt-in/marked and NEVER required, so its
+    # enumeration runs fully offline against a scripted executor (same
+    # _spawn seam as test_adb.py) — identical on machines with and without
+    # a real `adb` binary.
+    import importlib
+
+    from emuctl._proc import ProcessExecutor
+
+    calls: list[list[str]] = []
+    fixture = (
+        b"* daemon not running; starting now at tcp:5037\n"
+        b"* daemon started successfully\n"
+        b"List of devices attached\n"
+        b"emulator-5554\tdevice\n"
+        b"127.0.0.1:5555\tdevice\n"
+        b"ABCDEF123456\toffline\n"
+        b"ZYX987\tunauthorized\n"
+    )
+
+    class _FakeHandle:
+        def __init__(self) -> None:
+            self.returncode: int | None = 0
+
+        @property
+        def pid(self) -> int | None:
+            return 4242
+
+        def terminate(self) -> None: ...
+        def kill(self) -> None: ...
+
+        async def wait(self) -> int:
+            return 0
+
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            return (fixture, b"")
+
+    async def _spawn(argv: Sequence[str]) -> _FakeHandle:
+        calls.append(list(argv))
+        return _FakeHandle()
+
+    def _scripted_executor() -> ProcessExecutor:
+        return ProcessExecutor(_spawn=_spawn)  # type: ignore[arg-type]
+
+    adb_module = importlib.import_module("emuctl.backends.adb")
+    monkeypatch.setattr(adb_module, "ProcessExecutor", _scripted_executor)
     for name in (
-        "emuctl.backends.adb",
         "emuctl.backends.memu",
         "emuctl.backends.bluestacks.bs5",
         "emuctl.backends.bluestacks.air",
@@ -210,9 +256,21 @@ def test_discover_online_reports_stub_adapters_honestly(windows_host: Any) -> No
     report = asyncio.run(discover())
     assert report.offline is False
     by_id = {status.backend: status for status in report.backends}
+    # The ADB row: probed offline, banner lines skipped, rows honest.
+    assert by_id[BackendId.ADB].available is True
+    assert by_id[BackendId.ADB].reason == "ok"
+    assert [str(r.ref) for r in by_id[BackendId.ADB].instances] == [
+        "adb:emulator-5554",
+        "adb:127.0.0.1:5555",
+        "adb:ABCDEF123456",
+        "adb:ZYX987",
+    ]
+    assert [r.running for r in by_id[BackendId.ADB].instances] == [True, True, False, False]
+    assert len(calls) == 1 and calls[0][-1] == "devices"  # scripted, offline
+    assert all("daemon" not in str(row.ref) for row in by_id[BackendId.ADB].instances)
     # Windows-resolvable stubs report honestly; Air is macOS-only so a
     # Windows host reports its platform refusal instead.
-    for backend in (BackendId.ADB, BackendId.MEMU, BackendId.BLUESTACKS):
+    for backend in (BackendId.MEMU, BackendId.BLUESTACKS):
         assert by_id[backend].available is False
         assert by_id[backend].reason == "adapter-unavailable"
         assert by_id[backend].instances == ()

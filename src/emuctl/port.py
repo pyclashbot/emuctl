@@ -28,7 +28,28 @@ Interpretation decisions (CONTRACT §1 wins; these fill its silences):
   module-level discovery seam in later PRs.
 - ``is_reachable()`` is ungated: gating it would contradict the probes
   exemption ("never raises"). The port default has no observation seam and
-  returns data; AdbController overrides it with the real transport probe.
+  returns data; the concrete ADB adapter overrides it with the real transport
+  probe.
+- ``AdbController`` (§1's ``class AdbController(AsyncEmulatorController,
+  abc.ABC)``) lives HERE, core-side and port-adjacent: §6's sharing tiers pin
+  the ADB-family middle layer so every ADB-speaking adapter can inherit it
+  without a sideways family import. It carries the concrete mechanics once
+  over raw ADB (interaction verbs, screenshot, app verbs, install, the
+  scoping machinery ``_run_adb``/``_device_argv``/``_server_argv`` and the
+  serial layer-3 re-check) implemented against the transport state the
+  concrete adapter binds in its ``__init__``. Remotely backend-specific
+  truth — the FEATURES set, the concrete ``_vendor_run`` through the
+  ``_proc.py`` executor, the construction binding of ``AdbConfig``,
+  ``is_reachable``, and the module-level ``BackendDiscovery`` convention
+  functions — stays in the backend module (``emuctl.backends.adb``).
+  ``_vendor_run`` stays abstract here, keeping this class uninstantiable.
+- Bounded spawn-verify (§1 ``start_app`` / §2 "one deadline per call,
+  distributed internally"): the launch and the ``pidof`` verify share the
+  SAME op-level budget — deadline established once, the remaining slice fed
+  to :func:`emuctl.waits.wait_until`'s poll loop (the single sanctioned
+  internal loop). Expiry raises ``OperationTimeoutError`` (§2: expiry never
+  degrades to a value; ``EmulatorNotReadyError`` is a ``restart()``-only
+  surface), never a silent pass.
 """
 
 # ruff: noqa: B027 — mechanics are deliberately non-abstract `...` stubs: the
@@ -44,6 +65,7 @@ import dis
 import enum
 import inspect
 import logging
+import math
 import os
 import time
 import types
@@ -51,13 +73,18 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from typing import Any, Final, NamedTuple, TypeVar
 
 from emuctl._identification import InstanceRecord, InstanceRef
+from emuctl._proc import ProcessExecutor, ProcessResult
+from emuctl._proc import _validate_argv as _require_argv
+from emuctl._serials import ADB_SERVER_VERBS, validate_serial
 from emuctl.config.model import ConfigSpec, CreateSpec
 from emuctl.errors import (
     ControllerClosedError,
     EmulatorNotReadyError,
+    ExecutableNotFoundError,
     FeatureNotSupportedError,
     InvalidArgumentError,
     OperationTimeoutError,
+    VendorCommandError,
 )
 from emuctl.log import sanitize
 from emuctl.png import png_dimensions
@@ -73,6 +100,7 @@ from emuctl.timing import (
     TimeoutParam,
     resolve_timeout,
 )
+from emuctl.waits import wait_until
 
 __all__ = [
     "CapabilityFlag",
@@ -81,6 +109,7 @@ __all__ = [
     "PROBE_REASONS",
     "MECHANICS",
     "AsyncEmulatorController",
+    "AdbController",
 ]
 
 logger = logging.getLogger(__name__)
@@ -112,9 +141,10 @@ class ProbeResult(NamedTuple):
 
 #: Pinned probe-reason vocabulary (additive-only). "ok" and "no-adb" are §1's
 #: pins; offline/unauthorized/disconnected mirror §2's DeviceStateError states
-#: as probe data; "not-found" names an absent ref; "timeout" reports a probe
-#: that exceeded its budget without raising; "unknown" is the port default
-#: (this layer has no observation seam — AdbController overrides it).
+#: as probe data; "timeout" reports a probe that exceeded its budget without
+#: raising; "unknown" is the port default (this layer has no observation seam
+#: — the concrete ADB adapter overrides it). The former "not-found" token is
+#: cut until a producer exists (probe paths emit no absent-ref vocabulary).
 PROBE_REASONS: Final[frozenset[str]] = frozenset(
     {
         "ok",
@@ -122,7 +152,6 @@ PROBE_REASONS: Final[frozenset[str]] = frozenset(
         "offline",
         "unauthorized",
         "disconnected",
-        "not-found",
         "timeout",
         "unknown",
     }
@@ -785,3 +814,392 @@ class AsyncEmulatorController(abc.ABC):
     async def close(self) -> None:
         """Alias of aclose(): idempotent transport-only release."""
         await self.aclose()
+
+
+# ── ADB-family middle layer (§1's AdbController, §6 sharing tiers) ──
+
+#: Device-shell metacharacters backslash-escaped by the shared ``input text``
+#: rule (adb joins shell argv with spaces, so the device shell would
+#: otherwise interpret these). Space is handled separately (→ ``%s``).
+_TEXT_META: Final[frozenset[str]] = frozenset("\"';&|<>()$`\\*?~#!")
+
+#: ``monkey`` intent plumbing for package-only launches (no activity known).
+_LAUNCHER_CATEGORY: Final[str] = "android.intent.category.LAUNCHER"
+
+
+def _escape_input_text(value: str) -> str:
+    """Apply the shared ``adb shell input text`` escaping rule (pure).
+
+    Space → ``%s``; device-shell metacharacters → backslash-escaped;
+    everything else (including ``%``) literal. See ``AdbController._text`` for
+    the ``%s``-types-as-space caveat.
+    """
+    parts: list[str] = []
+    for char in value:
+        if char == " ":
+            parts.append("%s")
+        elif char in _TEXT_META:
+            parts.append("\\" + char)
+        else:
+            parts.append(char)
+    return "".join(parts)
+
+
+def _require_package(package: object) -> str:
+    """Package names: non-empty text with no whitespace (pure)."""
+    if (
+        not isinstance(package, str)
+        or not package
+        or any(char.isspace() or ord(char) < 32 for char in package)
+    ):
+        raise InvalidArgumentError(
+            parameter="package",
+            constraint="must be a non-empty package name with no whitespace",
+        )
+    return package
+
+
+def _require_coord(name: str, value: object) -> int:
+    """Absolute device pixels: ints only (bools are never coords), >= 0."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidArgumentError(parameter=name, constraint="must be an int device pixel")
+    if value < 0:
+        raise InvalidArgumentError(
+            parameter=name, constraint="must be >= 0 (absolute device pixels)"
+        )
+    return value
+
+
+def _stderr_excerpt(stderr: bytes) -> str:
+    """Sanitized ≤200-char diagnostic excerpt (logging/error payloads only)."""
+    return sanitize(stderr.decode("utf-8", errors="replace"))
+
+
+class AdbController(AsyncEmulatorController, abc.ABC):
+    """§1's ONE ADB middle layer (core-side, port-adjacent per §6).
+
+    Implements the interaction primitives ONCE over raw ADB so every
+    ADB-speaking adapter inherits them without a sideways family import
+    (§6 sharing tiers: "core, port-adjacent (all ADB-speaking adapters
+    inherit; no second middle layer)"). Carried concretely:
+
+    - the scoping machinery ``_run_adb``/``_device_argv``/``_server_argv``
+      (server verbs never scoped; nothing sniffed from argv) and the
+      per-call layer-3 serial re-check;
+    - click/swipe/key/text (text escaping owned here), screenshot,
+      install_apk, start_app (bounded spawn-verify through the sanctioned
+      ``waits.wait_until`` loop), is_app_installed.
+
+    ``_vendor_run`` stays abstract (inherited from the port): the concrete
+    adapter routes it through its own ``_proc.py`` executor. So does
+    transport state — the annotations below are bound by the concrete
+    adapter's ``__init__`` from the resolved ``EmuctlConfig`` (§1:
+    ``config.adb`` is the ONLY system-server selector); this layer only
+    reads them. FEATURES, ``is_reachable``, and discovery remain
+    backend-module truth.
+    """
+
+    #: Transport state, bound by the concrete adapter's __init__ (read-only here).
+    adb_path: str | None
+    adb_server_port: int | None
+    _adb_host: str
+    _serial: str
+    _executor: ProcessExecutor
+
+    def _prefix(self) -> list[str]:
+        """Server selector: binary + ``-H``/``-P`` (deterministic, always)."""
+        binary = self.adb_path if self.adb_path else "adb"
+        prefix = [binary, "-H", self._adb_host]
+        if self.adb_server_port is not None:
+            prefix += ["-P", str(self.adb_server_port)]
+        return prefix
+
+    def _device_argv(self, tail: Sequence[str]) -> list[str]:
+        """Full device-scoped argv: prefix + exactly one ``-s <transport>``.
+
+        Re-validates the transport at every call (§3's third enforcement
+        layer). Pure.
+        """
+        args = _require_argv(tail)
+        validate_serial(self._serial)
+        return [*self._prefix(), "-s", self._serial, *args]
+
+    def _server_argv(self, tail: Sequence[str]) -> list[str]:
+        """Full server-verb argv: prefix, never ``-s``.
+
+        The head word must be in the pinned ``ADB_SERVER_VERBS`` exclusion
+        list — the declaration (``server_verb=True``) selects the shape, the
+        list polices it; nothing is ever sniffed from argv.
+        """
+        args = _require_argv(tail)
+        if args[0] not in ADB_SERVER_VERBS:
+            raise InvalidArgumentError(
+                parameter="argv",
+                constraint=(f"server-verb call must head with one of {sorted(ADB_SERVER_VERBS)}"),
+            )
+        return [*self._prefix(), *args]
+
+    async def _run_adb(
+        self,
+        tail: Sequence[str],
+        *,
+        binary: bool,
+        operation: str,
+        timeout: float | None,
+        server_verb: bool = False,
+    ) -> bytes | str:
+        """Execute one adb argv: scoped, bounded, cancel-safe (internal seam).
+
+        Returns raw stdout bytes (``binary=True``) or decoded text. Nonzero
+        rc → ``VendorCommandError(output_reason="exit")``; stdout is returned
+        for the caller to verify, never interpreted here. ``CancelledError``
+        propagates unmodified (the executor owns abandonment).
+        """
+        argv = self._server_argv(tail) if server_verb else self._device_argv(tail)
+        logger.debug("adb op=%s argv=%s", sanitize(operation), [sanitize(a) for a in argv])
+        try:
+            result: ProcessResult = await self._executor.run(
+                argv, operation=operation, timeout=timeout
+            )
+        except OSError as exc:
+            raise ExecutableNotFoundError(
+                tool=argv[0],
+                searched=[argv[0]],
+                detail=f"could not execute the adb binary: {type(exc).__name__}",
+            ) from exc
+        if result.returncode != 0:
+            raise VendorCommandError(
+                command=argv,
+                returncode=result.returncode,
+                output_reason="exit",
+                stderr_excerpt=_stderr_excerpt(result.stderr),
+            )
+        if binary:
+            return result.stdout
+        return result.stdout.decode("utf-8", errors="replace")
+
+    async def _screenshot(self, timeout: float | None) -> bytes:
+        """``exec-out screencap -p`` binary transport; PNG-sniffed (§4 S2)."""
+        tail = ["exec-out", "screencap", "-p"]
+        raw = await self._run_adb(tail, binary=True, operation="screenshot", timeout=timeout)
+        assert isinstance(raw, bytes)
+        try:
+            png_dimensions(raw)
+        except (ValueError, TypeError) as exc:
+            raise VendorCommandError(
+                command=self._device_argv(tail),
+                returncode=0,
+                output_reason="unusable_output",
+                stderr_excerpt="",
+                detail=f"screenshot returned {len(raw)} bytes that do not decode as PNG",
+            ) from exc
+        return raw
+
+    async def _click(
+        self, x: int, y: int, *, count: int, interval: float, timeout: float | None
+    ) -> None:
+        """Raw device pixels, never re-scaled (§4 INV-C1).
+
+        One shared deadline for the whole multi-click burst (§2: one deadline
+        per call, distributed internally): the remaining slice — never the
+        full budget anew — is fed to each additional tap.
+        """
+        _require_coord("x", x)
+        _require_coord("y", y)
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise InvalidArgumentError(parameter="count", constraint="must be an int >= 1")
+        if count < 1:
+            raise InvalidArgumentError(parameter="count", constraint="must be >= 1")
+        if (
+            isinstance(interval, bool)
+            or not isinstance(interval, (int, float))
+            or not math.isfinite(interval)
+        ):
+            raise InvalidArgumentError(
+                parameter="interval",
+                constraint="must be a finite number of seconds >= 0",
+            )
+        if interval < 0:
+            raise InvalidArgumentError(parameter="interval", constraint="must be >= 0 seconds")
+        start = time.monotonic()
+        deadline = None if timeout is None else start + timeout
+        for index in range(count):
+            headroom = timeout if deadline is None or index == 0 else deadline - time.monotonic()
+            if headroom is not None and headroom <= 0:
+                raise OperationTimeoutError(
+                    operation="click",
+                    deadline=deadline,
+                    elapsed=time.monotonic() - start,
+                )
+            await self._run_adb(
+                ["shell", "input", "tap", str(x), str(y)],
+                binary=False,
+                operation="click",
+                timeout=headroom,
+            )
+            if interval and index < count - 1:
+                await asyncio.sleep(float(interval))
+
+    async def _swipe(
+        self,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        *,
+        duration_ms: int,
+        timeout: float | None,
+    ) -> None:
+        """Raw device pixels, never re-scaled (§4 INV-C1)."""
+        _require_coord("x1", x1)
+        _require_coord("y1", y1)
+        _require_coord("x2", x2)
+        _require_coord("y2", y2)
+        if isinstance(duration_ms, bool) or not isinstance(duration_ms, int):
+            raise InvalidArgumentError(parameter="duration_ms", constraint="must be an int >= 0")
+        if duration_ms < 0:
+            raise InvalidArgumentError(parameter="duration_ms", constraint="must be >= 0")
+        await self._run_adb(
+            ["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration_ms)],
+            binary=False,
+            operation="swipe",
+            timeout=timeout,
+        )
+
+    async def _key(self, code: str | int, timeout: float | None) -> None:
+        """Raw keycode/keyevent symbol, passed through verbatim."""
+        if isinstance(code, bool):
+            raise InvalidArgumentError(
+                parameter="code", constraint="must be a keycode int or keyevent symbol"
+            )
+        if isinstance(code, int):
+            if code < 0:
+                raise InvalidArgumentError(parameter="code", constraint="must be >= 0")
+            token = str(code)
+        elif isinstance(code, str):
+            if not code:
+                raise InvalidArgumentError(
+                    parameter="code", constraint="must be a non-empty keyevent symbol"
+                )
+            token = code
+        else:
+            raise InvalidArgumentError(
+                parameter="code", constraint="must be a keycode int or keyevent symbol"
+            )
+        await self._run_adb(
+            ["shell", "input", "keyevent", token],
+            binary=False,
+            operation="key",
+            timeout=timeout,
+        )
+
+    async def _text(self, value: str, timeout: float | None) -> None:
+        """Type text under the shared escaping rule (see ``_escape_input_text``)."""
+        if not isinstance(value, str):
+            raise InvalidArgumentError(parameter="value", constraint="must be a string")
+        if not value:
+            raise InvalidArgumentError(parameter="value", constraint="must be non-empty")
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise InvalidArgumentError(
+                parameter="value",
+                constraint="must not contain control characters (use key() for ENTER)",
+            )
+        await self._run_adb(
+            ["shell", "input", "text", _escape_input_text(value)],
+            binary=False,
+            operation="text",
+            timeout=timeout,
+        )
+
+    async def _install_apk(self, apk_path: str | os.PathLike[str], timeout: float | None) -> None:
+        """Bare ``adb install`` (no flags — predictable overwrite semantics)."""
+        if isinstance(apk_path, os.PathLike):
+            apk = os.fspath(apk_path)
+        elif isinstance(apk_path, str):
+            apk = apk_path
+        else:
+            raise InvalidArgumentError(
+                parameter="apk_path",
+                constraint="must be a path to an APK file",
+            )
+        if not apk:
+            raise InvalidArgumentError(parameter="apk_path", constraint="must be a non-empty path")
+        await self._run_adb(
+            ["install", apk], binary=False, operation="install_apk", timeout=timeout
+        )
+
+    async def _start_app(self, package: str, timeout: float | None) -> None:
+        """Launcher-intent launch + bounded ``pidof`` spawn-verify (§1).
+
+        Launch and verify share the SAME op-level budget (§2: one deadline
+        per call, distributed internally): the deadline is established once,
+        and ``waits.wait_until`` is handed the remaining slice — never a
+        full budget anew. The predicate keys on the ``pidof`` exit status
+        only (0 = a process exists); its stdout is consumed, never read for
+        the decision. Deadline expiry raises ``OperationTimeoutError`` (§2:
+        operation timeouts never degrade to a value) — never a silent
+        launch-and-hope pass.
+
+        Explicit unbounded (``timeout=None``, sanctioned-but-discouraged)
+        degrades the verify to a single exit-status probe — polling requires
+        a finite budget shape, and a second unsanctioned loop is not
+        invented to fake it.
+        """
+        pkg = _require_package(package)
+        start = time.monotonic()
+        deadline = None if timeout is None else start + float(timeout)
+        await self._run_adb(
+            ["shell", "monkey", "-p", pkg, "-c", _LAUNCHER_CATEGORY, "1"],
+            binary=False,
+            operation="start_app",
+            timeout=timeout,
+        )
+        if deadline is None:
+            # Explicit unbounded (§2: sanctioned, discouraged): polling is a
+            # finite-budget shape (waits.wait_until requires a positive
+            # timeout), so the verify degrades to a single exit-status probe —
+            # never a silent pass, never a second unsanctioned loop.
+            await self._run_adb(
+                ["shell", "pidof", pkg], binary=False, operation="start_app", timeout=None
+            )
+            return
+        headroom = deadline - time.monotonic()
+        if headroom <= 0:
+            raise OperationTimeoutError(
+                operation="start_app",
+                deadline=deadline,
+                elapsed=time.monotonic() - start,
+            )
+
+        async def spawn_present() -> bool:
+            try:
+                await self._run_adb(
+                    ["shell", "pidof", pkg],
+                    binary=False,
+                    operation="start_app",
+                    timeout=deadline - time.monotonic(),
+                )
+            except VendorCommandError:
+                return False  # absent this poll; keep polling to the shared deadline
+            return True
+
+        await wait_until(spawn_present, operation="start_app", timeout=headroom)
+
+    async def _is_app_installed(self, package: str, timeout: float | None) -> bool:
+        """Exact ``package:<pkg>`` line match on ``pm`` output (§1.9).
+
+        ``pm`` applies its own substring filter server-side, so the
+        client-side exact-line check is required for correctness (a
+        ``com.foo`` query also lists ``com.foobar``). No substrings, no
+        regex, no free-text parsing.
+        """
+        pkg = _require_package(package)
+        out = await self._run_adb(
+            ["shell", "pm", "list", "packages", pkg],
+            binary=False,
+            operation="is_app_installed",
+            timeout=timeout,
+        )
+        assert isinstance(out, str)
+        wanted = f"package:{pkg}"
+        return any(line.strip() == wanted for line in out.splitlines())
