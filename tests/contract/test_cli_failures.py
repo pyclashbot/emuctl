@@ -12,6 +12,7 @@ import contextlib
 import importlib.metadata
 import json
 import re
+import signal
 import subprocess
 import sys
 import textwrap
@@ -64,6 +65,10 @@ from ._clifake import (
     ok,
     spawn_from,
 )
+
+# SIGPIPE does not exist on Windows; resolve defensively so static checks resolve
+# the same attribute set on every platform.
+_SIGPIPE = getattr(signal, "SIGPIPE", None)
 
 ADB = "adb:emulator-5554"
 MEMU = "memu:pyclashbot-136"
@@ -717,8 +722,6 @@ def test_a_real_closed_pipe_closes_cleanly() -> None:
     """§5's pipe discipline, observed at the OS level: the raw-bytes write to a
     sink that went away closes cleanly — the process dies of SIGPIPE (the shell
     reports 141) or exits 141, with no traceback and no stderr noise."""
-    import signal
-
     child = subprocess.Popen(
         [sys.executable, "-c", _PIPE_SCRIPT],
         stdout=subprocess.PIPE,
@@ -727,7 +730,10 @@ def test_a_real_closed_pipe_closes_cleanly() -> None:
     assert child.stdout is not None
     child.stdout.close()  # the reader is gone before the writer writes
     _, stderr = child.communicate()
-    assert child.returncode in (141, -signal.SIGPIPE), child.returncode
+    if _SIGPIPE is None:  # pragma: no cover - Windows branch
+        assert child.returncode == 141, child.returncode
+    else:
+        assert child.returncode in (141, -_SIGPIPE), child.returncode
     assert b"Traceback" not in stderr
     assert b"BrokenPipeError" not in stderr
 
