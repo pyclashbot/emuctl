@@ -244,7 +244,9 @@ def test_real_process_timeout_evidence() -> None:
 
 def test_real_process_success_and_cancel_evidence() -> None:
     result = asyncio.run(run_process([sys.executable, "-c", "print('hi')"], operation="real-probe"))
-    assert result.stdout == b"hi\n"
+    # Child line ending is platform-defined (LF vs CRLF); executor must not translate bytes.
+    assert result.stdout.replace(b"\r\n", b"\n") == b"hi\n"
+    assert b"hi" in result.stdout
     assert result.returncode == 0
 
     async def main() -> None:
