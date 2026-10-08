@@ -22,6 +22,13 @@ EXPECTED: tuple[str, ...] = (
     "resources/.gitkeep",
     "config/__init__.py",
     "config/model.py",
+    # §5's CLI lives in-tree behind the [cli] extra; `_exitmap.py` is named by §2/§5 itself.
+    "cli/__init__.py",
+    "cli/_exitmap.py",
+    "cli/_options.py",
+    "cli/_render.py",
+    "cli/_commands.py",
+    "cli/_device.py",
     "backends/__init__.py",
     "backends/_registry.py",
     "backends/adb.py",

@@ -296,6 +296,7 @@ memu = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "click" },
     { name = "import-linter" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -322,6 +323,7 @@ provides-extras = ["memu", "bluestacks", "google-play", "avd", "cli", "all"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "click", specifier = ">=8.2" },
     { name = "import-linter", specifier = ">=2.15" },
     { name = "pre-commit", specifier = ">=4" },
     { name = "pytest", specifier = ">=8" },
