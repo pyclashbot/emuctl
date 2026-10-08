@@ -13,11 +13,15 @@ Interpretation decisions (CONTRACT §3 wins; these fill its silences):
   the baked contract — only the Air module path
   (``emuctl.backends.bluestacks.air``) is. The ``<Vendor>Controller`` scheme
   mirrors the port's ``AdbController`` middle-layer naming; adapter PRs treat
-  these spellings as pinned from here on.
+  these spellings as pinned from here on. Name-collision note: core
+  ``AdbController`` (§6 middle layer, ADB-family interaction primitives) is a
+  different class from the future ``emuctl.backends.adb.AdbController``
+  (concrete adapter subclass inheriting it).
 - Key validators are core-owned callables referenced by the table (this file
-  is core-owned per §6): ADB keys are transport serials, so the §3 serial
-  allowlist applies; vendor instance names require non-blank text with no
-  control characters (log/render safety, matching the sanitize discipline).
+  is core-owned per §6): ADB keys are transport serials, so the ADB row
+  references the §3 serial allowlist (`validate_serial`) directly; vendor
+  instance names require non-blank text with no control characters
+  (log/render safety, matching the sanitize discipline).
 - ``load_adapter`` converts a missing adapter module or missing third-party
   dep into ``ExtrasMissingError`` (never raw ``ModuleNotFoundError``); a
   present module whose attr is not a port-ABC subclass is an
@@ -60,11 +64,6 @@ __all__ = [
 
 #: Control characters rejected in vendor instance names (log/render safety).
 _CONTROL_RE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
-
-
-def _validate_adb_key(key: str) -> None:
-    """ADB keys are transport serials: enforce the §3 serial allowlist."""
-    validate_serial(key)
 
 
 def _validate_vm_name(key: str) -> None:
@@ -164,7 +163,7 @@ _SPEC_TABLE: Final[dict[BackendId, BackendSpec | None]] = {
             "Transport serial as listed by the local ADB server "
             "(e.g. '127.0.0.1:5555', 'emulator-5554'); positional, never referential."
         ),
-        validate_key=_validate_adb_key,
+        validate_key=validate_serial,  # §3 serial allowlist, referenced directly
     ),
     BackendId.MEMU: BackendSpec(
         backend=BackendId.MEMU,
@@ -299,7 +298,13 @@ def load_adapter(spec: BackendSpec) -> type[AsyncEmulatorController]:
 
     Missing third-party deps (or a missing extra-owned adapter module) raise
     `ExtrasMissingError`, never raw `ModuleNotFoundError`; a present module
-    whose attr is not a port subclass raises `InvalidArgumentError`."""
+    whose attr is not a port subclass raises `InvalidArgumentError`.
+
+    EXPLICIT interpretation decision: §3's "never a raw ModuleNotFoundError"
+    applies to adapter/extra failures only. An `extra=None` row whose import
+    chain fails is a broken core install — it surfaces the raw
+    `ModuleNotFoundError` unmapped (CLI exit 9: unmapped = broken install).
+    """
     if not isinstance(spec, BackendSpec):
         raise InvalidArgumentError(
             parameter="spec",
@@ -323,6 +328,8 @@ def load_adapter(spec: BackendSpec) -> type[AsyncEmulatorController]:
                     f"(install the '{spec.extra}' extra)"
                 ),
             ) from None
+        # extra=None row whose chain fails: broken core install — surface the
+        # raw ModuleNotFoundError unmapped (CLI exit 9), never ExtrasMissing.
         raise
     adapter = getattr(module, spec.adapter_attr, None)
     if not (isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)):

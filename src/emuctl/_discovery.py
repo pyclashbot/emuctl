@@ -5,7 +5,11 @@ about driveability — readiness begins at construction and the boot primitive.
 Read-only, bounded, per-backend isolated: a dead vendor becomes a
 `BackendStatus` row derived from the observed failure itself, never a global
 explosion. Deterministic ordering by backend id; no caching. `offline=True`
-skips vendor process probes (config-store enumeration still runs). Cold
+performs no probes and no enumeration — rows report resolved-but-not-probed
+("offline"). Honoring §3's parenthetical (config-store enumeration still
+running while offline) is deferred contract errata: it requires an offline
+knob on the `BackendDiscovery` seam (`list_instances(config)` takes no
+offline parameter today, so offline enumeration is un-implementable). Cold
 `adb devices` may start the local ADB server (documented exception).
 
 Interpretation decisions (CONTRACT §3 wins; these fill its silences):
@@ -241,16 +245,8 @@ async def _status_for(backend: BackendId, *, config: EmuctlConfig, offline: bool
     """One backend's row: registry availability first, vendor probe second,
     each failure derived into the row itself (never raised)."""
     # Function-local: §6 forbids core→backends static imports.
-    from emuctl.backends._registry import get_registry, load_adapter, resolve_backend
+    from emuctl.backends._registry import load_adapter, resolve_backend
 
-    spec = get_registry().get(backend)
-    if spec is None:
-        return BackendStatus(
-            backend=backend,
-            available=False,
-            reason="not-implemented-this-version",
-            detail=f"backend '{backend.value}' is not implemented in this version",
-        )
     try:
         resolved = resolve_backend(backend)
     except BackendNotAvailableError as exc:
@@ -308,8 +304,9 @@ async def discover(
     """Enumerate plausibly-present instances per backend, isolated per backend.
 
     Raises only for unknown ids; every other failure becomes a row.
-    Deterministic ordering by backend id; no caching. `offline=True` skips
-    vendor process probes (config-store enumeration still runs).
+    Deterministic ordering by backend id; no caching. `offline=True`
+    performs no probes and no enumeration (resolved-but-not-probed rows;
+    see the module docstring for the deferred §3-parenthetical errata).
     """
     wanted = _wanted_ids(backends)
     cfg = _resolve_config(config)

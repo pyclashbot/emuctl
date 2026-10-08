@@ -164,9 +164,13 @@ def test_discover_unknown_ids_raise(backends: list[Any], windows_host: Any) -> N
         asyncio.run(discover(backends))
 
 
-def test_discover_offline_skips_vendor_probes(
+def test_discover_offline_probes_nothing(
     windows_host: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Offline performs no probes AND no enumeration: load_adapter is never
+    # reached, rows report resolved-but-not-probed. (§3's parenthetical about
+    # config-store enumeration still running is deferred errata — it needs an
+    # offline knob on the BackendDiscovery seam first.)
     calls: list[str] = []
     registry = windows_host
 
@@ -226,6 +230,30 @@ def test_discover_row_per_refusal_mode(macos_host: Any) -> None:
     assert by_id[BackendId.MEMU].reason == "platform-unsupported"
     assert by_id[BackendId.MEMU].available is False
     assert by_id[BackendId.BLUESTACKS_AIR].reason == "adapter-unavailable"
+
+
+def test_discover_convention_violation_is_adapter_unavailable(
+    windows_host: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Valid port-subclass attr but NO `list_instances` member: the
+    # BackendDiscovery convention is violated, so the row is
+    # adapter-unavailable (never a raise, never a probe).
+    module = types.ModuleType("emuctl.backends.adb")
+    module.__dict__["AdbController"] = _ConfigDummy
+
+    async def get_instance(config: EmuctlConfig, ref: InstanceRef) -> InstanceRecord | None:
+        assert isinstance(config, EmuctlConfig)
+        assert isinstance(ref, InstanceRef)
+        return None
+
+    module.__dict__["get_instance"] = get_instance
+    assert "list_instances" not in module.__dict__
+    monkeypatch.setitem(sys.modules, "emuctl.backends.adb", module)
+    report = asyncio.run(discover([BackendId.ADB]))
+    (row,) = report.backends
+    assert row.available is False
+    assert row.reason == "adapter-unavailable"
+    assert "(BackendDiscovery convention)" in (row.detail or "")
 
 
 def test_discover_per_backend_isolation(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -313,6 +341,33 @@ def test_connect_refusal_missing_dep(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ExtrasMissingError) as excinfo:
         asyncio.run(connect("memu:pyclashbot-136"))
     assert excinfo.value.extra == "memu"
+
+
+@pytest.mark.parametrize(
+    ("platform", "target", "exc"),
+    [
+        (Platform.LINUX, "google-play:anything", BackendNotAvailableError),
+        (Platform.MACOS, "memu:pyclashbot-136", BackendNotAvailableError),
+        (Platform.WINDOWS, "memu:pyclashbot-136", ExtrasMissingError),
+        (Platform.LINUX, "adb:has space", InvalidSerialError),
+        (Platform.LINUX, "emulator-5554", InvalidArgumentError),
+    ],
+)
+def test_connect_refusal_imports_no_adapter(
+    monkeypatch: pytest.MonkeyPatch, platform: Platform, target: str, exc: type[Exception]
+) -> None:
+    """Every selection refusal fires before any adapter import: no
+    `emuctl.backends.*` module appears in `sys.modules` during the refusal."""
+    from emuctl.backends import _registry
+
+    monkeypatch.setattr(_registry, "current_platform", lambda: platform)
+    monkeypatch.setattr(_registry, "_dep_available", lambda name: False)
+    before = set(sys.modules)
+    with pytest.raises(exc):
+        asyncio.run(connect(target))
+    assert [
+        name for name in sys.modules if name not in before and name.startswith("emuctl.backends.")
+    ] == []
 
 
 def test_connect_validates_adb_keys_against_serial_allowlist() -> None:

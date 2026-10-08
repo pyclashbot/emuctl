@@ -365,3 +365,53 @@ def test_vendor_key_rule_rejects(reg: Any, key: str) -> None:
 def test_key_structural_rule_still_lives_in_identity() -> None:
     with pytest.raises(InvalidArgumentError):
         InstanceRef(backend=BackendId.MEMU, key="   ")
+
+
+#: §7.10 conformance walk: one row per spec-table step. `implemented` flips
+#: to True in the adapter PR that ships the row's module; all False today
+#: (only docstring stubs exist), so the test pins the honest not-implemented
+#: state and the full assertions activate row-by-row later.
+CONFORMANCE_ROWS = [
+    (BackendId.ADB, False),
+    (BackendId.MEMU, False),
+    (BackendId.BLUESTACKS, False),
+    (BackendId.BLUESTACKS_AIR, False),
+    (BackendId.GOOGLE_PLAY, False),
+    (BackendId.AVD, False),
+]
+
+
+@pytest.mark.parametrize(("backend", "implemented"), CONFORMANCE_ROWS)
+def test_spec_row_conformance(reg: Any, backend: BackendId, implemented: bool) -> None:
+    """§7.10 — every spec row's module is importable via the registry's own
+    machinery (`load_adapter`), exposes `spec.adapter_attr` as a port
+    subclass, and exposes module-level `list_instances`/`get_instance`."""
+    spec = reg.get_registry()[backend]
+    if not implemented:
+        if spec is None:
+            with pytest.raises(BackendNotAvailableError) as excinfo:
+                reg.resolve_backend(backend)
+            assert excinfo.value.reason == "not-implemented-this-version"
+            return
+        try:
+            adapter = reg.load_adapter(spec)
+        except (ExtrasMissingError, InvalidArgumentError, ImportError):
+            return  # honest today: the loader refuses the stub row
+        module = sys.modules.get(spec.module)
+        conformant = (
+            isinstance(adapter, type)
+            and issubclass(adapter, AsyncEmulatorController)
+            and callable(getattr(module, "list_instances", None))
+            and callable(getattr(module, "get_instance", None))
+        )
+        assert not conformant, (
+            f"{backend.value} looks implemented — flip its CONFORMANCE_ROWS "
+            "flag to True in the adapter PR"
+        )
+        return
+    assert spec is not None
+    adapter = reg.load_adapter(spec)
+    assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)
+    module = sys.modules[spec.module]
+    assert callable(getattr(module, "list_instances", None))
+    assert callable(getattr(module, "get_instance", None))
