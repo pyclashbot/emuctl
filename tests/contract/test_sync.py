@@ -113,6 +113,28 @@ def _wait_for_thread_teardown(deadline_s: float = 5.0) -> None:
         time.sleep(0.05)
 
 
+def _wait_for_no_controller_threads(before: set[str], deadline_s: float = 5.0) -> None:
+    """Bounded wait for a settled absence of OUR background threads.
+
+    Windows CI: close()'s deferred ``emuctl-portal-join`` helper can spawn a
+    scheduling beat behind a clean teardown sample, so a one-shot global
+    thread-set snapshot can contradict itself on a loaded runner. Poll the
+    §5 no-leak invariant — no portal/AnyIO/join thread that postdates
+    ``before`` — instead of demanding the runner's exact global thread set.
+    """
+    deadline = time.monotonic() + deadline_s
+    while True:
+        ours = {
+            name
+            for name in _thread_names() - before
+            if PORTAL_THREAD_NAME in name or "AnyIO" in name
+        }
+        if not ours:
+            return
+        assert time.monotonic() < deadline, f"our threads survived: {sorted(ours)}"
+        time.sleep(0.05)
+
+
 class _FakeController(AsyncEmulatorController):
     """In-memory fake of the port: records every op + the budget the async
     layer resolved (timeout parity evidence), optional failure, optional
@@ -708,9 +730,9 @@ def test_close_vs_first_call_race_all_outcomes_typed_and_no_leak() -> None:
             assert outcome is None or isinstance(outcome, ControllerClosedError), outcome
         assert controller._closed
         _wait_for_thread_teardown()  # per-iteration bounded join-pin
-        assert _thread_names() == before
+        _wait_for_no_controller_threads(before)
         controller.close()  # idempotent, joins nothing leaked
-    assert _thread_names() == before
+    _wait_for_no_controller_threads(before)
 
 
 def test_keyboard_interrupt_abandons_and_facade_stays_usable(monkeypatch: Any) -> None:
