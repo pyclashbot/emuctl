@@ -1,11 +1,8 @@
-"""§6 — Backend lazy package: PEP 562 __getattr__ resolves adapter modules via the spec table.
+"""§6 — Backend implementations (one module per single-adapter family, one
+package per multi-adapter family).
 
-TODO: implement once SpecTable exists (backends/_registry.py); raises until then.
+Adapter modules are imported ONLY via `emuctl.backends._registry.load_adapter`
+— never statically from core, never ad-hoc. This package exposes no names
+itself (no PEP 562 loader); core reaches the registry through function-local
+imports only.
 """
-
-from typing import Any
-
-
-def __getattr__(name: str) -> Any:
-    """PEP 562: lazily expose adapters through the spec table."""
-    raise NotImplementedError  # TODO: resolve via backends/_registry.SpecTable
