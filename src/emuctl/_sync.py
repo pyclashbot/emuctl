@@ -228,9 +228,15 @@ class EmulatorController:
         return f"<EmulatorController {str(self._ctl.identity)!r}>"
 
     def __del__(self) -> None:
-        """§5 no-op: ``__del__`` performs nothing; no atexit; cleanup is the
-        explicit ``aclose()``/``close()`` (an unreleased daemon portal thread
-        dies with the process)."""
+        """§5 no-op: ``__del__`` performs nothing; there is **no atexit** hook.
+
+        Shutdown is explicit. **``close()`` is the required exit path**: it
+        stops the portal thread and joins it. ``aclose()`` is transport-only —
+        it does not stop the portal, so a process that calls only ``aclose()``
+        can hang during interpreter shutdown in the blocking-portal thread
+        join (observed on 3.12/3.13); call ``close()`` (or use the facade as a
+        context manager) on every exit path.
+        """
 
     # ── the funnel ──
 

@@ -361,8 +361,6 @@ async def test_is_app_installed_via_inherited_mechanics(memu_module: Any) -> Non
     assert calls[0] == [MEMUC, "listvms"]  # lazy transport derivation
     assert calls[1] == [
         "adb",
-        "-H",
-        "127.0.0.1",
         "-P",
         "5037",
         "-s",
@@ -385,8 +383,6 @@ async def test_screenshot_sniffs_png_and_scopes(memu_module: Any) -> None:
         [MEMUC, "listvms"],
         [
             "adb",
-            "-H",
-            "127.0.0.1",
             "-P",
             "5037",
             "-s",
@@ -885,8 +881,6 @@ async def test_is_reachable_ok_via_rows_then_echo(memu_module: Any) -> None:
         [MEMUC, "listvms"],
         [
             "adb",
-            "-H",
-            "127.0.0.1",
             "-P",
             "5037",
             "-s",
@@ -1031,8 +1025,6 @@ async def test_restart_phase_argv_order(memu_module: Any) -> None:
     assert memuc_calls[4] == [MEMUC, "listvms"]
     assert adb_calls[0] == [
         "adb",
-        "-H",
-        "127.0.0.1",
         "-P",
         "5037",
         "connect",

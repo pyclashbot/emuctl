@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import contextlib
 import dis
 import enum
 import inspect
@@ -84,6 +85,7 @@ from emuctl._serials import ADB_SERVER_VERBS, validate_serial
 from emuctl.config.model import ConfigSpec, CreateSpec
 from emuctl.errors import (
     ControllerClosedError,
+    DeviceStateError,
     EmulatorNotReadyError,
     ExecutableNotFoundError,
     FeatureNotSupportedError,
@@ -439,9 +441,7 @@ class AsyncEmulatorController(abc.ABC):
         """Running observation: False only when the observation itself succeeded."""
         ...
 
-    async def _create(
-        self, spec: CreateSpec, timeout: float | None
-    ) -> InstanceRef:  # ty: ignore[empty-body]
+    async def _create(self, spec: CreateSpec, timeout: float | None) -> InstanceRef:  # ty: ignore[empty-body]
         """Provision a new instance; returns the new instance's ref.
 
         ``timeout`` is the REMAINING slice of create()'s ONE shared provision
@@ -489,9 +489,7 @@ class AsyncEmulatorController(abc.ABC):
         """Launch + bounded spawn-verify (no stdout parsing)."""
         ...
 
-    async def _is_app_installed(
-        self, package: str, timeout: float | None
-    ) -> bool:  # ty: ignore[empty-body]
+    async def _is_app_installed(self, package: str, timeout: float | None) -> bool:  # ty: ignore[empty-body]
         """Installed observation: False only when the observation succeeded."""
         ...
 
@@ -866,6 +864,24 @@ _TEXT_META: Final[frozenset[str]] = frozenset("\"';&|<>()$`\\*?~#!")
 _LAUNCHER_CATEGORY: Final[str] = "android.intent.category.LAUNCHER"
 
 
+#: Hosts where adb would use its local server anyway. Emitting `-H` for these
+#: marks the server REMOTE, and adb then refuses to auto-start it ("cannot
+#: start server on remote host"), breaking cold starts on a custom `-P` port.
+_LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+#: How long the best-effort pointer release may take (bounded cleanup).
+_POINTER_RELEASE_TIMEOUT_S: Final[float] = 2.0
+
+#: How long a lazy transport re-attach may take before the next op proceeds.
+_TRANSPORT_REATTACH_TIMEOUT_S: Final[float] = 2.0
+
+
+def _server_host_args(host: str) -> list[str]:
+    """`-H` only for a genuinely remote server host (pure)."""
+    return [] if host in _LOOPBACK_HOSTS else ["-H", host]
+
+
 def _escape_input_text(value: str) -> str:
     """Apply the shared ``adb shell input text`` escaping rule (pure).
 
@@ -935,6 +951,33 @@ def _classify_probe_failure(stderr_excerpt: str) -> str:
     return "disconnected"
 
 
+def _classify_transport_state(stderr_excerpt: str) -> str | None:
+    """Map a vendor failure's stderr to §2's DeviceStateError vocabulary.
+
+    Only explicit transport-degradation shapes qualify — a normal command
+    failure (``INSTALL_FAILED_*``, ``package not found``) must stay a
+    ``VendorCommandError``. stderr only; stdout is never consulted (pure).
+    """
+    lowered = stderr_excerpt.lower()
+    if "unauthorized" in lowered:
+        return "unauthorized"
+    if "offline" in lowered:
+        return "offline"
+    disconnected_tokens = (
+        "no devices/emulators found",
+        "device not found",
+        "connection reset",
+        "broken pipe",
+        "protocol fault",
+        "cannot connect to daemon",
+    )
+    if any(token in lowered for token in disconnected_tokens):
+        return "disconnected"
+    if "not found" in lowered and "device" in lowered:
+        return "disconnected"
+    return None
+
+
 class AdbController(AsyncEmulatorController, abc.ABC):
     """§1's ONE ADB middle layer (core-side, port-adjacent per §6).
 
@@ -968,9 +1011,15 @@ class AdbController(AsyncEmulatorController, abc.ABC):
     _executor: ProcessExecutor
 
     def _prefix(self) -> list[str]:
-        """Server selector: binary + ``-H``/``-P`` (deterministic, always)."""
+        """Server selector: binary + (remote ``-H``) + ``-P``.
+
+        ``-H`` makes adb treat the server as REMOTE and refuse to auto-start it
+        ("cannot start server on remote host"), so it is emitted only for a
+        genuinely remote host. Loopback defaults to the plain local server
+        (``-P`` only) and keeps the documented cold-start behaviour.
+        """
         binary = self.adb_path if self.adb_path else "adb"
-        prefix = [binary, "-H", self._adb_host]
+        prefix = [binary, *_server_host_args(self._adb_host)]
         if self.adb_server_port is not None:
             prefix += ["-P", str(self.adb_server_port)]
         return prefix
@@ -1000,6 +1049,24 @@ class AdbController(AsyncEmulatorController, abc.ABC):
             )
         return [*self._prefix(), *args]
 
+    async def _reattach_transport(self, timeout: float) -> None:
+        """Lazily re-issue ``adb connect`` after a classified transport loss.
+
+        A single socket blip otherwise poisons a long-lived facade forever:
+        adb forgets the transport and every later op fails until someone
+        connects again. This runs at the START of the next op (never as a
+        retry of the failed one), as a bounded server verb, and swallows its
+        own failure so the op's own typed error remains authoritative. The
+        budget is the caller op's remaining slice, capped at
+        :data:`_TRANSPORT_REATTACH_TIMEOUT_S` — never a fresh timeout (§2).
+        """
+        argv = self._server_argv(["connect", self._serial])
+        logger.debug("adb op=reattach argv=%s", [sanitize(a) for a in argv])
+        try:
+            await self._executor.run(argv, operation="reattach", timeout=timeout)
+        except Exception:
+            logger.debug("adb reattach failed serial=%s", sanitize(self._serial))
+
     async def _run_adb(
         self,
         tail: Sequence[str],
@@ -1012,10 +1079,18 @@ class AdbController(AsyncEmulatorController, abc.ABC):
         """Execute one adb argv: scoped, bounded, cancel-safe (internal seam).
 
         Returns raw stdout bytes (``binary=True``) or decoded text. Nonzero
-        rc → ``VendorCommandError(output_reason="exit")``; stdout is returned
-        for the caller to verify, never interpreted here. ``CancelledError``
+        rc → ``DeviceStateError`` for explicit transport degradation, else
+        ``VendorCommandError(output_reason="exit")``; stdout is returned for
+        the caller to verify, never interpreted here. ``CancelledError``
         propagates unmodified (the executor owns abandonment).
         """
+        if getattr(self, "_transport_stale", False):
+            self._transport_stale = False
+            budget = _TRANSPORT_REATTACH_TIMEOUT_S
+            if timeout is not None:
+                budget = min(budget, timeout)
+            if budget > 0:
+                await self._reattach_transport(budget)
         argv = self._server_argv(tail) if server_verb else self._device_argv(tail)
         logger.debug("adb op=%s argv=%s", sanitize(operation), [sanitize(a) for a in argv])
         try:
@@ -1029,11 +1104,20 @@ class AdbController(AsyncEmulatorController, abc.ABC):
                 detail=f"could not execute the adb binary: {type(exc).__name__}",
             ) from exc
         if result.returncode != 0:
+            excerpt = _stderr_excerpt(result.stderr)
+            state = _classify_transport_state(excerpt)
+            if state is not None:
+                # §2: mid-op transport degradation is DeviceStateError, not a
+                # vendor command failure (the observation itself failed). Mark
+                # the transport for a lazy re-attach on the NEXT op; never
+                # retry this one (§2: no exception-driven retries).
+                self._transport_stale = True
+                raise DeviceStateError(serial=self._serial, state=state)
             raise VendorCommandError(
                 command=argv,
                 returncode=result.returncode,
                 output_reason="exit",
-                stderr_excerpt=_stderr_excerpt(result.stderr),
+                stderr_excerpt=excerpt,
             )
         if binary:
             return result.stdout
@@ -1055,6 +1139,23 @@ class AdbController(AsyncEmulatorController, abc.ABC):
                 detail=f"screenshot returned {len(raw)} bytes that do not decode as PNG",
             ) from exc
         return raw
+
+    async def _release_pointer(self, operation: str) -> None:
+        """Best-effort lift of a pointer stuck DOWN after an interrupted gesture.
+
+        A tap/swipe killed between the device's DOWN and UP leaves
+        InputDispatcher in "already down" state, after which every later
+        ``input tap`` exits 0 and does nothing. One bounded, error-swallowed
+        ``motionevent UP`` restores input without masking the original
+        timeout/cancellation (which the caller re-raises immediately after).
+        """
+        with contextlib.suppress(Exception):
+            await self._run_adb(
+                ["shell", "input", "motionevent", "UP", "0", "0"],
+                binary=False,
+                operation=operation,
+                timeout=_POINTER_RELEASE_TIMEOUT_S,
+            )
 
     async def _click(
         self, x: int, y: int, *, count: int, interval: float, timeout: float | None
@@ -1092,12 +1193,18 @@ class AdbController(AsyncEmulatorController, abc.ABC):
                     deadline=deadline,
                     elapsed=time.monotonic() - start,
                 )
-            await self._run_adb(
-                ["shell", "input", "tap", str(x), str(y)],
-                binary=False,
-                operation="click",
-                timeout=headroom,
-            )
+            try:
+                await self._run_adb(
+                    ["shell", "input", "tap", str(x), str(y)],
+                    binary=False,
+                    operation="click",
+                    timeout=headroom,
+                )
+            except (OperationTimeoutError, VendorCommandError, DeviceStateError):
+                # CancelledError is NOT caught (§2/§5: it propagates
+                # unmodified and adds no cleanup delay).
+                await self._release_pointer("click")
+                raise
             if interval and index < count - 1:
                 await asyncio.sleep(float(interval))
 
@@ -1120,12 +1227,26 @@ class AdbController(AsyncEmulatorController, abc.ABC):
             raise InvalidArgumentError(parameter="duration_ms", constraint="must be an int >= 0")
         if duration_ms < 0:
             raise InvalidArgumentError(parameter="duration_ms", constraint="must be >= 0")
-        await self._run_adb(
-            ["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration_ms)],
-            binary=False,
-            operation="swipe",
-            timeout=timeout,
-        )
+        try:
+            await self._run_adb(
+                [
+                    "shell",
+                    "input",
+                    "swipe",
+                    str(x1),
+                    str(y1),
+                    str(x2),
+                    str(y2),
+                    str(duration_ms),
+                ],
+                binary=False,
+                operation="swipe",
+                timeout=timeout,
+            )
+        except (OperationTimeoutError, VendorCommandError, DeviceStateError):
+            # CancelledError is NOT caught (§2/§5).
+            await self._release_pointer("swipe")
+            raise
 
     async def _key(self, code: str | int, timeout: float | None) -> None:
         """Raw keycode/keyevent symbol, passed through verbatim."""
@@ -1335,6 +1456,8 @@ class AdbController(AsyncEmulatorController, abc.ABC):
             return ProbeResult(ok=False, reason="timeout")
         except ExecutableNotFoundError:
             return ProbeResult(ok=False, reason="no-adb")
+        except DeviceStateError as exc:
+            return ProbeResult(ok=False, reason=exc.state)
         except VendorCommandError as exc:
             return ProbeResult(ok=False, reason=_classify_probe_failure(exc.stderr_excerpt))
         except Exception:

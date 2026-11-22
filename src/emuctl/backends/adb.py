@@ -55,7 +55,7 @@ from emuctl.errors import (
 )
 from emuctl.log import sanitize
 from emuctl.port import AdbController as _AdbMiddleLayer
-from emuctl.port import CapabilityFlag, ProbeResult, _stderr_excerpt
+from emuctl.port import CapabilityFlag, ProbeResult, _server_host_args, _stderr_excerpt
 from emuctl.timing import (
     DEFAULT,
     QUERY_TIMEOUT,
@@ -168,7 +168,7 @@ class AdbController(_AdbMiddleLayer):
 def _discovery_argv(cfg: EmuctlConfig) -> list[str]:
     """Server-verb argv for ``adb devices`` from the resolved config (pure)."""
     binary = cfg.adb.path if cfg.adb.path else "adb"
-    return [binary, "-H", cfg.adb.host, "-P", str(cfg.adb.port), "devices"]
+    return [binary, *_server_host_args(cfg.adb.host), "-P", str(cfg.adb.port), "devices"]
 
 
 def _device_rows(stdout: bytes) -> list[tuple[str, str]]:

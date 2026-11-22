@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import os
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -885,3 +887,39 @@ def test_vendor_failure_crosses_the_facade_typed() -> None:
         assert resolve_error_code(caught.value) == "vendor_command_failed"
     finally:
         facade.close()
+
+
+# ── interpreter exit: close() is the required exit path (§5, no atexit) ──
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the fake adb shim is a POSIX executable")
+def test_interpreter_exit_after_close_is_clean(tmp_path: Any) -> None:
+    """A closed facade exits cleanly: the portal thread is stopped and joined.
+
+    §5 forbids atexit, so no hidden shutdown hook exists. ``close()`` is the
+    required exit path (``aclose()`` is transport-only and does not stop the
+    portal); this child interpreter exercises the documented path end to end.
+    """
+    adb = tmp_path / "fake-adb"
+    adb.write_text(f"#!{sys.executable}\nprint('')\n", encoding="utf-8")
+    adb.chmod(0o755)
+    code = f"""
+import emuctl
+from emuctl.config.model import AdbConfig, EmuctlConfig
+
+facade = emuctl.connect_sync(
+    "adb:127.0.0.1:5555",
+    config=EmuctlConfig(adb=AdbConfig(path={str(adb)!r})),
+)
+assert facade.is_reachable().ok is True
+facade.close()
+facade.close()  # idempotent
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
