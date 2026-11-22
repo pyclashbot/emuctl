@@ -54,7 +54,11 @@ Interpretation decisions (CONTRACT §1 wins; these fill its silences):
   to :func:`emuctl.waits.wait_until`'s poll loop (the single sanctioned
   internal loop). Expiry raises ``OperationTimeoutError`` (§2: expiry never
   degrades to a value; ``EmulatorNotReadyError`` is a ``restart()``-only
-  surface), never a silent pass.
+  surface), never a silent pass. The launch phase uses a syskeys-free
+  ``monkey`` invocation (headless images have no physical keys; the default
+  SYS_KEYS slice aborts with rc 251), falls back once to the historical plain
+  invocation, and never treats rc 0 as proof: a short acceptance window fails
+  the launch if ``pidof`` never reports the process. No stdout is read (§1.9).
 """
 
 # ruff: noqa: B027 — mechanics are deliberately non-abstract `...` stubs: the
@@ -439,9 +443,7 @@ class AsyncEmulatorController(abc.ABC):
         """Running observation: False only when the observation itself succeeded."""
         ...
 
-    async def _create(
-        self, spec: CreateSpec, timeout: float | None
-    ) -> InstanceRef:  # ty: ignore[empty-body]
+    async def _create(self, spec: CreateSpec, timeout: float | None) -> InstanceRef:  # ty: ignore[empty-body]
         """Provision a new instance; returns the new instance's ref.
 
         ``timeout`` is the REMAINING slice of create()'s ONE shared provision
@@ -489,9 +491,7 @@ class AsyncEmulatorController(abc.ABC):
         """Launch + bounded spawn-verify (no stdout parsing)."""
         ...
 
-    async def _is_app_installed(
-        self, package: str, timeout: float | None
-    ) -> bool:  # ty: ignore[empty-body]
+    async def _is_app_installed(self, package: str, timeout: float | None) -> bool:  # ty: ignore[empty-body]
         """Installed observation: False only when the observation succeeded."""
         ...
 
@@ -865,6 +865,12 @@ _TEXT_META: Final[frozenset[str]] = frozenset("\"';&|<>()$`\\*?~#!")
 #: ``monkey`` intent plumbing for package-only launches (no activity known).
 _LAUNCHER_CATEGORY: Final[str] = "android.intent.category.LAUNCHER"
 
+#: How long a launch that exited 0 gets to produce a process before it is
+#: treated as a failed launch (never the full app budget): rc 0 is not proof
+#: that anything started (Android's ``am`` can print "Activity not started"
+#: and still exit 0). No stdout is consulted; the ``pidof`` status decides.
+_LAUNCH_CONFIRM_TIMEOUT_S: Final[float] = 10.0
+
 
 def _escape_input_text(value: str) -> str:
     """Apply the shared ``adb shell input text`` escaping rule (pure).
@@ -1206,6 +1212,27 @@ class AdbController(AsyncEmulatorController, abc.ABC):
         status only (0 = a process exists); its stdout is consumed, never read
         for the decision.
 
+        The launch phase uses package-scoped ``monkey`` under that one
+        deadline. On headless platform images (observed: some images) monkey's
+        default event mix injects SYS_KEYS events and aborts with rc 251
+        because the image has no physical keys; the primary invocation
+        therefore disables that event class with ``--pct-syskeys 0``. If that
+        invocation still exits nonzero, one historical plain event-mix
+        invocation is tried (for monkey builds that reject the option), under
+        the same shrinking budget. ``monkey`` is not
+        contract-mandated — §1 requires "launch + bounded spawn-verify (no
+        stdout parsing)"; both invocations decide from exit status only. If
+        both fail, one ``VendorCommandError`` carries the fallback's payload
+        plus both return codes in ``detail``, so operators see the original
+        failure too.
+
+        A successful launch command is not treated as proof of a launch
+        (§1.9): the process must appear within
+        :data:`_LAUNCH_CONFIRM_TIMEOUT_S` of the launch, or the call raises
+        ``OperationTimeoutError`` with a detail explaining that the command
+        exited 0 but no process was observed — it never silently burns the
+        full app budget polling for a launch that never happened.
+
         Explicit unbounded (``timeout=None``, sanctioned-but-discouraged)
         degrades the verify to a single exit-status probe — polling requires
         a finite budget shape, and a second unsanctioned loop is not
@@ -1234,12 +1261,58 @@ class AdbController(AsyncEmulatorController, abc.ABC):
             operation="start_app",
             timeout=timeout,
         )
-        await self._run_adb(
-            ["shell", "monkey", "-p", pkg, "-c", _LAUNCHER_CATEGORY, "1"],
-            binary=False,
-            operation="start_app",
-            timeout=remaining(),
-        )
+        try:
+            await self._run_adb(
+                [
+                    "shell",
+                    "monkey",
+                    "-p",
+                    pkg,
+                    "-c",
+                    _LAUNCHER_CATEGORY,
+                    "--pct-syskeys",
+                    "0",
+                    "1",
+                ],
+                binary=False,
+                operation="start_app",
+                timeout=remaining(),
+            )
+        except VendorCommandError as primary_error:
+            # The syskeys-free mix is the primary launch: headless images have
+            # no physical keys, so monkey's default SYS_KEYS slice aborts with
+            # rc 251 even though the platform is healthy. The fallback below
+            # keeps the historical mix for monkey builds that reject the
+            # option; it is a different invocation, not a blind retry, and it
+            # spends the SAME shrinking op-level budget (``remaining()``),
+            # never a fresh full timeout. Only exit status decides; stdout is
+            # never parsed (§1.9).
+            try:
+                await self._run_adb(
+                    ["shell", "monkey", "-p", pkg, "-c", _LAUNCHER_CATEGORY, "1"],
+                    binary=False,
+                    operation="start_app",
+                    timeout=remaining(),
+                )
+            except VendorCommandError as fallback_error:
+                detail = (
+                    f"syskeys-free monkey launch failed with rc={primary_error.returncode}; "
+                    f"plain monkey fallback failed with rc={fallback_error.returncode}"
+                )
+                if primary_error.stderr_excerpt:
+                    detail += f"; primary stderr: {primary_error.stderr_excerpt}"
+                raise VendorCommandError(
+                    command=fallback_error.command,
+                    returncode=fallback_error.returncode,
+                    output_reason=fallback_error.output_reason,
+                    stderr_excerpt=fallback_error.stderr_excerpt,
+                    detail=detail,
+                ) from primary_error
+            logger.debug(
+                "start_app syskeys-free monkey rc=%s failed; plain monkey fallback launched %s",
+                primary_error.returncode,
+                sanitize(pkg),
+            )
         if deadline is None:
             # Explicit unbounded (§2: sanctioned, discouraged): polling is a
             # finite-budget shape (waits.wait_until requires a positive
@@ -1264,7 +1337,23 @@ class AdbController(AsyncEmulatorController, abc.ABC):
                 return False  # absent this poll; keep polling to the shared deadline
             return True
 
-        await wait_until(spawn_present, operation="start_app", timeout=headroom)
+        # rc 0 is not proof of a launch: bound the acceptance window so a
+        # silent no-op (observed with ``am start -p``: exit 0, nothing started)
+        # fails in seconds instead of burning the whole app budget.
+        confirm = min(headroom, _LAUNCH_CONFIRM_TIMEOUT_S)
+        try:
+            await wait_until(spawn_present, operation="start_app", timeout=confirm)
+        except OperationTimeoutError as exc:
+            raise OperationTimeoutError(
+                operation="start_app",
+                deadline=exc.deadline,
+                elapsed=exc.elapsed,
+                detail=(
+                    "launch command exited 0 but pidof found no process for "
+                    f"{sanitize(pkg)} within {confirm:.1f}s; treating the launch "
+                    "as failed (launch stdout is never parsed, §1.9)"
+                ),
+            ) from exc
 
     async def _is_app_installed(self, package: str, timeout: float | None) -> bool:
         """Exact ``package:<pkg>`` line match on ``pm`` output (§1.9).
