@@ -1,4 +1,7 @@
-"""Layout-drift detector: the CONTRACT §6 tree exists in src/emuctl (organization lock)."""
+"""Layout-drift detector: the CONTRACT §6 tree exists in src/emuctl
+(organization lock) — and ONLY that tree: any stray file/shipped directory in
+the package that the contract's layout does not name is drift in the other
+direction."""
 
 from pathlib import Path
 
@@ -18,6 +21,7 @@ EXPECTED: tuple[str, ...] = (
     "_identification.py",
     "_discovery.py",
     "_platforms.py",
+    "_sync.py",
     "py.typed",
     "resources/.gitkeep",
     "config/__init__.py",
@@ -47,3 +51,31 @@ EXPECTED: tuple[str, ...] = (
 def test_layout_tree_matches_contract() -> None:
     missing = [name for name in EXPECTED if not (ROOT / name).exists()]
     assert missing == [], f"layout drifted from CONTRACT §6; missing: {missing}"
+
+
+def _actual_tree() -> set[str]:
+    """The files the shipped package tree actually contains (no __pycache__)."""
+    actual: set[str] = set()
+    for item in sorted(ROOT.rglob("*")):
+        rel = item.relative_to(ROOT).as_posix()
+        if "__pycache__" in rel.split("/"):
+            continue
+        if item.is_file():
+            actual.add(rel)
+    return actual
+
+
+def test_layout_tree_is_exactly_expected() -> None:
+    """§7.10 layout completeness, both directions: every expected file
+    exists AND the shipped package tree names no file beyond the contract's
+    layout (generated ``__pycache__`` directories tolerated)."""
+    expected_files = set(EXPECTED)
+    # every parent directory an expected file lives under must exist
+    expected_dirs = {str(Path(name).parent) for name in expected_files if "/" in name}
+    missing_dirs = sorted(name for name in expected_dirs if not (ROOT / name).is_dir())
+    assert missing_dirs == [], missing_dirs
+    actual = _actual_tree()
+    stray = sorted(actual - expected_files)
+    missing_files = sorted(expected_files - actual)
+    assert stray == [], f"files beyond CONTRACT §6's named layout: {stray}"
+    assert missing_files == [], f"expected files absent: {missing_files}"

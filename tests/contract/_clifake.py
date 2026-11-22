@@ -9,6 +9,16 @@ transport-constructor-level, never a plugin registry). No real vendor binary is
 ever executed.
 
 Not a pytest module (no ``test_`` prefix): shared helpers, collected by import.
+
+Offline-tier interpretation ledger (§7 close-out): §7's "replayed subprocess
+transcripts ... backed by recorded real-hardware byte fixtures" is realized
+at v0 as the tier THIS module implements — synthesized in-process fixtures
+(``ADB_DEVICES``/``MEMU_VMS``, the minimal-PNG bytes above) + scripted
+``_spawn`` doubles bound through ``emuctl._proc._default_spawn`` (§6's
+recorded-fixture seam). No real-hardware capture exists in the repo and no
+live tier run is required for CI; recording genuine device transcripts is
+deferred out of v0 until a real-attached run is available — this file is
+where captured fixtures would land, byte-format unchanged.
 """
 
 from __future__ import annotations

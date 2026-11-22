@@ -133,7 +133,13 @@ update_changelog_on_bump = true
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
 commit_parser = "conventional"
-tag_format = "v$version"
+# PSR 10.x requires PSR-style format keys ("v{version}"); "v$version" is
+# commitizen syntax and fails PSR's config validation.
+tag_format = "v{version}"
+# v0 determinism: with the default gate PSR would compute 1.0.0 from the
+# declared 0.1.0; the contract scope IS v0, so the zero version stays a legal
+# release target.
+allow_zero_version = true
 commit_author = "github-actions[bot] <actions@github.com>"
 # UV recipe (PSR docs: configuration-guides/uv_integration): refresh the lock for the new
 # version, stage it into the release commit, then build. uv is on PATH via setup-uv in CI.
@@ -149,5 +155,8 @@ prerelease = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# §7: "the live tier is opt-in/marked and never required for CI" — deselection
+# is structural (addopts), so accidental live-tier execution can't happen by
+# forgetting a flag; `-m emulator` opts back in explicitly.
+addopts = "-q -m 'not emulator'"
 markers = ["emulator: hardware-attached tests, opt-in via -m emulator (not CI)"]
