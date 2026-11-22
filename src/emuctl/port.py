@@ -439,7 +439,9 @@ class AsyncEmulatorController(abc.ABC):
         """Running observation: False only when the observation itself succeeded."""
         ...
 
-    async def _create(self, spec: CreateSpec, timeout: float | None) -> InstanceRef:  # ty: ignore[empty-body]
+    async def _create(
+        self, spec: CreateSpec, timeout: float | None
+    ) -> InstanceRef:  # ty: ignore[empty-body]
         """Provision a new instance; returns the new instance's ref.
 
         ``timeout`` is the REMAINING slice of create()'s ONE shared provision
@@ -487,7 +489,9 @@ class AsyncEmulatorController(abc.ABC):
         """Launch + bounded spawn-verify (no stdout parsing)."""
         ...
 
-    async def _is_app_installed(self, package: str, timeout: float | None) -> bool:  # ty: ignore[empty-body]
+    async def _is_app_installed(
+        self, package: str, timeout: float | None
+    ) -> bool:  # ty: ignore[empty-body]
         """Installed observation: False only when the observation succeeded."""
         ...
 
@@ -1186,16 +1190,21 @@ class AdbController(AsyncEmulatorController, abc.ABC):
         )
 
     async def _start_app(self, package: str, timeout: float | None) -> None:
-        """Launcher-intent launch + bounded ``pidof`` spawn-verify (§1).
+        """Cold launch: force-stop, launcher intent, bounded ``pidof`` verify (§1).
 
-        Launch and verify share the SAME op-level budget (§2: one deadline
-        per call, distributed internally): the deadline is established once,
-        and ``waits.wait_until`` is handed the remaining slice — never a
-        full budget anew. The predicate keys on the ``pidof`` exit status
-        only (0 = a process exists); its stdout is consumed, never read for
-        the decision. Deadline expiry raises ``OperationTimeoutError`` (§2:
-        operation timeouts never degrade to a value) — never a silent
-        launch-and-hope pass.
+        A warm device can be mid-run on a popup; ``monkey`` alone would resume
+        whatever screen Clash is on and burn the caller's restart budget. The
+        force-stop therefore precedes the launch, and all three phases
+        (force-stop, launch, verify) share the SAME op-level budget (§2: one
+        deadline per call, distributed internally) — the deadline is
+        established once; the first slice carries the op-level budget and the
+        later phases are handed the shrinking remainder, never a full budget
+        anew. Force-stop and launch failures surface as
+        ``VendorCommandError`` (nonzero rc / unusable output); deadline expiry
+        in any phase raises ``OperationTimeoutError`` (§2: expiry never
+        degrades to a value). The verify predicate keys on the ``pidof`` exit
+        status only (0 = a process exists); its stdout is consumed, never read
+        for the decision.
 
         Explicit unbounded (``timeout=None``, sanctioned-but-discouraged)
         degrades the verify to a single exit-status probe — polling requires
@@ -1205,11 +1214,31 @@ class AdbController(AsyncEmulatorController, abc.ABC):
         pkg = _require_package(package)
         start = time.monotonic()
         deadline = None if timeout is None else start + float(timeout)
+
+        def remaining() -> float | None:
+            """The one shared deadline's remaining slice (§2)."""
+            if deadline is None:
+                return None
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise OperationTimeoutError(
+                    operation="start_app",
+                    deadline=deadline,
+                    elapsed=time.monotonic() - start,
+                )
+            return left
+
+        await self._run_adb(
+            ["shell", "am", "force-stop", pkg],
+            binary=False,
+            operation="start_app",
+            timeout=timeout,
+        )
         await self._run_adb(
             ["shell", "monkey", "-p", pkg, "-c", _LAUNCHER_CATEGORY, "1"],
             binary=False,
             operation="start_app",
-            timeout=timeout,
+            timeout=remaining(),
         )
         if deadline is None:
             # Explicit unbounded (§2: sanctioned, discouraged): polling is a
@@ -1220,13 +1249,8 @@ class AdbController(AsyncEmulatorController, abc.ABC):
                 ["shell", "pidof", pkg], binary=False, operation="start_app", timeout=None
             )
             return
-        headroom = deadline - time.monotonic()
-        if headroom <= 0:
-            raise OperationTimeoutError(
-                operation="start_app",
-                deadline=deadline,
-                elapsed=time.monotonic() - start,
-            )
+        headroom = remaining()
+        assert headroom is not None
 
         async def spawn_present() -> bool:
             try:

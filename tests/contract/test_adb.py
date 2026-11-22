@@ -338,6 +338,7 @@ async def test_start_app_launch_plus_pidof_verify(adb_module: Any) -> None:
     )
     await ctl.start_app("com.example.game")
     assert calls == [
+        [*SCOPED, "shell", "am", "force-stop", "com.example.game"],
         [
             *SCOPED,
             "shell",
@@ -357,11 +358,39 @@ async def test_start_app_launch_failure_raises_before_verify(
     adb_module: Any,
 ) -> None:
     calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok(stderr=b"no such package", returncode=1))
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "force-stop" in argv:
+            return _FakeHandle()  # warm-device stop succeeds
+        return _FakeHandle(stderr=b"no such package", returncode=1)
+
+    ctl = _make(adb_module, calls, respond)
     with pytest.raises(VendorCommandError) as excinfo:
         await ctl.start_app("com.example.missing")
     assert excinfo.value.output_reason == "exit"
-    assert len(calls) == 1  # launch failed: no verify attempt
+    assert calls[0][-3:] == ["am", "force-stop", "com.example.missing"]
+    assert len(calls) == 2  # force-stop + failed launch: no verify attempt
+
+
+@_sync
+async def test_start_app_force_stop_failure_raises_before_launch(
+    adb_module: Any,
+) -> None:
+    """A failed force-stop is typed and aborts: monkey never runs, so a warm
+    popup cannot be mistaken for a completed restart."""
+    calls: list[list[str]] = []
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "force-stop" in argv:
+            return _FakeHandle(stderr=b"Error: package not found", returncode=1)
+        return _FakeHandle(stdout=b"events injected")
+
+    ctl = _make(adb_module, calls, respond)
+    with pytest.raises(VendorCommandError) as excinfo:
+        await ctl.start_app("com.example.game")
+    assert excinfo.value.output_reason == "exit"
+    assert all("monkey" not in argv for argv in calls)
+    assert all("pidof" not in argv for argv in calls)
 
 
 @_sync
@@ -372,6 +401,8 @@ async def test_start_app_slow_spawn_polls_pidof_then_succeeds(adb_module: Any) -
     polls = {"n": 0}
 
     def respond(argv: list[str]) -> _FakeHandle:
+        if "force-stop" in argv:
+            return _FakeHandle()
         if "monkey" in argv:
             return _FakeHandle(stdout=b"events injected")
         polls["n"] += 1
@@ -385,10 +416,11 @@ async def test_start_app_slow_spawn_polls_pidof_then_succeeds(adb_module: Any) -
     await ctl.start_app("com.example.game", timeout=5.0)
     verify = [c for c in calls if c[-2:] == ["pidof", "com.example.game"]]
     assert len(verify) >= 2  # negative first, positive after polling
-    launch, probes = spy.seen_all["start_app"][0], spy.seen_all["start_app"]
-    assert launch == 5.0  # launch runs under the full resolved budget
-    assert len(probes) >= 3  # launch + negative poll + positive poll
-    assert all(budget is not None and 0 < budget <= 5.0 for budget in probes[1:])
+    assert calls[0][-3:] == ["am", "force-stop", "com.example.game"]
+    probes = spy.seen_all["start_app"]
+    assert probes[0] == 5.0  # force-stop runs under the full resolved budget
+    assert all(budget is not None and 0 < budget <= 5.0 for budget in probes)
+    assert len(probes) >= 4  # force-stop + launch + negative poll + positive poll
     # shared deadline: verify slices shrink across polls, never reset to the
     # full budget anew (§2 one deadline per call, distributed internally).
     assert all((probes[i] or 0) <= (probes[i - 1] or 0) for i in range(1, len(probes)))
@@ -434,6 +466,8 @@ async def test_start_app_deadline_expiry_is_typed_timeout_never_green_pass(
     calls: list[list[str]] = []
 
     def respond(argv: list[str]) -> _FakeHandle:
+        if "force-stop" in argv:
+            return _FakeHandle()
         if "monkey" in argv:
             return _FakeHandle(stdout=b"events injected")
         return _FakeHandle(stdout=b"", returncode=1)  # pidof: never spawns
