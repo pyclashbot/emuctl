@@ -433,6 +433,9 @@ def test_connect_refusal_missing_dep(monkeypatch: pytest.MonkeyPatch) -> None:
     from emuctl.backends import _registry
 
     monkeypatch.setattr(_registry, "current_platform", lambda: Platform.WINDOWS)
+    # Hermetic: simulate the missing [memu] extra via the registry's
+    # dep-probe seam, independent of the ambient package store.
+    monkeypatch.setattr(_registry, "_dep_available", lambda name: False)
     with pytest.raises(ExtrasMissingError) as excinfo:
         asyncio.run(connect("memu:pyclashbot-136"))
     assert excinfo.value.extra == "memu"

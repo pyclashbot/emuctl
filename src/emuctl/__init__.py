@@ -3,8 +3,8 @@
 The public surface (CONTRACT §5's "the one public surface" plus the §3/§4
 data types):
 
-- Construction: :func:`connect` (async; the sync twin ``connect_sync`` is
-  §5-derived, owned by the sync PR — deliberately NOT exported here).
+- Construction: :func:`connect` (async) and :func:`connect_sync` (§5's sync
+  twin) + the :class:`EmulatorController` sync facade class.
 - Enumeration: :func:`discover` is the ONLY enumeration path (§1 invariant 11,
   §3 Boundary) — the registry/selection machinery stays internal.
 - Identity (§3): ``BackendId`` / ``InstanceRef`` / ``InstanceRecord`` and the
@@ -42,6 +42,7 @@ from emuctl._discovery import (  # noqa: E402
 from emuctl._identification import BackendId, InstanceRecord, InstanceRef  # noqa: E402
 from emuctl._platforms import Platform, current_platform  # noqa: E402
 from emuctl._serials import is_valid_serial, validate_serial  # noqa: E402
+from emuctl._sync import EmulatorController, connect_sync  # noqa: E402
 from emuctl.config import (  # noqa: E402
     SCHEMA_VERSION,
     AdbConfig,
@@ -157,6 +158,8 @@ __all__: list[str] = [
     "connect",
     "current_platform",
     "discover",
+    "EmulatorController",
+    "connect_sync",
     "ensure_config_supported",
     "is_valid_serial",
     "png_dimensions",
