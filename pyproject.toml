@@ -19,6 +19,14 @@ dependencies = ["anyio>=4.10"]
 Repository = "https://github.com/pyclashbot/emuctl"
 Contract = "https://github.com/pyclashbot/emuctl/blob/main/CONTRACT.md"
 
+# §5: "Console script in the core distribution (pip ignores extras on entry
+# points — pip#9726): a lazy-click stub exits 3 with 'install `emuctl[cli]`'".
+# The script therefore points at the CLICK-FREE package root; emuctl/cli/__init__.py
+# imports click lazily inside main()/amain(), so a core install without the
+# extra still gets a clean exit 3 instead of a ModuleNotFoundError traceback.
+[project.scripts]
+emuctl = "emuctl.cli:main"
+
 [project.optional-dependencies]
 memu = ["pymemuc>=0.6,<0.7"]
 bluestacks = []
@@ -28,7 +36,12 @@ cli = ["click>=8.2"]
 all = ["pymemuc>=0.6,<0.7", "click>=8.2"]
 
 [dependency-groups]
-dev = ["pytest>=8", "import-linter>=2.15", "pre-commit>=4"]
+# `click` is the [cli] extra's framework: the offline conformance suite drives
+# the CLI through click.testing, so it belongs to the dev group explicitly
+# rather than relying on a transitive dependency (commitizen happens to pull
+# click today — that is an accident, not a contract). test_cli_failures.py's
+# hermetic eviction test proves the library itself never needs it.
+dev = ["pytest>=8", "import-linter>=2.15", "pre-commit>=4", "click>=8.2"]
 lint = ["ruff>=0.14", "ty>=0.0", "commitizen>=4"]
 release = ["python-semantic-release>=10", "griffe>=1"]
 
@@ -52,16 +65,27 @@ name = "Backends may import core; core may never import backends"
 type = "layers"
 containers = ["emuctl"]
 layers = [
+  # §5's optional Click CLI is the TOP layer: it may import the core tier and
+  # the backend packages (through the same function-local registry seams
+  # `connect()` uses — §6 rule 3), while nothing in core or the backends may
+  # import it back. Note this makes the `cli` → `backends._registry` edge
+  # contract-legal, so it needs no ignore_imports carve-out below.
+  "cli",
   "backends",
   # `:` = one non-independent core tier (timing→errors→waits…); `|` would forbid intra-core imports.
   "config : log : png : port : errors : timing : waits : _proc : _serials : _identification : _sync : _discovery : _platforms",
 ]
+# Exhaustiveness is what keeps this list honest: every module in the package
+# must be declared in a layer, so a new module (cli/… included) that is not
+# declared here fails the contract until it is.
 exhaustive = true
 # CONTRACT §3/§6 sanctioned seam: connect()/discover() live in core _discovery but
 # selection/loading live in backends._registry, reached ONLY through function-local
 # imports (never top-level in core). Dynamic ADAPTER imports stay exclusively in
 # load_adapter (§7.10); this carve-out names the registry edge only, and
 # unmatched-expression alerting fails the contract if the edge ever disappears.
+# (The §5 CLI reaches the same spec table from the `cli` layer above, which the
+# layers list already permits — no carve-out needed there.)
 ignore_imports = [
   "emuctl._discovery -> emuctl.backends._registry",
   # Same sanctioned seam as above: connect_sync is §5's sync twin of connect()
