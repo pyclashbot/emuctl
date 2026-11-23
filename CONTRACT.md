@@ -38,6 +38,18 @@ class ProbeResult(NamedTuple):
     reason: str
 
 
+class DisplayState(NamedTuple):
+    """Display geometry observed immediately BEFORE configure() applies its overlay.
+    Fields are None when the backend has no display-readback seam; ADB always fills
+    them. Restore is explicit: configure(state.to_spec()) — never automatic."""
+
+    width: int | None
+    height: int | None
+    dpi: int | None
+
+    def to_spec(self) -> "ConfigSpec": ...  # canonical display.width/height/dpi overlay
+
+
 class AsyncEmulatorController(abc.ABC):
     FEATURES: frozenset[CapabilityFlag]  # declared I/O-free, class body only
 
@@ -65,7 +77,9 @@ class AsyncEmulatorController(abc.ABC):
 
     # ── lifecycle ──
     async def create(self, spec: CreateSpec) -> InstanceRef: ...
-    async def configure(self, spec: ConfigSpec | None = None) -> None: ...
+    async def configure(
+        self, spec: ConfigSpec | None = None
+    ) -> DisplayState: ...  # gated CONFIGURE; returns the PRE-apply display observation
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
     async def restart(
@@ -130,8 +144,8 @@ class AdbController(AsyncEmulatorController, abc.ABC):
 5. Bounded waits everywhere: every I/O op carries `timeout: float | None = DEFAULT` (§2's timing table); `restart()`'s internal phases share the one remaining deadline — no per-phase config surface at v0.
 6. `restart()` is one attempt: `None` or `EmulatorNotReadyError(reason, cause)` — never `False`, never internal retries, not idempotent. Phases: stop-if-running → configure-while-stopped → start → `_attach` → settle (first screenshot decodes non-empty) → [app: launch + bounded spawn-verify] → terminal check: `ready(...)` if given, else spawn-present-if-app, else screenshot-decodes. Adapters MAY override it wholesale (BlueStacks' MIM lifecycle is the motivating case); an override re-invokes `_require(BOOT)` at its head and inherits no default body. The bounded re-run-then-re-discover shape is consumer policy — the count is the consumer's too.
 7. `create()` is backend-scoped (ignores the bound identity; returns the new instance's ref). `spec.name` is required at v0; the body begins with an existence pre-check through the discovery seam (`get_instance`), never vendor greeting text — an existing name raises `InvalidArgumentError(parameter="spec.name", constraint="already provisioned")` (exit 2).
-8. `configure()` is gated CONFIGURE: `spec=None` re-applies every non-None section of the bound config; a populated `ConfigSpec` is a targeted overlay (§4). Instance-scoped everything — kills, config, and state target the bound ref; the sole exception is `create()`. No global sweeps.
-9. No control flow from vendor stdout parsing — machine-readable verification only. Screenshot: §4's INV-S1..S7 apply verbatim.
+8. `configure()` is gated CONFIGURE: `spec=None` re-applies every non-None section of the bound config; a populated `ConfigSpec` is a targeted overlay (§4). It returns a `DisplayState` observed immediately before the apply (all fields `None` when the backend cannot observe display); restore is explicit via `configure(state.to_spec())`, never automatic. Instance-scoped everything — kills, config, and state target the bound ref; the sole exception is `create()`. No global sweeps.
+9. No control flow from vendor stdout parsing — machine-readable verification only. One sanctioned data readback exists: the ADB `configure()` display observation (`wm size` / `wm density`), whose exact `Physical|Override size|density` line grammar is parsed for a `DisplayState` only; it never selects a command path beyond skipping a write whose value already matches, fails closed on malformed output, and shares the op deadline. Screenshot: §4's INV-S1..S7 apply verbatim.
 10. Additive-only evolution: flags pinned; new methods enter as gated defaults; abstract-set additions post-1.0 gate a major; no second version knob — semver + the changelog own behavior deltas.
 11. Enforcement has exactly two sites: wiring-time (`__init_subclass__`) and conformance-time (§7); no bespoke lint rule. No `__del__` behavior — cleanup is explicit `aclose()`/`close()` (+ §5's facade CM), with at most one DEBUG "implicit GC close" backstop line. Enumeration is not a port method — §3's module-level `BackendDiscovery` seam. No coordinate scaling, ever (absolute device pixels; §4's INV-C1).
 
@@ -264,7 +278,7 @@ async def discover(backends=None, *, config=None, offline: bool = False) -> Disc
 
 **Screenshot (INV-S1..S7).** `screenshot() -> bytes` returns a complete, well-formed PNG of the current framebuffer, as exactly `bytes` (S1 pure bytes). PNG signature + IHDR provable by the core helper, enforced adapter-side; corruption → `VendorCommandError(output_reason="unusable_output")` (S2). No vendor noise, no base64, no regex repair ever crosses the adapter (S3). No transcoding, never re-encoded (S4). One attempt per call, no internal retry loop — pacing is the consumer's (S5). Byte-equality is not identifiable — compare pixels or dims (S6). Rotation is not owned (S7). Core helper: `def png_dimensions(data: bytes) -> tuple[int, int]` (emuctl/png.py, stdlib-only; IHDR read, raises `ValueError` if absent; replaces consumers' cv2-decode-for-shape).
 
-**Coordinates (INV-C1).** `click`/`swipe` coordinates are the screenshot PNG's top-left-origin pixel space (ADB display pixel space); the frame is stable within a session; the library never re-scales or re-bases. Geometry is *data* (applied at configure-time); *actual* geometry is observable (`png_dimensions(screenshot())`); target/actual mismatch is the consumer's detection — no auto-fix, no scaling shim.
+**Coordinates (INV-C1).** `click`/`swipe` coordinates are the screenshot PNG's top-left-origin pixel space (ADB display pixel space); the frame is stable within a session; the library never re-scales or re-bases. Geometry is *data* (applied at configure-time; the ADB backend applies size/density via `wm size WxH` / `wm density D` and returns the pre-apply `DisplayState`); *actual* geometry is observable (`png_dimensions(screenshot())`); target/actual mismatch is the consumer's detection — no auto-fix, no scaling shim.
 
 **Config models (`emuctl/config/model.py`) — frozen dataclasses, `slots=True`, validating `__post_init__`; an invalid instance cannot exist; failures → `ConfigValidationError(path, value, layer, expected)`:**
 
@@ -315,7 +329,7 @@ Escape hatches: `--config-file` (replaces layers 3+4) and `--no-config` (skips b
 
 **Resources rule.** Any shipped file is addressed exclusively through `importlib.resources` (`emuctl.resources`; real-path needs via `as_file`) — never relative paths, `os.getcwd()`, or `__file__`-arithmetic; a contract test enforces the singularity. User-override order per resource: explicit path → project profiles dir → user profiles dir → bundled (immutable, always present).
 
-**Config ↔ capability gate (construction time).** `ensure_config_supported(cfg, features)` runs against the selected adapter's declared set: `[display]` / `[resources]` / `[memu.settings]` / `[bluestacks.settings]` each require `configure`; refusal = `FeatureNotSupportedError(feature, detail)` — typed, never silent-ignore, never hand-written. Plain-ADB + `[display]` → typed refusal (adb never declares CONFIGURE); `VULKAN` on MEmu → the same gate via a missing table entry. Load-time validates structure only (types/ranges/versions) — capability truth binds at selection (the target ref names the backend), so the gate runs at construction.
+**Config ↔ capability gate (construction time).** `ensure_config_supported(cfg, features)` runs against the selected adapter's declared set: `[display]` / `[resources]` / `[memu.settings]` / `[bluestacks.settings]` each require `configure`; refusal = `FeatureNotSupportedError(feature, detail)` — typed, never silent-ignore, never hand-written. Plain-ADB declares CONFIGURE for guest display geometry (`configure()` → `DisplayState`), so `[display]` is accepted there; `VULKAN` on MEmu → the same gate via a missing table entry. Load-time validates structure only (types/ranges/versions) — capability truth binds at selection (the target ref names the backend), so the gate runs at construction.
 
 **Evolution.** `schema_version` optional, absent ⇒ 1; unknown major → `ConfigError(reason="bad_version")` carrying the found version in `value` and naming the installed one in the message. Unknown **keys** → warn+ignore with nearest-key hint (never error, never silent); unknown **values** → always strict error. New fields/members in any minor; renames get a one-minor warning alias then major-drop; removals are major-only with the replacement named. Emission additive-only per minor; reading tolerant; round-trip lossy-on-unknown, loudly.
 
@@ -333,7 +347,7 @@ class EmulatorController:  # built only by connect_sync(); not user-constructed
     restart(*, app=None, ready=None, timeout=DEFAULT) / click / swipe / key / text /
     screenshot(timeout=…) -> bytes / is_reachable() -> ProbeResult / install_apk /
     start_app / is_app_installed / create(spec: CreateSpec) -> InstanceRef (same shape as §1's) /
-    start / stop / configure(spec: ConfigSpec | None) / aclose / close /
+    start / stop / configure(spec: ConfigSpec | None) -> DisplayState / aclose / close /
     __enter__ / __exit__ (start nothing; boot stays explicit)
     @property features · has_feature()             # portal-free (declared, static)
 ```

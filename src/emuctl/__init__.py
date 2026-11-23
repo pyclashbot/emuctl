@@ -88,6 +88,7 @@ from emuctl.port import (  # noqa: E402
     AdbController,
     AsyncEmulatorController,
     CapabilityFlag,
+    DisplayState,
     ProbeResult,
     ReadyCheck,
 )
@@ -118,6 +119,7 @@ __all__: list[str] = [
     "CapabilityFlag",
     "ConfigError",
     "ConfigSpec",
+    "DisplayState",
     "ConfigValidationError",
     "ConfigWarning",
     "ControllerClosedError",

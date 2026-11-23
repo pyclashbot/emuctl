@@ -156,7 +156,7 @@ from emuctl.errors import (
 )
 from emuctl.log import sanitize
 from emuctl.port import AdbController as _AdbMiddleLayer
-from emuctl.port import CapabilityFlag, ReadyCheck, _stderr_excerpt
+from emuctl.port import CapabilityFlag, DisplayState, ReadyCheck, _stderr_excerpt
 from emuctl.timing import (
     DEFAULT,
     LIFECYCLE_TIMEOUT,
@@ -947,7 +947,7 @@ class MemuController(_AdbMiddleLayer):
 
     # ── CONFIGURE mechanic (config group; one shared budget) ──
 
-    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> None:
+    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> DisplayState:
         """``memuc -n <key> setconfigex <vendor-key> <tokens…>`` per entry.
 
         ``spec=None`` re-applies every non-None leaf of the bound config
@@ -962,7 +962,7 @@ class MemuController(_AdbMiddleLayer):
             _bound_entries(self._config) if spec is None else _overlay_entries(spec)
         )
         if not entries:
-            return
+            return DisplayState(None, None, None)
         self._resolve_memuc_path()  # fail-fast on the binary before any set
         start = time.monotonic()
         deadline = None if timeout is None else start + float(timeout)
@@ -979,6 +979,7 @@ class MemuController(_AdbMiddleLayer):
                 sanitize(vendor_key),
                 [sanitize(token) for token in tokens],
             )
+        return DisplayState(None, None, None)
 
     # ── BOOT primitive: §1.6 wholesale override (vendor ordering) ──
 

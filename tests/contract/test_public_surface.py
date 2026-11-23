@@ -99,6 +99,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "CapabilityFlag",
         "ReadyCheck",
         "ProbeResult",
+        "DisplayState",
         "AsyncEmulatorController",
         "AdbController",
         # Config models + precedence + gate (§4).

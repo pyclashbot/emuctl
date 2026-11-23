@@ -119,7 +119,7 @@ if TYPE_CHECKING:
 
     from emuctl._identification import InstanceRef
     from emuctl.config.model import ConfigSpec, CreateSpec, EmuctlConfig
-    from emuctl.port import CapabilityFlag, ProbeResult, ReadyCheck
+    from emuctl.port import CapabilityFlag, DisplayState, ProbeResult, ReadyCheck
 
 __all__ = ["EmulatorController", "PORTAL_THREAD_NAME", "connect_sync"]
 
@@ -324,7 +324,9 @@ class EmulatorController:
         _check_timeout(timeout, PROVISION_TIMEOUT, "create")
         return self._call("create", spec, timeout=timeout)
 
-    def configure(self, spec: ConfigSpec | None = None, *, timeout: TimeoutParam = DEFAULT) -> None:
+    def configure(
+        self, spec: ConfigSpec | None = None, *, timeout: TimeoutParam = DEFAULT
+    ) -> DisplayState:
         _check_timeout(timeout, CONFIG_TIMEOUT, "configure")
         return self._call("configure", spec, timeout=timeout)
 
