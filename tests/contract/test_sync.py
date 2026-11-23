@@ -930,6 +930,8 @@ facade.close()  # idempotent
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
 def test_configure_returns_display_state_across_the_portal() -> None:
     """The §5 twin forwards the typed DisplayState unchanged — the consumer
     needs no raw adb readback to restore geometry."""
