@@ -89,12 +89,14 @@ class AdbController(_AdbMiddleLayer):
     """The plain-ADB concrete adapter over the core-side middle layer.
 
     Declares exactly what plain ADB supports: SCREENSHOT / INPUT / APPS /
-    APK_INSTALL. No BOOT / CREATE / CONFIGURE — ``restart()``/``start()``/
-    ``stop()``/``create()``/``configure()`` raise the derived
-    ``FeatureNotSupportedError`` through the port funnel (§1 invariant 3,
-    never a silent skip); ``_attach`` inherits the port no-op. All ADB
-    mechanics and scoping are inherited from the core middle layer; only the
-    transport construction and the concrete ``_vendor_run`` are bound here.
+    APK_INSTALL / CONFIGURE. CONFIGURE applies guest display size/density
+    through the inherited ``wm`` mechanic and returns the previously observed
+    ``DisplayState``. No BOOT / CREATE — ``restart()``/``start()``/``stop()``/
+    ``create()`` raise the derived ``FeatureNotSupportedError`` through the
+    port funnel (§1 invariant 3, never a silent skip); ``_attach`` inherits
+    the port no-op. All ADB mechanics and scoping are inherited from the core
+    middle layer; only the transport construction and the concrete
+    ``_vendor_run`` are bound here.
     """
 
     FEATURES: frozenset[CapabilityFlag] = frozenset(
@@ -103,6 +105,7 @@ class AdbController(_AdbMiddleLayer):
             CapabilityFlag.INPUT,
             CapabilityFlag.APPS,
             CapabilityFlag.APK_INSTALL,
+            CapabilityFlag.CONFIGURE,
         }
     )
 

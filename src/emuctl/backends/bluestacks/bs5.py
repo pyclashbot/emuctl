@@ -115,7 +115,7 @@ from emuctl.errors import (
 )
 from emuctl.log import sanitize
 from emuctl.port import AdbController as _AdbMiddleLayer
-from emuctl.port import CapabilityFlag, ReadyCheck, _stderr_excerpt
+from emuctl.port import CapabilityFlag, DisplayState, ReadyCheck, _stderr_excerpt
 from emuctl.timing import (
     DEFAULT,
     LIFECYCLE_TIMEOUT,
@@ -557,7 +557,7 @@ class BlueStacks5Controller(_AdbMiddleLayer):
 
     # ── CONFIGURE mechanic (§4; instance-scoped conf writes) ──
 
-    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> None:
+    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> DisplayState:
         """Translate the overlay (or the bound config's non-None leaves when
         ``spec=None``) through the family table and write ``bluestacks.conf``
         scoped to the bound instance's internal name.
@@ -576,12 +576,12 @@ class BlueStacks5Controller(_AdbMiddleLayer):
             if value is not None
         ]
         if not translated:
-            return
+            return DisplayState(None, None, None)
         internal, _port = self._target_and_port()
         doc, _meta_view = _conf_document(self._bs)
         new_doc = _conf.translate(doc, internal, translated)
         if new_doc == doc:
-            return
+            return DisplayState(None, None, None)
         store_path = _paths.conf_path(self._bs)
         assert store_path is not None  # _conf_document() would have raised otherwise
         logger.debug(
@@ -590,6 +590,7 @@ class BlueStacks5Controller(_AdbMiddleLayer):
             [sanitize(k) for k, _v in translated],
         )
         store_path.write_text(_conf.serialize(new_doc), encoding="utf-8")
+        return DisplayState(None, None, None)
 
     @staticmethod
     def _resolve_auto(key: str, value: object) -> RendererMode:

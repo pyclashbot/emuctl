@@ -150,6 +150,29 @@ class ProbeResult(NamedTuple):
     reason: str
 
 
+class DisplayState(NamedTuple):
+    """Observed display geometry (pixels + density) before a configure call.
+
+    ``None`` means the backend could not observe that field (no readback seam);
+    an ADB controller always returns concrete values. Restore explicitly by
+    re-applying ``to_spec()`` — the library never restores silently.
+    """
+
+    width: int | None
+    height: int | None
+    dpi: int | None
+
+    def to_spec(self) -> dict[str, int]:
+        """Canonical ``ConfigSpec`` overlay for this observed state."""
+        spec: dict[str, int] = {}
+        if self.width is not None and self.height is not None:
+            spec["display.width"] = self.width
+            spec["display.height"] = self.height
+        if self.dpi is not None:
+            spec["display.dpi"] = self.dpi
+        return spec
+
+
 #: Pinned probe-reason vocabulary (additive-only). "ok" and "no-adb" are §1's
 #: pins; offline/unauthorized/disconnected mirror §2's DeviceStateError states
 #: as probe data; "timeout" reports a probe that exceeded its budget without
@@ -454,8 +477,12 @@ class AsyncEmulatorController(abc.ABC):
         """
         ...
 
-    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> None:
-        """Apply config: None re-applies the bound config, else a targeted overlay."""
+    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> DisplayState:  # ty: ignore[empty-body]
+        """Apply config: None re-applies the bound config, else a targeted overlay.
+
+        Returns the display observed immediately BEFORE the apply (fields are
+        ``None`` when the backend has no display readback seam).
+        """
         ...
 
     async def _screenshot(self, timeout: float | None) -> bytes:  # ty: ignore[empty-body]
@@ -543,8 +570,13 @@ class AsyncEmulatorController(abc.ABC):
 
     async def configure(
         self, spec: ConfigSpec | None = None, *, timeout: TimeoutParam = DEFAULT
-    ) -> None:
-        """Gated CONFIGURE: None re-applies the bound config; else an overlay."""
+    ) -> DisplayState:
+        """Gated CONFIGURE: None re-applies the bound config; else an overlay.
+
+        Returns the display geometry observed immediately before applying the
+        overlay. Restore explicitly by calling ``configure(state.to_spec())``;
+        the library never assumes or performs a restore.
+        """
         self._require(CapabilityFlag.CONFIGURE)
         self._ensure_open()
         if spec is not None and not isinstance(spec, Mapping):
@@ -553,7 +585,7 @@ class AsyncEmulatorController(abc.ABC):
                 constraint="must be a ConfigSpec mapping or None",
             )
         budget = resolve_timeout(timeout, CONFIG_TIMEOUT, operation="configure")
-        await self._configure(spec, budget)
+        return await self._configure(spec, budget)
 
     async def start(self, *, timeout: TimeoutParam = DEFAULT) -> None:
         """Boot the bound instance (gated BOOT)."""
@@ -910,6 +942,63 @@ def _escape_input_text(value: str) -> str:
     return "".join(parts)
 
 
+#: The only canonical display leaves the ADB backend can translate.
+_ADB_DISPLAY_KEYS: Final[frozenset[str]] = frozenset(
+    {"display.width", "display.height", "display.dpi"}
+)
+
+
+def _parse_wm_size(text: str) -> tuple[int, int] | None:
+    """Pick the effective ``wm size`` geometry (override wins; pure)."""
+    physical: tuple[int, int] | None = None
+    override: tuple[int, int] | None = None
+    for line in text.splitlines():
+        label, sep, value = line.partition(":")
+        if not sep:
+            continue
+        label = label.strip().lower()
+        if label not in ("physical size", "override size"):
+            continue
+        width, x, height = value.strip().partition("x")
+        if not x or not width.isdigit() or not height.isdigit():
+            continue
+        if int(width) <= 0 or int(height) <= 0:
+            continue
+        if label == "override size":
+            override = (int(width), int(height))
+        else:
+            physical = (int(width), int(height))
+    return override if override is not None else physical
+
+
+def _parse_wm_density(text: str) -> int | None:
+    """Pick the effective ``wm density`` value (override wins; pure)."""
+    physical: int | None = None
+    override: int | None = None
+    for line in text.splitlines():
+        label, sep, value = line.partition(":")
+        if not sep:
+            continue
+        label = label.strip().lower()
+        if label not in ("physical density", "override density"):
+            continue
+        token = value.strip()
+        if not token.isdigit() or int(token) <= 0:
+            continue
+        if label == "override density":
+            override = int(token)
+        else:
+            physical = int(token)
+    return override if override is not None else physical
+
+
+def _require_positive_int(name: str, value: object) -> int:
+    """Display overlay values: ints (never bools) >= 1 (pure)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise InvalidArgumentError(parameter=name, constraint="must be an int >= 1")
+    return value
+
+
 def _require_package(package: object) -> str:
     """Package names: non-empty text with no whitespace (pure)."""
     if (
@@ -1019,6 +1108,7 @@ class AdbController(AsyncEmulatorController, abc.ABC):
     _adb_host: str
     _serial: str
     _executor: ProcessExecutor
+    _config: Any
 
     def _prefix(self) -> list[str]:
         """Server selector: binary + (remote ``-H``) + ``-P``.
@@ -1132,6 +1222,109 @@ class AdbController(AsyncEmulatorController, abc.ABC):
         if binary:
             return result.stdout
         return result.stdout.decode("utf-8", errors="replace")
+
+    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> DisplayState:
+        """Apply display size/density over ``wm`` and return the PREVIOUS state.
+
+        Spec shape (canonical §4 leaves only): ``display.width`` +
+        ``display.height`` (both required together) and/or ``display.dpi``,
+        each an int >= 1. ``None`` re-applies the bound ``DisplayConfig``'s
+        non-None leaves. Reads are machine-readable ``wm`` observations with a
+        pinned line grammar (override wins, else physical) and fail closed;
+        commands key on exit status only. Everything shares ONE config-group
+        deadline, distributed across reads and writes. Applying the same
+        geometry twice performs reads but no writes (idempotent, no churn).
+        """
+        if spec is None:
+            display = self._config.display
+            width, height, dpi = display.width, display.height, display.dpi
+        else:
+            for key in spec:
+                if not isinstance(key, str) or key not in _ADB_DISPLAY_KEYS:
+                    raise InvalidArgumentError(
+                        parameter="spec",
+                        constraint=(
+                            "adb configure supports display.width, display.height and display.dpi"
+                        ),
+                    )
+            width = spec.get("display.width")
+            height = spec.get("display.height")
+            dpi = spec.get("display.dpi")
+            if width is not None:
+                width = _require_positive_int("display.width", width)
+            if height is not None:
+                height = _require_positive_int("display.height", height)
+            if dpi is not None:
+                dpi = _require_positive_int("display.dpi", dpi)
+            if (width is None) != (height is None):
+                raise InvalidArgumentError(
+                    parameter="spec",
+                    constraint="display.width and display.height must be supplied together",
+                )
+        if (width is None) != (height is None):
+            raise InvalidArgumentError(
+                parameter="display.width",
+                constraint="display.width and display.height must be configured together",
+            )
+        size = (width, height) if width is not None and height is not None else None
+        if size is None and dpi is None:
+            return DisplayState(None, None, None)  # nothing to apply/observe
+
+        start = time.monotonic()
+        deadline = None if timeout is None else start + float(timeout)
+
+        def left() -> float | None:
+            if deadline is None:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OperationTimeoutError(
+                    operation="configure", deadline=deadline, elapsed=time.monotonic() - start
+                )
+            return remaining
+
+        size_text = await self._run_adb(
+            ["shell", "wm", "size"], binary=False, operation="configure", timeout=left()
+        )
+        density_text = await self._run_adb(
+            ["shell", "wm", "density"], binary=False, operation="configure", timeout=left()
+        )
+        assert isinstance(size_text, str) and isinstance(density_text, str)
+        observed_size = _parse_wm_size(size_text)
+        if observed_size is None:
+            raise VendorCommandError(
+                command=self._device_argv(["shell", "wm", "size"]),
+                returncode=0,
+                output_reason="unusable_output",
+                stderr_excerpt="",
+                detail="wm size returned no valid Physical/Override size line",
+            )
+        observed_dpi = _parse_wm_density(density_text)
+        if observed_dpi is None:
+            raise VendorCommandError(
+                command=self._device_argv(["shell", "wm", "density"]),
+                returncode=0,
+                output_reason="unusable_output",
+                stderr_excerpt="",
+                detail="wm density returned no valid Physical/Override density line",
+            )
+        previous = DisplayState(observed_size[0], observed_size[1], observed_dpi)
+
+        if size is not None and size != observed_size:
+            await self._run_adb(
+                ["shell", "wm", "size", f"{size[0]}x{size[1]}"],
+                binary=False,
+                operation="configure",
+                timeout=left(),
+            )
+        if dpi is not None and dpi != observed_dpi:
+            await self._run_adb(
+                ["shell", "wm", "density", str(dpi)],
+                binary=False,
+                operation="configure",
+                timeout=left(),
+            )
+        return previous
 
     async def _screenshot(self, timeout: float | None) -> bytes:
         """``exec-out screencap -p`` binary transport; PNG-sniffed (§4 S2)."""

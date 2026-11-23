@@ -25,6 +25,7 @@ from emuctl.port import (
     PROBE_REASONS,
     AsyncEmulatorController,
     CapabilityFlag,
+    DisplayState,
     ProbeResult,
     ReadyCheck,
 )
@@ -127,9 +128,10 @@ class FullFake(AsyncEmulatorController):
         await self._act("_create", timeout)
         return InstanceRef(backend=self._ref.backend, key=spec.name)
 
-    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> None:
+    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> DisplayState:
         self.configure_specs.append(spec)
         await self._act("_configure", timeout)
+        return DisplayState(None, None, None)
 
     async def _screenshot(self, timeout: float | None) -> bytes:
         await self._act("_screenshot", timeout)
@@ -226,8 +228,9 @@ class BootConfigureFake(AsyncEmulatorController):
     async def _stop(self, timeout: float | None) -> None:
         self.calls.append(("_stop", timeout))
 
-    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> None:
+    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> DisplayState:
         self.calls.append(("_configure", timeout))
+        return DisplayState(None, None, None)
 
 
 class BootConfigureScreenshotFake(BootConfigureFake):

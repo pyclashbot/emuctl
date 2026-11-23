@@ -3,6 +3,7 @@ screenshot validation, app verbs, probes, discovery, timeouts, wiring."""
 
 import asyncio
 import functools
+import os
 import struct
 import sys
 import time
@@ -24,7 +25,7 @@ from emuctl.errors import (
     OperationTimeoutError,
     VendorCommandError,
 )
-from emuctl.port import PROBE_REASONS, CapabilityFlag
+from emuctl.port import PROBE_REASONS, CapabilityFlag, DisplayState
 from emuctl.timing import (
     APP_TIMEOUT,
     INTERACTION_TIMEOUT,
@@ -370,6 +371,199 @@ async def test_screenshot_nonzero_rc_maps_exit(adb_module: Any) -> None:
         await ctl.screenshot()
     assert excinfo.value.output_reason == "exit"
     assert excinfo.value.returncode == 1
+
+
+# ── display configure (CONFIGURE, §4) ──
+
+
+def _display_responder(
+    *,
+    size_out: bytes = b"Physical size: 1080x2400\n",
+    density_out: bytes = b"Physical density: 420\n",
+    write_hang: bool = False,
+) -> Callable[[list[str]], _FakeHandle]:
+    def respond(argv: list[str]) -> _FakeHandle:
+        if argv[-3:] == ["shell", "wm", "size"]:
+            return _FakeHandle(stdout=size_out)
+        if argv[-3:] == ["shell", "wm", "density"]:
+            return _FakeHandle(stdout=density_out)
+        if "wm" in argv and write_hang:
+            return _FakeHandle(hang=True)
+        return _FakeHandle()
+
+    return respond
+
+
+@_sync
+async def test_configure_display_exact_argv_and_previous_state(adb_module: Any) -> None:
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _display_responder())
+    previous = await ctl.configure(
+        {"display.width": 419, "display.height": 633, "display.dpi": 160}
+    )
+    assert previous == DisplayState(1080, 2400, 420)
+    assert previous.to_spec() == {
+        "display.width": 1080,
+        "display.height": 2400,
+        "display.dpi": 420,
+    }
+    assert calls == [
+        [*SCOPED, "shell", "wm", "size"],
+        [*SCOPED, "shell", "wm", "density"],
+        [*SCOPED, "shell", "wm", "size", "419x633"],
+        [*SCOPED, "shell", "wm", "density", "160"],
+    ]
+
+
+@_sync
+async def test_configure_none_reapplies_bound_display(adb_module: Any) -> None:
+    calls: list[list[str]] = []
+    cfg = EmuctlConfig(display=DisplayConfig(width=419, height=633, dpi=160))
+    ctl = _make(adb_module, calls, _display_responder(), config=cfg)
+    previous = await ctl.configure()
+    assert previous == DisplayState(1080, 2400, 420)
+    assert calls[-2:] == [
+        [*SCOPED, "shell", "wm", "size", "419x633"],
+        [*SCOPED, "shell", "wm", "density", "160"],
+    ]
+
+
+@_sync
+async def test_configure_is_idempotent_and_skips_equal_writes(adb_module: Any) -> None:
+    calls: list[list[str]] = []
+    responder = _display_responder(
+        size_out=b"Physical size: 1080x2400\nOverride size: 419x633\n",
+        density_out=b"Physical density: 420\nOverride density: 160\n",
+    )
+    ctl = _make(adb_module, calls, responder)
+    previous = await ctl.configure(
+        {"display.width": 419, "display.height": 633, "display.dpi": 160}
+    )
+    assert previous == DisplayState(419, 633, 160)
+    assert calls == [
+        [*SCOPED, "shell", "wm", "size"],
+        [*SCOPED, "shell", "wm", "density"],
+    ]  # reads only: no vendor churn for an identical request
+
+
+@_sync
+async def test_configure_partial_dpi_overlay_only_writes_density(adb_module: Any) -> None:
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _display_responder())
+    await ctl.configure({"display.dpi": 160})
+    assert calls == [
+        [*SCOPED, "shell", "wm", "size"],
+        [*SCOPED, "shell", "wm", "density"],
+        [*SCOPED, "shell", "wm", "density", "160"],
+    ]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"display.width": 419},  # height missing
+        {"display.height": 633},  # width missing
+        {"display.width": 0, "display.height": 633},
+        {"display.width": 419, "display.height": 633, "display.dpi": 0},
+        {"display.width": True, "display.height": 633},
+        {"display.renderer": "vulkan"},  # unsupported leaf
+        {"bogus.leaf": 1},  # unknown leaf
+    ],
+)
+@_sync
+async def test_configure_invalid_spec_is_typed_before_io(
+    adb_module: Any, spec: dict[str, object]
+) -> None:
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _ok())
+    with pytest.raises(InvalidArgumentError):
+        await ctl.configure(spec)
+    assert calls == []
+
+
+@_sync
+async def test_configure_timeout_is_typed_and_shared(adb_module: Any) -> None:
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _display_responder(write_hang=True))
+    with pytest.raises(OperationTimeoutError) as excinfo:
+        await ctl.configure(
+            {"display.width": 419, "display.height": 633, "display.dpi": 160},
+            timeout=0.05,
+        )
+    assert excinfo.value.operation == "configure"
+    # reads finished; the first write consumed the shared budget
+    assert calls[-1] == [*SCOPED, "shell", "wm", "size", "419x633"]
+
+
+@_sync
+async def test_configure_unusable_wm_output_fails_closed(adb_module: Any) -> None:
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _display_responder(size_out=b"garbage\n"))
+    with pytest.raises(VendorCommandError) as excinfo:
+        await ctl.configure({"display.width": 419, "display.height": 633})
+    assert excinfo.value.output_reason == "unusable_output"
+
+
+@_sync
+async def test_configure_rejects_non_mapping(adb_module: Any) -> None:
+    ctl = _make(adb_module, [], _ok())
+    with pytest.raises(InvalidArgumentError):
+        await ctl.configure("display.width=419")  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the fake adb shim is a POSIX executable")
+def test_consumer_configure_path_needs_no_raw_shell_out(tmp_path: Any) -> None:
+    """The py-clash-bot shape end to end: connect with a DisplayConfig, call
+    configure() with no spec, and let emuctl's fake adb do ALL the wm work.
+
+    The fake adb is the only transport; it rejects any argv outside the
+    expected wm reads/writes, so a consumer-side shell-out would fail here.
+    """
+    from emuctl import connect_sync
+
+    log = tmp_path / "adb.log"
+    shim = tmp_path / "fake-adb"
+    shim.write_text(
+        f"""#!{sys.executable}
+import sys
+
+LOG = {str(log)!r}
+argv = sys.argv[1:]
+index = 0
+while index < len(argv) and argv[index] in ("-H", "-P", "-s"):
+    index += 2
+args = argv[index:]
+with open(LOG, "a", encoding="utf-8") as handle:
+    handle.write(" ".join(args) + "\\n")
+if args == ["shell", "wm", "size"]:
+    print("Physical size: 1080x2400")
+elif args == ["shell", "wm", "density"]:
+    print("Physical density: 420")
+elif args[:3] == ["shell", "wm", "size"] or args[:3] == ["shell", "wm", "density"]:
+    pass
+else:
+    sys.stderr.write("unexpected adb args: " + " ".join(args) + "\\n")
+    raise SystemExit(3)
+""",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = EmuctlConfig(
+        adb=AdbConfig(path=str(shim)),
+        display=DisplayConfig(width=419, height=633, dpi=160),
+    )
+    facade = connect_sync("adb:127.0.0.1:5555", config=config)
+    try:
+        previous = facade.configure()  # exactly what the consumer adapter calls
+    finally:
+        facade.close()
+    assert previous == DisplayState(1080, 2400, 420)
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "shell wm size",
+        "shell wm density",
+        "shell wm size 419x633",
+        "shell wm density 160",
+    ]
 
 
 @_sync
@@ -1196,6 +1390,7 @@ def test_features_declare_plain_adb_mechanics(adb_module: Any) -> None:
                 CapabilityFlag.INPUT,
                 CapabilityFlag.APPS,
                 CapabilityFlag.APK_INSTALL,
+                CapabilityFlag.CONFIGURE,
             }
         )
         == adb_module.AdbController.FEATURES
@@ -1203,7 +1398,7 @@ def test_features_declare_plain_adb_mechanics(adb_module: Any) -> None:
 
 
 @_sync
-async def test_plain_adb_has_no_boot_create_configure(adb_module: Any) -> None:
+async def test_plain_adb_has_no_boot_create(adb_module: Any) -> None:
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _ok())
     with pytest.raises(FeatureNotSupportedError) as excinfo:
@@ -1213,8 +1408,6 @@ async def test_plain_adb_has_no_boot_create_configure(adb_module: Any) -> None:
         await ctl.start()
     with pytest.raises(FeatureNotSupportedError):
         await ctl.stop()
-    with pytest.raises(FeatureNotSupportedError):
-        await ctl.configure(None)
     with pytest.raises(FeatureNotSupportedError) as excinfo:
         await ctl.create(CreateSpec(name="new-vm"))
     assert excinfo.value.feature == "create"
@@ -1289,12 +1482,15 @@ async def test_connect_builds_adb_adapter_without_io(
 
 
 @_sync
-async def test_connect_refuses_configured_display_for_plain_adb() -> None:
+async def test_connect_accepts_configured_display_for_plain_adb() -> None:
     from emuctl._discovery import connect
 
-    cfg = EmuctlConfig(display=DisplayConfig(width=800, height=600))
-    with pytest.raises(FeatureNotSupportedError):
-        await connect("adb:emulator-5554", config=cfg)
+    cfg = EmuctlConfig(display=DisplayConfig(width=800, height=600, dpi=320))
+    ctl = await connect("adb:emulator-5554", config=cfg)
+    try:
+        assert ctl.has_feature(CapabilityFlag.CONFIGURE)
+    finally:
+        await ctl.aclose()
 
 
 @_sync

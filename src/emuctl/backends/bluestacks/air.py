@@ -93,7 +93,7 @@ from emuctl.errors import (
 )
 from emuctl.log import sanitize
 from emuctl.port import AdbController as _AdbMiddleLayer
-from emuctl.port import CapabilityFlag, ReadyCheck, _stderr_excerpt
+from emuctl.port import CapabilityFlag, DisplayState, ReadyCheck, _stderr_excerpt
 from emuctl.timing import (
     DEFAULT,
     LIFECYCLE_TIMEOUT,
@@ -472,7 +472,7 @@ class BlueStacksAirController(_AdbMiddleLayer):
 
     # ── CONFIGURE mechanic (§4; the SHARED family translation) ──
 
-    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> None:
+    async def _configure(self, spec: ConfigSpec | None, timeout: float | None) -> DisplayState:
         """Translate the overlay (or bound-config leaves when ``spec=None``)
         through the family table and write ``bluestacks.conf`` scoped to
         the bound instance. Renderer AUTO → VULKAN here (§4 macOS pin)."""
@@ -485,12 +485,12 @@ class BlueStacksAirController(_AdbMiddleLayer):
             if value is not None
         ]
         if not translated:
-            return
+            return DisplayState(None, None, None)
         internal, _port = self._target_and_port()
         doc, _meta_view = self._store()
         new_doc = _conf.translate(doc, internal, translated)
         if new_doc == doc:
-            return
+            return DisplayState(None, None, None)
         path = _paths.conf_path(self._bs)
         assert path is not None  # _store() would have raised otherwise
         logger.debug(
@@ -499,6 +499,7 @@ class BlueStacksAirController(_AdbMiddleLayer):
             [sanitize(k) for k, _v in translated],
         )
         path.write_text(_conf.serialize(new_doc), encoding="utf-8")
+        return DisplayState(None, None, None)
 
     @staticmethod
     def _resolve_auto(key: str, value: object) -> RendererMode:

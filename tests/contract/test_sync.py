@@ -39,7 +39,7 @@ from emuctl.errors import (
     VendorCommandError,
     resolve_error_code,
 )
-from emuctl.port import AsyncEmulatorController, CapabilityFlag
+from emuctl.port import AsyncEmulatorController, CapabilityFlag, DisplayState
 from emuctl.timing import (
     APP_TIMEOUT,
     CONFIG_TIMEOUT,
@@ -197,9 +197,10 @@ class _FakeController(AsyncEmulatorController):
         self._record("_create", spec, timeout=timeout)
         return InstanceRef(backend=self._ref.backend, key=spec.name)
 
-    async def _configure(self, spec: Any, timeout: float | None) -> None:
+    async def _configure(self, spec: Any, timeout: float | None) -> DisplayState:
         await self._pause(None)
         self._record("_configure", spec, timeout=timeout)
+        return DisplayState(None, None, None)
 
     async def _screenshot(self, timeout: float | None) -> bytes:
         await self._pause(timeout)
@@ -782,10 +783,16 @@ def test_connect_sync_config_refusals_are_pre_portal() -> None:
     before = _thread_names()
     with pytest.raises(InvalidArgumentError):
         connect_sync("adb:emulator-5554", config="nope")  # ty: ignore[invalid-argument-type]
-    # §4 capability gate runs at construction: plain ADB never declares CONFIGURE
-    gated = EmuctlConfig(display=DisplayConfig(width=1080, height=1920))
-    with pytest.raises(FeatureNotSupportedError):
-        connect_sync("adb:emulator-5554", config=gated)
+    # Plain ADB now declares CONFIGURE, so a display request is accepted at
+    # construction and starts no portal thread until the first op.
+    configured = connect_sync(
+        "adb:emulator-5554",
+        config=EmuctlConfig(display=DisplayConfig(width=1080, height=1920)),
+    )
+    try:
+        assert configured.has_feature(CapabilityFlag.CONFIGURE)
+    finally:
+        configured.close()
     _wait_for_no_controller_threads(before)
 
 
@@ -923,3 +930,8 @@ facade.close()  # idempotent
         check=False,
     )
     assert result.returncode == 0, result.stderr
+def test_configure_returns_display_state_across_the_portal() -> None:
+    """The §5 twin forwards the typed DisplayState unchanged — the consumer
+    needs no raw adb readback to restore geometry."""
+    with _facade() as controller:
+        assert controller.configure() == DisplayState(None, None, None)
