@@ -12,20 +12,16 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-keywords = ["adb", "android-emulator", "memu", "bluestacks", "avd"]
-dependencies = []
+keywords = ["adb", "android-emulator", "headless-android"]
+dependencies = ["anyio>=4.10"]
 
 [project.urls]
 Repository = "https://github.com/pyclashbot/emuctl"
 Contract = "https://github.com/pyclashbot/emuctl/blob/main/CONTRACT.md"
 
 [project.optional-dependencies]
-memu = ["pymemuc>=0.6,<0.7"]
-bluestacks = []
-google-play = []
-avd = []
 cli = ["click>=8.2"]
-all = ["pymemuc>=0.6,<0.7", "click>=8.2"]
+all = ["click>=8.2"]
 
 [dependency-groups]
 dev = ["pytest>=8", "import-linter>=2.15", "pre-commit>=4"]
@@ -53,24 +49,30 @@ type = "layers"
 containers = ["emuctl"]
 layers = [
   "backends",
-  "config | log | png | port | errors | timing | waits | _proc | _serials | _identification | _discovery | _platforms",
+  # `:` = one non-independent core tier (timing→errors→waits…); `|` would forbid intra-core imports.
+  "config : log : png : port : errors : timing : waits : _proc : _serials : _identification : _sync : _discovery : _platforms : _adb",
 ]
 exhaustive = true
+# CONTRACT §3/§6 sanctioned seam: connect()/discover() live in core _discovery but
+# selection/loading live in backends._registry, reached ONLY through function-local
+# imports (never top-level in core). Dynamic ADAPTER imports stay exclusively in
+# load_adapter (§7.10); this carve-out names the registry edge only, and
+# unmatched-expression alerting fails the contract if the edge ever disappears.
+ignore_imports = [
+  "emuctl._discovery -> emuctl.backends._registry",
+  # Same sanctioned seam as above: connect_sync is §5's sync twin of connect()
+  # and reaches the registry through the identical function-local import.
+  "emuctl._sync -> emuctl.backends._registry",
+]
 
 [[tool.importlinter.contracts]]
 name = "Backend families are independent"
 type = "independence"
 include_external_packages = false
-modules = [
-  "emuctl.backends.adb",
-  "emuctl.backends.memu",
-  "emuctl.backends.bluestacks",
-  "emuctl.backends.google_play",
-  "emuctl.backends.avd",
-]
+modules = ["emuctl.backends.adb"]
 
 [tool.ruff]
-line-length = 100
+line-length = 112
 target-version = "py312"
 src = ["src", "tests"]
 
@@ -114,4 +116,3 @@ prerelease = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-markers = ["emulator: hardware-attached tests, opt-in via -m emulator (not CI)"]

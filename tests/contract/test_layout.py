@@ -1,5 +1,3 @@
-"""Layout-drift detector: the CONTRACT §6 tree exists in src/emuctl (organization lock)."""
-
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2] / "src" / "emuctl"
@@ -25,15 +23,6 @@ EXPECTED: tuple[str, ...] = (
     "backends/__init__.py",
     "backends/_registry.py",
     "backends/adb.py",
-    "backends/memu.py",
-    "backends/bluestacks/__init__.py",
-    "backends/bluestacks/bs5.py",
-    "backends/bluestacks/air.py",
-    "backends/bluestacks/_conf.py",
-    "backends/bluestacks/_meta.py",
-    "backends/bluestacks/_paths.py",
-    "backends/google_play/__init__.py",
-    "backends/avd/__init__.py",
 )
 
 

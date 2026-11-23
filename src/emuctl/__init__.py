@@ -1,3 +1,128 @@
-"""emuctl — vendor-agnostic Android emulator controller (CONTRACT: Identity; surfaces in §5)."""
+import logging
 
-__all__: list[str] = []
+_package_logger = logging.getLogger(__name__)
+if not any(isinstance(h, logging.NullHandler) for h in _package_logger.handlers):
+    _package_logger.addHandler(logging.NullHandler())
+
+from emuctl._discovery import (  # noqa: E402
+    BackendStatus,
+    DiscoveryReport,
+    connect,
+    discover,
+)
+from emuctl._identification import BackendId, InstanceRecord, InstanceRef  # noqa: E402
+from emuctl._platforms import Platform, current_platform  # noqa: E402
+from emuctl._serials import is_valid_serial, validate_serial  # noqa: E402
+from emuctl._sync import EmulatorController, connect_sync  # noqa: E402
+from emuctl.config import (  # noqa: E402
+    SCHEMA_VERSION,
+    AdbConfig,
+    ConfigSpec,
+    ConfigWarning,
+    CreateSpec,
+    DisplayConfig,
+    EmuctlConfig,
+    ResolvedConfig,
+    resolve_config,
+)
+from emuctl.config.model import ensure_config_supported  # noqa: E402
+from emuctl.errors import (  # noqa: E402
+    AmbiguousInstanceError,
+    BackendNotAvailableError,
+    BackendNotFoundError,
+    ConfigError,
+    ConfigValidationError,
+    ControllerClosedError,
+    DeviceStateError,
+    EmuctlError,
+    EmulatorNotReadyError,
+    ExecutableNotFoundError,
+    ExtrasMissingError,
+    FeatureNotSupportedError,
+    InstanceNotFoundError,
+    InvalidArgumentError,
+    InvalidSerialError,
+    OperationTimeoutError,
+    SyncCallInsideEventLoopError,
+    VendorCommandError,
+    resolve_error_code,
+)
+from emuctl.png import png_dimensions  # noqa: E402
+from emuctl.port import (  # noqa: E402
+    AdbController,
+    AsyncEmulatorController,
+    CapabilityFlag,
+    DisplayState,
+    ProbeResult,
+    ReadyCheck,
+)
+from emuctl.timing import (  # noqa: E402
+    APP_TIMEOUT,
+    CONFIG_TIMEOUT,
+    DEFAULT,
+    INTERACTION_TIMEOUT,
+    LIFECYCLE_TIMEOUT,
+    PROVISION_TIMEOUT,
+    QUERY_TIMEOUT,
+    SNAPSHOT_TIMEOUT,
+)
+
+__all__: list[str] = [
+    "APP_TIMEOUT",
+    "AdbConfig",
+    "AdbController",
+    "AmbiguousInstanceError",
+    "AsyncEmulatorController",
+    "BackendId",
+    "BackendNotAvailableError",
+    "BackendNotFoundError",
+    "BackendStatus",
+    "CONFIG_TIMEOUT",
+    "CapabilityFlag",
+    "ConfigError",
+    "ConfigSpec",
+    "CreateSpec",
+    "DisplayState",
+    "ConfigValidationError",
+    "ConfigWarning",
+    "ControllerClosedError",
+    "DEFAULT",
+    "DeviceStateError",
+    "DiscoveryReport",
+    "DisplayConfig",
+    "EmuctlConfig",
+    "EmuctlError",
+    "EmulatorNotReadyError",
+    "ExecutableNotFoundError",
+    "ExtrasMissingError",
+    "FeatureNotSupportedError",
+    "InstanceRecord",
+    "InstanceRef",
+    "INTERACTION_TIMEOUT",
+    "InvalidArgumentError",
+    "InstanceNotFoundError",
+    "InvalidSerialError",
+    "LIFECYCLE_TIMEOUT",
+    "OperationTimeoutError",
+    "PROVISION_TIMEOUT",
+    "Platform",
+    "QUERY_TIMEOUT",
+    "ProbeResult",
+    "ReadyCheck",
+    "ResolvedConfig",
+    "SCHEMA_VERSION",
+    "SNAPSHOT_TIMEOUT",
+    "SyncCallInsideEventLoopError",
+    "VendorCommandError",
+    "connect",
+    "current_platform",
+    "discover",
+    "EmulatorController",
+    "connect_sync",
+    "ensure_config_supported",
+    "is_valid_serial",
+    "png_dimensions",
+    "resolve_config",
+    "resolve_error_code",
+    "validate_serial",
+]

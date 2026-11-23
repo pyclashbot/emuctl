@@ -8,7 +8,13 @@ Version: 1.0 · Status: PROMOTED 2026-10-07 — the operating contract for emuct
 
 **What it is.** A higher-level, vendor-agnostic Android emulator controller library for Python: interaction primitives plus engine-specific lifecycle operations (`create`, `start`, `stop`, `configure`) where the engine provides them, with deliberate, discoverable handling of the gaps between engines. The emulator is a black box driven over ADB and vendor CLIs. It is not a screen-scraping/botting framework, a game API, or a drop-in shim for pymemuc; game logic, image recognition, and state machines stay in consumers; no coordinate scaling; no provisioning-as-config. First consumer: `py-clash-bot` — integration may edit py-clash-bot; drop-in compatibility is not required.
 
-**Shape.** Async core (pure asyncio) + sync bridge (anyio portals, confined to one module). v0 backends: ADB devices (core), MEmu (Windows), BlueStacks 5 (Windows), BlueStacks Air (macOS). Distribution: `emuctl` core + PEP 685 extras (`[memu]`, `[bluestacks]`, `[all]`, `[cli]`) — only what is wanted, where it is wanted. Python 3.12+, stdlib-only core, `py.typed` from day one, conventional-commit auto-release (python-semantic-release, PyPI Trusted Publishing). Standing principles: fail-fast typed errors with bounded internal waits — never unbounded loops, never prompts; `restart()` is the explicit boot primitive and construction is cheap discovery; never parse vendor stdout for control flow; kills scoped to instances; bundled resources resolved through the package; serial validation as a security control; binary screenshot transport, no base64 round-trips.
+**Release scope (v0.1).** v0.1 ships the **ADB backend only** (headless Android over
+ADB). MEmu, BlueStacks 5, BlueStacks Air, AVD and Google Play are preserved on
+their stack branches and are **unverified** for v0.1. Their `BackendId` values stay
+pinned for identity/wire compatibility, but they have no registry row: selection
+fails cleanly with `BackendNotAvailableError("not-implemented-this-version")`.
+
+**Shape.** Async core (pure asyncio) + sync bridge (anyio portals, confined to one module). v0.1 backends: ADB devices (core) only. Distribution: `emuctl` core + PEP 685 extras (`[all]`, `[cli]`) — only what is wanted, where it is wanted. Python 3.12+, stdlib-only core, `py.typed` from day one, conventional-commit auto-release (python-semantic-release, PyPI Trusted Publishing). Standing principles: fail-fast typed errors with bounded internal waits — never unbounded loops, never prompts; `restart()` is the explicit boot primitive and construction is cheap discovery; never parse vendor stdout for control flow; kills scoped to instances; bundled resources resolved through the package; serial validation as a security control; binary screenshot transport, no base64 round-trips.
 
 ## §1 — The port (`emuctl/port.py`)
 
@@ -38,6 +44,18 @@ class ProbeResult(NamedTuple):
     reason: str
 
 
+class DisplayState(NamedTuple):
+    """Display geometry observed immediately BEFORE configure() applies its overlay.
+    Fields are None when the backend has no display-readback seam; ADB always fills
+    them. Restore is explicit: configure(state.to_spec()) — never automatic."""
+
+    width: int | None
+    height: int | None
+    dpi: int | None
+
+    def to_spec(self) -> "ConfigSpec": ...  # canonical display.width/height/dpi overlay
+
+
 class AsyncEmulatorController(abc.ABC):
     FEATURES: frozenset[CapabilityFlag]  # declared I/O-free, class body only
 
@@ -65,7 +83,9 @@ class AsyncEmulatorController(abc.ABC):
 
     # ── lifecycle ──
     async def create(self, spec: CreateSpec) -> InstanceRef: ...
-    async def configure(self, spec: ConfigSpec | None = None) -> None: ...
+    async def configure(
+        self, spec: ConfigSpec | None = None
+    ) -> DisplayState: ...  # gated CONFIGURE; returns the PRE-apply display observation
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
     async def restart(
@@ -78,15 +98,11 @@ class AsyncEmulatorController(abc.ABC):
     # ── interaction / apps (implemented once in AdbController) ──
     async def screenshot(self) -> bytes: ...
     async def click(self, x: int, y: int, *, count: int = 1, interval: float = 0.0) -> None: ...
-    async def swipe(
-        self, x1: int, y1: int, x2: int, y2: int, *, duration_ms: int = 300
-    ) -> None: ...
+    async def swipe(self, x1: int, y1: int, x2: int, y2: int, *, duration_ms: int = 300) -> None: ...
     async def key(self, code: str | int) -> None: ...  # raw keycode/keyevent symbol, documented
     async def text(self, value: str) -> None: ...  # escaping owned by the shared default
     async def install_apk(self, apk_path: str | os.PathLike[str]) -> None: ...
-    async def start_app(
-        self, package: str
-    ) -> None: ...  # launch + bounded spawn-verify (no stdout parsing)
+    async def start_app(self, package: str) -> None: ...  # launch + bounded spawn-verify (no stdout parsing)
     async def is_app_installed(self, package: str) -> bool: ...
     async def is_reachable(self) -> ProbeResult: ...
     async def aclose(self) -> None: ...  # idempotent; releases transport only
@@ -130,8 +146,8 @@ class AdbController(AsyncEmulatorController, abc.ABC):
 5. Bounded waits everywhere: every I/O op carries `timeout: float | None = DEFAULT` (§2's timing table); `restart()`'s internal phases share the one remaining deadline — no per-phase config surface at v0.
 6. `restart()` is one attempt: `None` or `EmulatorNotReadyError(reason, cause)` — never `False`, never internal retries, not idempotent. Phases: stop-if-running → configure-while-stopped → start → `_attach` → settle (first screenshot decodes non-empty) → [app: launch + bounded spawn-verify] → terminal check: `ready(...)` if given, else spawn-present-if-app, else screenshot-decodes. Adapters MAY override it wholesale (BlueStacks' MIM lifecycle is the motivating case); an override re-invokes `_require(BOOT)` at its head and inherits no default body. The bounded re-run-then-re-discover shape is consumer policy — the count is the consumer's too.
 7. `create()` is backend-scoped (ignores the bound identity; returns the new instance's ref). `spec.name` is required at v0; the body begins with an existence pre-check through the discovery seam (`get_instance`), never vendor greeting text — an existing name raises `InvalidArgumentError(parameter="spec.name", constraint="already provisioned")` (exit 2).
-8. `configure()` is gated CONFIGURE: `spec=None` re-applies every non-None section of the bound config; a populated `ConfigSpec` is a targeted overlay (§4). Instance-scoped everything — kills, config, and state target the bound ref; the sole exception is `create()`. No global sweeps.
-9. No control flow from vendor stdout parsing — machine-readable verification only. Screenshot: §4's INV-S1..S7 apply verbatim.
+8. `configure()` is gated CONFIGURE: `spec=None` re-applies every non-None section of the bound config; a populated `ConfigSpec` is a targeted overlay (§4). It returns a `DisplayState` observed immediately before the apply (all fields `None` when the backend cannot observe display); restore is explicit via `configure(state.to_spec())`, never automatic. Instance-scoped everything — kills, config, and state target the bound ref; the sole exception is `create()`. No global sweeps.
+9. No control flow from vendor stdout parsing — machine-readable verification only. One sanctioned data readback exists: the ADB `configure()` display observation (`wm size` / `wm density`), whose exact `Physical|Override size|density` line grammar is parsed for a `DisplayState` only; it never selects a command path beyond skipping a write whose value already matches, fails closed on malformed output, and shares the op deadline. Screenshot: §4's INV-S1..S7 apply verbatim.
 10. Additive-only evolution: flags pinned; new methods enter as gated defaults; abstract-set additions post-1.0 gate a major; no second version knob — semver + the changelog own behavior deltas.
 11. Enforcement has exactly two sites: wiring-time (`__init_subclass__`) and conformance-time (§7); no bespoke lint rule. No `__del__` behavior — cleanup is explicit `aclose()`/`close()` (+ §5's facade CM), with at most one DEBUG "implicit GC close" backstop line. Enumeration is not a port method — §3's module-level `BackendDiscovery` seam. No coordinate scaling, ever (absolute device pixels; §4's INV-C1).
 
@@ -217,12 +233,11 @@ class BackendSpec:
     supported_platforms: frozenset[Platform]   # THE sole platform-gating truth (consumed pre-import)
     dep_modules: tuple[str, ...]               # find_spec'd, never imported for side effects
     description: str; key_semantics: str; validate_key: Callable[[str], None]
-# _SPEC_TABLE (module-level, pinned):
-#   ADB full spec — extra=None, all platforms  ·  MEMU dep pymemuc, Windows  ·  BLUESTACKS BS5, Windows (HD-Player/HD-Adb.exe, MIM)
-#   BLUESTACKS_AIR macOS Apple-Silicon Air, v0 — same [bluestacks] extra; module emuctl.backends.bluestacks.air
-#                  (family package, §6); /Applications/BlueStacks.app + bundled hd-adb; key from
-#                  bluestacks.conf (single instance; MimMeta synthesized when cold); renderer AUTO → VULKAN
-#   GOOGLE_PLAY    spec None (not implemented this version)  ·  AVD    spec None
+# _SPEC_TABLE (module-level, pinned for v0.1):
+#   ADB full spec — extra=None, all platforms. The sole row.
+#   MEMU / BLUESTACKS / BLUESTACKS_AIR / GOOGLE_PLAY / AVD keep pinned BackendId
+#   values but have NO row in v0.1: resolve_backend refuses cleanly, no import.
+#   Those adapters live on their stack branches and are unverified this release.
 def get_registry() -> Mapping[BackendId, BackendSpec | None]: ...  # static; import-free
 def available_backends() -> list[BackendSpec]: ...                 # platform ⊇ host AND deps resolve
 def resolve_backend(backend: BackendId) -> BackendSpec:
@@ -264,38 +279,31 @@ async def discover(backends=None, *, config=None, offline: bool = False) -> Disc
 
 **Screenshot (INV-S1..S7).** `screenshot() -> bytes` returns a complete, well-formed PNG of the current framebuffer, as exactly `bytes` (S1 pure bytes). PNG signature + IHDR provable by the core helper, enforced adapter-side; corruption → `VendorCommandError(output_reason="unusable_output")` (S2). No vendor noise, no base64, no regex repair ever crosses the adapter (S3). No transcoding, never re-encoded (S4). One attempt per call, no internal retry loop — pacing is the consumer's (S5). Byte-equality is not identifiable — compare pixels or dims (S6). Rotation is not owned (S7). Core helper: `def png_dimensions(data: bytes) -> tuple[int, int]` (emuctl/png.py, stdlib-only; IHDR read, raises `ValueError` if absent; replaces consumers' cv2-decode-for-shape).
 
-**Coordinates (INV-C1).** `click`/`swipe` coordinates are the screenshot PNG's top-left-origin pixel space (ADB display pixel space); the frame is stable within a session; the library never re-scales or re-bases. Geometry is *data* (applied at configure-time); *actual* geometry is observable (`png_dimensions(screenshot())`); target/actual mismatch is the consumer's detection — no auto-fix, no scaling shim.
+**Coordinates (INV-C1).** `click`/`swipe` coordinates are the screenshot PNG's top-left-origin pixel space (ADB display pixel space); the frame is stable within a session; the library never re-scales or re-bases. Geometry is *data* (applied at configure-time; the ADB backend applies size/density via `wm size WxH` / `wm density D` and returns the pre-apply `DisplayState`); *actual* geometry is observable (`png_dimensions(screenshot())`); target/actual mismatch is the consumer's detection — no auto-fix, no scaling shim.
 
 **Config models (`emuctl/config/model.py`) — frozen dataclasses, `slots=True`, validating `__post_init__`; an invalid instance cannot exist; failures → `ConfigValidationError(path, value, layer, expected)`:**
 
 ```python
-class RendererMode(enum.Enum): AUTO / OPENGL / DIRECTX / VULKAN   # canonical per semantic, per backend
-DisplayConfig(width, height, dpi, fps, renderer)                 # all None-defaults = leave as-is
-ResourceConfig(cpus=None, memory_mb=None, cpu_cap_pct=None)      # None = vendor's current value
+DisplayConfig(width, height, dpi)                                # all None-defaults = leave as-is
 AdbConfig(path=None, host="127.0.0.1", port=5037)                # None path → §3's discovery
-MemuConfig(memuc_path=None, vm_name=None,
-           settings=MemuSettings(hide_toolbar, turbo, audio, window_mode, scale_percent))
-BlueStacksConfig(adb_server_port=5041, install_dir=None, conf_path=None,
-                 instance_name=None, settings=BlueStacksSettings(vsync, high_fps))
-LogConfig(level="warning", file=None)   # consumed ONLY by the CLI surface; the library never configures handlers
-EmuctlConfig(adb=…, display=…, resources=…, log=…, memu=None, bluestacks=None)  # ROOT contract object
+EmuctlConfig(adb=…, display=…)                     # ROOT contract object (v0.1: ADB only)
 CreateSpec(name: str, android_version: str | None = None)  # name REQUIRED at v0; None version ⇒
-                                                           # default image (MEmu "136" / Android 13)
+                                                           # default image (Android 13)
 # Range checks: ports 1..65535; set geometry >0; cpus ≥1; memory_mb >0; cpu_cap_pct, scale_percent
 # 1..100; level ∈ stdlib names.
 ConfigSpec = Mapping[str, str | int | float | bool | None]  # normative type ALIAS for the overlay
-# Keys are CANONICAL config leaves ("display.width", "display.renderer", "resources.cpus",
-# "memu.settings.hide_toolbar", … — same vocabulary as the model sections); values are strict typed
+# Keys are CANONICAL config leaves ("display.width", "display.height", "display.dpi" —
+# same vocabulary as the model sections); values are strict typed
 # primitives. Adapters translate entries via their translation table; an unknown canonical key →
 # InvalidArgumentError (caller misuse); an entry the backend can't translate deploys the gate.
 ```
 
-**Translation tables.** Backend subpackages own the canonical → vendor keys/value encodings, imported only with the adapter: MEmu `graphics_render_mode` 0/1-ints with `is_customed_resolution=1` implied; BlueStacks `"gl"/"dx"/"vlcn"` with the custom-res token `"419 x 633"` absorbed. An unknown vendor encoding → `ConfigValidationError`, never silent fallback. `AUTO` resolves: MEmu → DIRECTX; BlueStacks → DIRECTX (Windows) / VULKAN (macOS); ADB → no renderer semantics. **`AUTO` is emuctl's vendor default, not the reference consumer's** — a migrating pipeline validated on a specific renderer passes `renderer=` explicitly.
+**Translation tables.** v0.1 has no vendor translation table: the ADB backend applies only `display.width` / `display.height` / `display.dpi` through `wm`, and `display.renderer` has no ADB semantics. Translation tables for MEmu/BlueStacks remain on their stack branches (unverified). **`AUTO` is a vendor default, not the reference consumer's** — a future vendor pipeline passes `renderer=` explicitly.
 
 **Precedence (normative chain).**
 
 1. **Flags** (structured; the CLI binds layer 1 only) →
-2. **`EMUCTL_*` env** — flat leaf-only grammar (`EMUCTL_DISPLAY_WIDTH`, `EMUCTL_MEMU_VM_NAME`, …); strict typed parse; unknown names → `ConfigWarning` →
+2. **`EMUCTL_*` env** — flat leaf-only grammar (`EMUCTL_DISPLAY_WIDTH`, `EMUCTL_RESOURCES_CPUS`, …); strict typed parse; unknown names → `ConfigWarning` →
 3. **Project layer** — walk cwd → parent dirs; per dir, `emuctl.toml` wins over `[tool.emuctl]` in that dir; the FIRST dir containing either is authoritative and outer dirs are ignored; within the chosen file, leaf-first-wins →
 4. **User XDG** (`~/.config` or `%APPDATA%\emuctl`) →
 5. **Dataclass defaults** →
@@ -315,7 +323,7 @@ Escape hatches: `--config-file` (replaces layers 3+4) and `--no-config` (skips b
 
 **Resources rule.** Any shipped file is addressed exclusively through `importlib.resources` (`emuctl.resources`; real-path needs via `as_file`) — never relative paths, `os.getcwd()`, or `__file__`-arithmetic; a contract test enforces the singularity. User-override order per resource: explicit path → project profiles dir → user profiles dir → bundled (immutable, always present).
 
-**Config ↔ capability gate (construction time).** `ensure_config_supported(cfg, features)` runs against the selected adapter's declared set: `[display]` / `[resources]` / `[memu.settings]` / `[bluestacks.settings]` each require `configure`; refusal = `FeatureNotSupportedError(feature, detail)` — typed, never silent-ignore, never hand-written. Plain-ADB + `[display]` → typed refusal (adb never declares CONFIGURE); `VULKAN` on MEmu → the same gate via a missing table entry. Load-time validates structure only (types/ranges/versions) — capability truth binds at selection (the target ref names the backend), so the gate runs at construction.
+**Config ↔ capability gate (construction time).** `ensure_config_supported(cfg, features)` runs against the selected adapter's declared set: `[display]` requires `configure`; refusal = `FeatureNotSupportedError(feature, detail)` — typed, never silent-ignore, never hand-written. Plain-ADB declares CONFIGURE for guest display geometry (`configure()` → `DisplayState`), so `[display]` is accepted there. v0.1 has no vendor config sections. Load-time validates structure only (types/ranges/versions) — capability truth binds at selection (the target ref names the backend), so the gate runs at construction.
 
 **Evolution.** `schema_version` optional, absent ⇒ 1; unknown major → `ConfigError(reason="bad_version")` carrying the found version in `value` and naming the installed one in the message. Unknown **keys** → warn+ignore with nearest-key hint (never error, never silent); unknown **values** → always strict error. New fields/members in any minor; renames get a one-minor warning alias then major-drop; removals are major-only with the replacement named. Emission additive-only per minor; reading tolerant; round-trip lossy-on-unknown, loudly.
 
@@ -333,7 +341,7 @@ class EmulatorController:  # built only by connect_sync(); not user-constructed
     restart(*, app=None, ready=None, timeout=DEFAULT) / click / swipe / key / text /
     screenshot(timeout=…) -> bytes / is_reachable() -> ProbeResult / install_apk /
     start_app / is_app_installed / create(spec: CreateSpec) -> InstanceRef (same shape as §1's) /
-    start / stop / configure(spec: ConfigSpec | None) / aclose / close /
+    start / stop / configure(spec: ConfigSpec | None) -> DisplayState / aclose / close /
     __enter__ / __exit__ (start nothing; boot stays explicit)
     @property features · has_feature()             # portal-free (declared, static)
 ```
@@ -400,20 +408,25 @@ emuctl/
   port.py errors.py timing.py waits.py png.py log.py _proc.py
   _serials.py _identification.py _discovery.py _platforms.py
   config/model.py
-  backends/_registry.py backends/adb.py backends/memu.py
-  backends/bluestacks/{__init__.py, bs5.py, air.py, _conf.py, _meta.py, _paths.py}
+  backends/_registry.py backends/adb.py
 ```
+
+**v0.1 scope.** Only the plain ADB backend ships. MEmu, BlueStacks, AVD, and the Google
+Play stub are preserved on their stack branches for later, unverified work; the release
+has no adapter modules, extras, or registry rows for them. Their `BackendId` values stay
+in the identity vocabulary, so selection refuses cleanly with
+`BackendNotAvailableError` instead of pretending they do not exist.
 
 **Layout rules.**
 
-1. Lazy packages: a backend becomes a package only when its family gains a second concrete adapter (BlueStacks triggers this day one via Air; MEmu stays a module; `_`-modules are family-private).
+1. Lazy packages: a backend becomes a package only when its family gains a second concrete adapter; `_`-modules are family-private. v0.1's sole adapter is a module (`backends/adb.py`).
 2. Import direction is a DAG: core ← any backend; never sideways between backend families; never a family reaching into another family's `_`-private modules.
 3. Only the spec table names import-facing paths; everything else under `emuctl.backends.*` is implementation; dynamic adapter imports happen ONLY via `load_adapter`, never ad-hoc.
-4. Extra-boundary promotion: sharing that would cross an extras boundary (`[memu]` code wanted by `[bluestacks]`) is, by definition, the promotion signal — it goes to core so extras stay minimal.
+4. Extra-boundary promotion: sharing that would cross an extras boundary is, by definition, the promotion signal — it goes to core so extras stay minimal.
 
 **Enforcement (CI + `make lint`, not vibes).**
 
-- **import-linter** (dev dependency group; pre-commit + CI): a `layers` contract asserting `emuctl.backends → emuctl` only (core never imports backends statically — the lazy loader's dynamic import is deliberately invisible to it), and an `independence` contract over the backend sibling packages (`memu`, `bluestacks`, `google_play`, `avd`) — no sideways imports; this also enforces rules 1 and 4, since a would-be sideways import must instead be promoted and pass the layers contract.
+- **import-linter** (dev dependency group; pre-commit + CI): a `layers` contract asserting `emuctl.backends → emuctl` only (core never imports backends statically — the lazy loader's dynamic import is deliberately invisible to it), and an `independence` contract over the backend sibling packages (v0.1: `adb` only) — no sideways imports; this also enforces rules 1 and 4, since a would-be sideways import must instead be promoted and pass the layers contract.
 - **ruff TID251 banned-api:** `subprocess` banned project-wide, `_proc.py` exempt via `per-file-ignores` (the exemption disables all of TID251 there, so banned-api stays single-entry; §7's AST-walk is the backstop), plus the flake8-bandit S-rules (S602/S603/S605/S607) for the `shell=True` family.
 - **Release-time API discipline:** griffe `check` against the last release tag in the release workflow (additive-only evolution promises); commitizen `cz check` for conventional-commit gates alongside python-semantic-release.
 - **No editor/agent hooks.** Hooks are fail-open and per-tool; pre-commit + CI are the enforcement of record. The conformance suite (§7) carries what linters cannot.
