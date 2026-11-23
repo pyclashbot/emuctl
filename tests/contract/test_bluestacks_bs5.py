@@ -552,8 +552,6 @@ async def test_vendor_run_prefix_and_serial_scope(bt_module: Any, tmp_path: Path
     assert calls == [
         [
             str(root / "HD-Adb.exe"),
-            "-H",
-            "127.0.0.1",
             "-P",
             "5041",
             "-s",
@@ -577,9 +575,7 @@ async def test_server_verbs_never_scoped(bt_module: Any, tmp_path: Path) -> None
         timeout=None,
         server_verb=True,
     )
-    assert calls == [
-        [str(root / "HD-Adb.exe"), "-H", "127.0.0.1", "-P", "5041", "connect", "127.0.0.1:5555"]
-    ]
+    assert calls == [[str(root / "HD-Adb.exe"), "-P", "5041", "connect", "127.0.0.1:5555"]]
 
 
 @_sync

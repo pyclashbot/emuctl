@@ -16,6 +16,7 @@ from emuctl._identification import BackendId, InstanceRef
 from emuctl._proc import ProcessExecutor, ProcessResult
 from emuctl.config.model import AdbConfig, CreateSpec, DisplayConfig, EmuctlConfig
 from emuctl.errors import (
+    DeviceStateError,
     ExecutableNotFoundError,
     FeatureNotSupportedError,
     InvalidArgumentError,
@@ -32,7 +33,7 @@ from emuctl.timing import (
 )
 
 SERIAL = "emulator-5554"
-PREFIX = ["adb", "-H", "127.0.0.1", "-P", "5037"]
+PREFIX = ["adb", "-P", "5037"]
 SCOPED = [*PREFIX, "-s", SERIAL]
 
 
@@ -223,6 +224,64 @@ async def test_click_count_shares_one_deadline(adb_module: Any) -> None:
 
 
 @_sync
+async def test_cancelled_click_propagates_without_pointer_release(adb_module: Any) -> None:
+    """§2/§5: CancelledError is never caught; no extra cleanup I/O (and no
+    ~2 s delay) is added on the cancellation path."""
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, lambda argv: _FakeHandle(hang=True))
+    task = asyncio.ensure_future(ctl.click(1, 2))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert all("motionevent" not in argv for argv in calls)
+
+
+@_sync
+async def test_click_timeout_releases_a_stuck_pointer(adb_module: Any) -> None:
+    """An aborted tap can leave the device pointer DOWN; one bounded
+    `motionevent UP` restores later taps, and the original timeout still wins."""
+    calls: list[list[str]] = []
+    hangs = {"tap": 0}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "tap" in argv and hangs["tap"] == 0:
+            hangs["tap"] += 1
+            return _FakeHandle(hang=True)
+        return _FakeHandle()
+
+    ctl = _make(adb_module, calls, respond)
+    with pytest.raises(OperationTimeoutError):
+        await ctl.click(1, 2, timeout=0.05)
+    assert calls[-1][-6:] == ["shell", "input", "motionevent", "UP", "0", "0"]
+
+
+@_sync
+async def test_successful_click_never_sends_pointer_release(adb_module: Any) -> None:
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _ok())
+    await ctl.click(1, 2)
+    assert all("motionevent" not in argv for argv in calls)
+
+
+@_sync
+async def test_swipe_timeout_releases_a_stuck_pointer(adb_module: Any) -> None:
+    calls: list[list[str]] = []
+    hangs = {"swipe": 0}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "swipe" in argv and hangs["swipe"] == 0:
+            hangs["swipe"] += 1
+            return _FakeHandle(hang=True)
+        return _FakeHandle()
+
+    ctl = _make(adb_module, calls, respond)
+    with pytest.raises(OperationTimeoutError):
+        await ctl.swipe(1, 2, 3, 4, duration_ms=100, timeout=0.05)
+    assert calls[-1][-6:] == ["shell", "input", "motionevent", "UP", "0", "0"]
+
+
+@_sync
 async def test_click_count_expiry_is_typed_timeout(adb_module: Any) -> None:
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _ok())
@@ -311,6 +370,113 @@ async def test_screenshot_nonzero_rc_maps_exit(adb_module: Any) -> None:
         await ctl.screenshot()
     assert excinfo.value.output_reason == "exit"
     assert excinfo.value.returncode == 1
+
+
+@_sync
+async def test_transport_degradation_raises_device_state_error(adb_module: Any) -> None:
+    """§2: explicit transport-degradation stderr is DeviceStateError, not a
+    vendor command failure (mid-op observation failed)."""
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _ok(stderr=b"adb: device offline", returncode=1))
+    with pytest.raises(DeviceStateError) as excinfo:
+        await ctl.screenshot()
+    assert excinfo.value.state == "offline"
+    assert excinfo.value.serial == SERIAL
+    assert excinfo.value.error_code == "device_state"
+
+
+@pytest.mark.parametrize(
+    ("stderr", "state"),
+    [
+        (b"error: device unauthorized. check prompt", "unauthorized"),
+        (b"adb: device 'emulator-5554' not found", "disconnected"),
+        (b"adb: no devices/emulators found", "disconnected"),
+        (b"adb: connection reset by peer", "disconnected"),
+    ],
+)
+@_sync
+async def test_transport_state_token_map(adb_module: Any, stderr: bytes, state: str) -> None:
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _ok(stderr=stderr, returncode=1))
+    with pytest.raises(DeviceStateError) as excinfo:
+        await ctl.click(1, 2)
+    assert excinfo.value.state == state
+
+
+@_sync
+async def test_non_transport_vendor_failure_stays_vendor_error(adb_module: Any) -> None:
+    """A real command failure is never laundered into DeviceStateError."""
+    calls: list[list[str]] = []
+    ctl = _make(
+        adb_module,
+        calls,
+        _ok(stderr=b"Failure [INSTALL_FAILED_ALREADY_EXISTS]", returncode=1),
+    )
+    with pytest.raises(VendorCommandError) as excinfo:
+        await ctl.install_apk("dist/app.apk")
+    assert excinfo.value.returncode == 1
+
+
+@_sync
+async def test_probe_maps_device_state_to_its_own_reason(adb_module: Any) -> None:
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _ok(stderr=b"adb: device offline", returncode=1))
+    probe = await ctl.is_reachable()
+    assert (probe.ok, probe.reason) == (False, "offline")
+
+
+@_sync
+async def test_transport_loss_is_repaired_on_the_next_op(adb_module: Any) -> None:
+    """One transport blip sets DeviceStateError; the next op lazily re-attaches
+    (adb connect) before running — the failed op is never retried."""
+    calls: list[list[str]] = []
+    state = {"first": True}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "screencap" in argv:
+            if state["first"]:
+                state["first"] = False
+                return _FakeHandle(stderr=b"adb: device 'emulator-5554' not found", returncode=1)
+            return _FakeHandle(stdout=_png())
+        if "connect" in argv:
+            return _FakeHandle(stdout=b"connected to emulator-5554")
+        return _FakeHandle()
+
+    ctl = _make(adb_module, calls, respond)
+    with pytest.raises(DeviceStateError) as excinfo:
+        await ctl.screenshot()
+    assert excinfo.value.state == "disconnected"
+    assert calls == [[*SCOPED, "exec-out", "screencap", "-p"]]  # no retry
+
+    frame = await ctl.screenshot()
+    assert frame.startswith(b"\x89PNG")
+    assert calls[1] == [*PREFIX, "connect", SERIAL]  # server verb, never -s scoped
+    assert calls[2] == [*SCOPED, "exec-out", "screencap", "-p"]
+
+
+@_sync
+async def test_reattach_uses_the_op_remaining_budget(adb_module: Any) -> None:
+    """The lazy reconnect is bounded by the caller's slice, never a fresh 2 s
+    (§2 one deadline). A 0.05 s op gets a 0.05 s re-attach."""
+    calls: list[list[str]] = []
+    state = {"first": True}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "screencap" in argv:
+            if state["first"]:
+                state["first"] = False
+                return _FakeHandle(stderr=b"adb: device 'emulator-5554' not found", returncode=1)
+            return _FakeHandle(stdout=_png())
+        return _FakeHandle(stdout=b"connected")
+
+    spy = _TimeoutSpy(_spawn=_spawn_factory(calls, respond))  # type: ignore[arg-type]
+    ref = InstanceRef(backend=BackendId.ADB, key=SERIAL)
+    ctl = adb_module.AdbController(ref, config=EmuctlConfig(), _executor=spy)
+    with pytest.raises(DeviceStateError):
+        await ctl.screenshot()
+    await ctl.screenshot(timeout=0.05)
+    assert spy.seen["reattach"] == pytest.approx(0.05)
+    assert (spy.seen["reattach"] or 0) < 2.0
 
 
 @_sync
@@ -688,6 +854,31 @@ async def test_is_app_installed_exact_line_match(
 
 
 # ── serial scoping ──
+
+
+@_sync
+async def test_loopback_prefix_omits_H_so_a_cold_server_can_start(
+    adb_module: Any,
+) -> None:
+    """`-H` marks the server REMOTE and blocks adb's documented cold-start;
+    loopback must emit `-P` only (custom ports included)."""
+    calls: list[list[str]] = []
+    cfg = EmuctlConfig(adb=AdbConfig(port=5042))
+    ctl = _make(adb_module, calls, _ok(), config=cfg)
+    await ctl.click(1, 2)
+    assert calls == [["adb", "-P", "5042", "-s", SERIAL, "shell", "input", "tap", "1", "2"]]
+
+
+@_sync
+async def test_genuinely_remote_host_keeps_H(adb_module: Any) -> None:
+    """Only loopback is local; a real remote host still pins the server."""
+    calls: list[list[str]] = []
+    cfg = EmuctlConfig(adb=AdbConfig(host="10.0.0.2", port=5037))
+    ctl = _make(adb_module, calls, _ok(), config=cfg)
+    await ctl.click(1, 2)
+    assert calls == [
+        ["adb", "-H", "10.0.0.2", "-P", "5037", "-s", SERIAL, "shell", "input", "tap", "1", "2"]
+    ]
 
 
 @_sync

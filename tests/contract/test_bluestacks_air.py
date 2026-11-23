@@ -438,8 +438,6 @@ async def test_vendor_run_prefix_and_serial_scope(air_module: Any, tmp_path: Pat
     assert calls == [
         [
             str(tools / "hd-adb"),
-            "-H",
-            "127.0.0.1",
             "-P",
             "5041",
             "-s",
