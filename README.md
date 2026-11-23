@@ -41,12 +41,14 @@ Async works the same way:
 import asyncio
 import emuctl
 
+
 async def main() -> None:
     emu = await emuctl.connect("adb:127.0.0.1:5555")
     try:
         await emu.configure({"display.width": 419, "display.height": 633})
     finally:
         await emu.close()
+
 
 asyncio.run(main())
 ```
