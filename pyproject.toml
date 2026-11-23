@@ -99,7 +99,10 @@ update_changelog_on_bump = true
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
 commit_parser = "conventional"
-tag_format = "v$version"
+# PSR 10.x uses "v{version}" (the commitizen "$version" form fails validation).
+tag_format = "v{version}"
+# Keep v0.x releases legal for the first release.
+allow_zero_version = true
 commit_author = "github-actions[bot] <actions@github.com>"
 # UV recipe (PSR docs: configuration-guides/uv_integration): refresh the lock for the new
 # version, stage it into the release commit, then build. uv is on PATH via setup-uv in CI.
