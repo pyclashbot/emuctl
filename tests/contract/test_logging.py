@@ -1,5 +1,3 @@
-"""§7.4 conformance: logger silence + sanitize discipline."""
-
 import importlib
 import logging
 import sys

@@ -1,5 +1,3 @@
-"""§2 — Failure contract: the pure EmuctlError taxonomy (stdlib-only, payload-first)."""
-
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -17,21 +15,20 @@ __all__ = [
     "ConfigValidationError",
     "OperationTimeoutError",
     "VendorCommandError",
-    "DeviceStateError",
     "InstanceNotFoundError",
+    "AmbiguousInstanceError",
+    "DeviceStateError",
     "FeatureNotSupportedError",
     "BackendNotAvailableError",
     "BackendNotFoundError",
     "EmulatorNotReadyError",
     "ControllerClosedError",
-    "AmbiguousInstanceError",
     "SyncCallInsideEventLoopError",
     "resolve_error_code",
 ]
 
 
 def _reconstruct(cls: type[EmuctlError], state: dict[str, Any]) -> EmuctlError:
-    """Pickle reconstructor: bypasses kwargs-only __init__ via __new__ + state restore."""
     obj = cls.__new__(cls)
     Exception.__init__(obj)
     obj.__dict__.update(state)
@@ -39,13 +36,6 @@ def _reconstruct(cls: type[EmuctlError], state: dict[str, Any]) -> EmuctlError:
 
 
 class EmuctlError(Exception):
-    """Root of the pure taxonomy. invalid_argument → exit 2 family (see cli/_exitmap.py).
-
-    Payload-first: kwargs-only typed constructors, ``args == ()``, picklable via
-    the base ``__reduce__``. ``__str__`` is generated from payloads + sanitized
-    detail only — never the ``suggestion`` template (rendered at the CLI layer).
-    """
-
     error_code: ClassVar[str] = "emuctl_error"
     suggestion: ClassVar[str] = ""
     payload: ClassVar[tuple[str, ...]] = ()
@@ -68,8 +58,6 @@ class EmuctlError(Exception):
 
 
 class InvalidArgumentError(EmuctlError):
-    """Caller misuse. invalid_argument → exit 2."""
-
     error_code: ClassVar[str] = "invalid_argument"
     suggestion: ClassVar[str] = "Check the value of '{parameter}': {constraint}."
     payload: ClassVar[tuple[str, ...]] = ("parameter", "constraint")
@@ -81,8 +69,6 @@ class InvalidArgumentError(EmuctlError):
 
 
 class InvalidSerialError(InvalidArgumentError):
-    """Serial failed the allowlist (empty/whitespace/shape). invalid_serial → exit 2."""
-
     error_code: ClassVar[str] = "invalid_serial"
     suggestion: ClassVar[str] = (
         "Use the canonical 'backend:key' form (e.g. 'adb:127.0.0.1:5555'); got '{serial}'."
@@ -95,8 +81,6 @@ class InvalidSerialError(InvalidArgumentError):
 
 
 class ExtrasMissingError(EmuctlError):
-    """Backend dependency (PEP 685 extra) not installed. extras_missing → exit 3."""
-
     error_code: ClassVar[str] = "extras_missing"
     suggestion: ClassVar[str] = "Install the '{extra}' extra: pip install 'emuctl[{extra}]'."
     payload: ClassVar[tuple[str, ...]] = ("extra",)
@@ -107,8 +91,6 @@ class ExtrasMissingError(EmuctlError):
 
 
 class ExecutableNotFoundError(EmuctlError):
-    """Required tool binary not found. executable_not_found → exit 3."""
-
     error_code: ClassVar[str] = "executable_not_found"
     suggestion: ClassVar[str] = "Install '{tool}' and ensure it is on PATH."
     payload: ClassVar[tuple[str, ...]] = ("tool", "searched")
@@ -126,12 +108,6 @@ class ExecutableNotFoundError(EmuctlError):
 
 
 class ConfigError(EmuctlError):
-    """Config layer unreadable or wrong schema version. config → exit 3.
-
-    reason ∈ {"unreadable", "bad_version"}; bad_version carries the found
-    version in `value` and names the installed one in the message.
-    """
-
     error_code: ClassVar[str] = "config"
     suggestion: ClassVar[str] = "Check config layer '{layer}' at '{path}': {reason}."
     payload: ClassVar[tuple[str, ...]] = ("layer", "path", "reason", "value")
@@ -153,12 +129,8 @@ class ConfigError(EmuctlError):
 
 
 class ConfigValidationError(ConfigError):
-    """A config value failed structural validation. config_validation → exit 3."""
-
     error_code: ClassVar[str] = "config_validation"
-    suggestion: ClassVar[str] = (
-        "Fix config value at '{path}' in layer '{layer}': expected {expected}."
-    )
+    suggestion: ClassVar[str] = "Fix config value at '{path}' in layer '{layer}': expected {expected}."
     payload: ClassVar[tuple[str, ...]] = ("layer", "path", "value", "expected")
 
     def __init__(
@@ -178,8 +150,6 @@ class ConfigValidationError(ConfigError):
 
 
 class OperationTimeoutError(EmuctlError):
-    """The op-level deadline expired. timeout → exit 7."""
-
     error_code: ClassVar[str] = "timeout"
     suggestion: ClassVar[str] = "Retry with a larger timeout for '{operation}'."
     payload: ClassVar[tuple[str, ...]] = ("operation", "deadline", "elapsed")
@@ -199,16 +169,8 @@ class OperationTimeoutError(EmuctlError):
 
 
 class VendorCommandError(EmuctlError):
-    """Nonzero rc or unusable output. vendor_command_failed → exit 8.
-
-    output_reason ∈ {"exit" | "unusable_output" | "stderr"}; screenshot
-    corruption ⇒ unusable_output (no dedicated class).
-    """
-
     error_code: ClassVar[str] = "vendor_command_failed"
-    suggestion: ClassVar[str] = (
-        "Re-run the vendor command manually to reproduce; check device state."
-    )
+    suggestion: ClassVar[str] = "Re-run the vendor command manually to reproduce; check device state."
     payload: ClassVar[tuple[str, ...]] = (
         "command",
         "returncode",
@@ -232,22 +194,6 @@ class VendorCommandError(EmuctlError):
         self.stderr_excerpt = stderr_excerpt
 
 
-class DeviceStateError(EmuctlError):
-    """Mid-op transport degradation. device_state → exit 8.
-
-    state ∈ offline | unauthorized | disconnected (mid-op degradation only).
-    """
-
-    error_code: ClassVar[str] = "device_state"
-    suggestion: ClassVar[str] = "Reconnect or reboot the device at '{serial}' (state: {state})."
-    payload: ClassVar[tuple[str, ...]] = ("serial", "state")
-
-    def __init__(self, *, serial: str, state: str, detail: str | None = None) -> None:
-        super().__init__(detail=detail)
-        self.serial = serial
-        self.state = state
-
-
 class InstanceNotFoundError(EmuctlError):
     """No such instance. instance_not_found → exit 4.
 
@@ -263,81 +209,6 @@ class InstanceNotFoundError(EmuctlError):
     def __init__(self, *, instance_ref: str, detail: str | None = None) -> None:
         super().__init__(detail=detail)
         self.instance_ref = instance_ref
-
-
-class FeatureNotSupportedError(EmuctlError):
-    """Backend lacks the gated capability. feature_not_supported → exit 5.
-
-    `detail` extends the config gate (e.g. "config requests [display]…").
-    """
-
-    error_code: ClassVar[str] = "feature_not_supported"
-    suggestion: ClassVar[str] = (
-        "Query 'emuctl probe' for supported features; '{feature}' is not supported by this backend."
-    )
-    payload: ClassVar[tuple[str, ...]] = ("feature",)
-
-    def __init__(self, *, feature: str, detail: str | None = None) -> None:
-        super().__init__(detail=detail)
-        self.feature = feature
-
-
-class BackendNotAvailableError(EmuctlError):
-    """Backend known but unusable here. backend_not_available → exit 5.
-
-    reason ∈ "platform-unsupported" | "not-implemented-this-version".
-    """
-
-    error_code: ClassVar[str] = "backend_not_available"
-    suggestion: ClassVar[str] = "Reason: {reason}."
-    payload: ClassVar[tuple[str, ...]] = ("reason",)
-
-    def __init__(self, *, reason: str, detail: str | None = None) -> None:
-        super().__init__(detail=detail)
-        self.reason = reason
-
-
-class BackendNotFoundError(EmuctlError):
-    """Unknown backend id. backend_not_found → exit 2."""
-
-    error_code: ClassVar[str] = "backend_not_found"
-    suggestion: ClassVar[str] = "Use a known backend id; got '{backend_id}'."
-    payload: ClassVar[tuple[str, ...]] = ("backend_id",)
-
-    def __init__(self, *, backend_id: str, detail: str | None = None) -> None:
-        super().__init__(detail=detail)
-        self.backend_id = backend_id
-
-
-class EmulatorNotReadyError(EmuctlError):
-    """restart() terminal check failed. not_ready → exit 6; restart() ONLY.
-
-    reason = short snake_case phase/vendor token ("app_not_installed",
-    "menu_not_reached", "timeout", "start_failed").
-    """
-
-    error_code: ClassVar[str] = "not_ready"
-    suggestion: ClassVar[str] = "Restart and wait for readiness; phase '{reason}' did not complete."
-    payload: ClassVar[tuple[str, ...]] = ("reason", "cause")
-
-    def __init__(
-        self,
-        *,
-        reason: str,
-        cause: BaseException | str | None,
-        detail: str | None = None,
-    ) -> None:
-        super().__init__(detail=detail)
-        self.reason = reason
-        self.cause = cause
-
-
-class ControllerClosedError(EmuctlError):
-    """Op on a closed controller. controller_closed → exit 6."""
-
-    error_code: ClassVar[str] = "controller_closed"
-    suggestion: ClassVar[str] = "The controller is closed; construct a new one with connect()."
-    payload: ClassVar[tuple[str, ...]] = ()
 
 
 class AmbiguousInstanceError(EmuctlError):
@@ -359,16 +230,79 @@ class AmbiguousInstanceError(EmuctlError):
         self.matched = tuple(matched)
 
 
-class SyncCallInsideEventLoopError(EmuctlError):
-    """Sync facade called from a running loop. sync_call_inside_loop → exit 2."""
+class DeviceStateError(EmuctlError):
+    error_code: ClassVar[str] = "device_state"
+    suggestion: ClassVar[str] = "Reconnect or reboot the device at '{serial}' (state: {state})."
+    payload: ClassVar[tuple[str, ...]] = ("serial", "state")
 
+    def __init__(self, *, serial: str, state: str, detail: str | None = None) -> None:
+        super().__init__(detail=detail)
+        self.serial = serial
+        self.state = state
+
+
+class FeatureNotSupportedError(EmuctlError):
+    error_code: ClassVar[str] = "feature_not_supported"
+    suggestion: ClassVar[str] = (
+        "Query 'emuctl probe' for supported features; '{feature}' is not supported by this backend."
+    )
+    payload: ClassVar[tuple[str, ...]] = ("feature",)
+
+    def __init__(self, *, feature: str, detail: str | None = None) -> None:
+        super().__init__(detail=detail)
+        self.feature = feature
+
+
+class BackendNotAvailableError(EmuctlError):
+    error_code: ClassVar[str] = "backend_not_available"
+    suggestion: ClassVar[str] = "Reason: {reason}."
+    payload: ClassVar[tuple[str, ...]] = ("reason",)
+
+    def __init__(self, *, reason: str, detail: str | None = None) -> None:
+        super().__init__(detail=detail)
+        self.reason = reason
+
+
+class BackendNotFoundError(EmuctlError):
+    error_code: ClassVar[str] = "backend_not_found"
+    suggestion: ClassVar[str] = "Use a known backend id; got '{backend_id}'."
+    payload: ClassVar[tuple[str, ...]] = ("backend_id",)
+
+    def __init__(self, *, backend_id: str, detail: str | None = None) -> None:
+        super().__init__(detail=detail)
+        self.backend_id = backend_id
+
+
+class EmulatorNotReadyError(EmuctlError):
+    error_code: ClassVar[str] = "not_ready"
+    suggestion: ClassVar[str] = "Restart and wait for readiness; phase '{reason}' did not complete."
+    payload: ClassVar[tuple[str, ...]] = ("reason", "cause")
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        cause: BaseException | str | None,
+        detail: str | None = None,
+    ) -> None:
+        super().__init__(detail=detail)
+        self.reason = reason
+        self.cause = cause
+
+
+class ControllerClosedError(EmuctlError):
+    error_code: ClassVar[str] = "controller_closed"
+    suggestion: ClassVar[str] = "The controller is closed; construct a new one with connect()."
+    payload: ClassVar[tuple[str, ...]] = ()
+
+
+class SyncCallInsideEventLoopError(EmuctlError):
     error_code: ClassVar[str] = "sync_call_inside_loop"
     suggestion: ClassVar[str] = "Use 'await emulator.aio.<op>()' inside a running event loop."
     payload: ClassVar[tuple[str, ...]] = ()
 
 
 def resolve_error_code(exc: BaseException) -> str:
-    """Walk the MRO for the nearest pinned `error_code`; "emuctl_error" fallback."""
     for klass in type(exc).__mro__:
         code = klass.__dict__.get("error_code")
         if isinstance(code, str):

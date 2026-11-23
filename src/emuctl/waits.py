@@ -1,5 +1,3 @@
-"""§2 — The single sanctioned internal wait loop: wait_until(predicate, operation, timeout)."""
-
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +18,6 @@ _POLL_INTERVAL_S = 0.05
 
 
 def _validate_timeout(timeout: float) -> float:
-    """REQUIRED concrete deadline: reject DEFAULT/None/non-positive before any I/O."""
     if timeout is DEFAULT or timeout is None:
         raise InvalidArgumentError(
             parameter="timeout",
@@ -42,14 +39,6 @@ async def wait_until(
     operation: str,
     timeout: float,
 ) -> None:
-    """Poll `predicate` until truthy under one shared deadline.
-
-    Shape: deadline-check → evaluate → sleep(poll). `timeout` is REQUIRED
-    (no default; DEFAULT/None rejected). Predicate exceptions propagate
-    unchanged — no internal retries beyond polling. Expiry raises only
-    OperationTimeoutError, never conflated with cancellation: CancelledError
-    propagates unmodified.
-    """
     budget = _validate_timeout(timeout)
     start = time.monotonic()
     deadline = start + budget

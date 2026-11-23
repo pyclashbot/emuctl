@@ -98,15 +98,11 @@ class AsyncEmulatorController(abc.ABC):
     # ── interaction / apps (implemented once in AdbController) ──
     async def screenshot(self) -> bytes: ...
     async def click(self, x: int, y: int, *, count: int = 1, interval: float = 0.0) -> None: ...
-    async def swipe(
-        self, x1: int, y1: int, x2: int, y2: int, *, duration_ms: int = 300
-    ) -> None: ...
+    async def swipe(self, x1: int, y1: int, x2: int, y2: int, *, duration_ms: int = 300) -> None: ...
     async def key(self, code: str | int) -> None: ...  # raw keycode/keyevent symbol, documented
     async def text(self, value: str) -> None: ...  # escaping owned by the shared default
     async def install_apk(self, apk_path: str | os.PathLike[str]) -> None: ...
-    async def start_app(
-        self, package: str
-    ) -> None: ...  # launch + bounded spawn-verify (no stdout parsing)
+    async def start_app(self, package: str) -> None: ...  # launch + bounded spawn-verify (no stdout parsing)
     async def is_app_installed(self, package: str) -> bool: ...
     async def is_reachable(self) -> ProbeResult: ...
     async def aclose(self) -> None: ...  # idempotent; releases transport only
@@ -288,19 +284,16 @@ async def discover(backends=None, *, config=None, offline: bool = False) -> Disc
 **Config models (`emuctl/config/model.py`) — frozen dataclasses, `slots=True`, validating `__post_init__`; an invalid instance cannot exist; failures → `ConfigValidationError(path, value, layer, expected)`:**
 
 ```python
-class RendererMode(enum.Enum): AUTO / OPENGL / DIRECTX / VULKAN   # canonical per semantic, per backend
-DisplayConfig(width, height, dpi, fps, renderer)                 # all None-defaults = leave as-is
-ResourceConfig(cpus=None, memory_mb=None, cpu_cap_pct=None)      # None = vendor's current value
+DisplayConfig(width, height, dpi)                                # all None-defaults = leave as-is
 AdbConfig(path=None, host="127.0.0.1", port=5037)                # None path → §3's discovery
-LogConfig(level="warning", file=None)   # consumed ONLY by the CLI surface; the library never configures handlers
-EmuctlConfig(adb=…, display=…, resources=…, log=…)  # ROOT contract object (v0.1: ADB only)
+EmuctlConfig(adb=…, display=…)                     # ROOT contract object (v0.1: ADB only)
 CreateSpec(name: str, android_version: str | None = None)  # name REQUIRED at v0; None version ⇒
                                                            # default image (Android 13)
 # Range checks: ports 1..65535; set geometry >0; cpus ≥1; memory_mb >0; cpu_cap_pct, scale_percent
 # 1..100; level ∈ stdlib names.
 ConfigSpec = Mapping[str, str | int | float | bool | None]  # normative type ALIAS for the overlay
-# Keys are CANONICAL config leaves ("display.width", "display.renderer", "resources.cpus",
-# "resources.cpus", … — same vocabulary as the model sections); values are strict typed
+# Keys are CANONICAL config leaves ("display.width", "display.height", "display.dpi" —
+# same vocabulary as the model sections); values are strict typed
 # primitives. Adapters translate entries via their translation table; an unknown canonical key →
 # InvalidArgumentError (caller misuse); an entry the backend can't translate deploys the gate.
 ```
@@ -330,7 +323,7 @@ Escape hatches: `--config-file` (replaces layers 3+4) and `--no-config` (skips b
 
 **Resources rule.** Any shipped file is addressed exclusively through `importlib.resources` (`emuctl.resources`; real-path needs via `as_file`) — never relative paths, `os.getcwd()`, or `__file__`-arithmetic; a contract test enforces the singularity. User-override order per resource: explicit path → project profiles dir → user profiles dir → bundled (immutable, always present).
 
-**Config ↔ capability gate (construction time).** `ensure_config_supported(cfg, features)` runs against the selected adapter's declared set: `[display]` / `[resources]` each require `configure`; refusal = `FeatureNotSupportedError(feature, detail)` — typed, never silent-ignore, never hand-written. Plain-ADB declares CONFIGURE for guest display geometry (`configure()` → `DisplayState`), so `[display]` is accepted there. v0.1 has no vendor config sections. Load-time validates structure only (types/ranges/versions) — capability truth binds at selection (the target ref names the backend), so the gate runs at construction.
+**Config ↔ capability gate (construction time).** `ensure_config_supported(cfg, features)` runs against the selected adapter's declared set: `[display]` requires `configure`; refusal = `FeatureNotSupportedError(feature, detail)` — typed, never silent-ignore, never hand-written. Plain-ADB declares CONFIGURE for guest display geometry (`configure()` → `DisplayState`), so `[display]` is accepted there. v0.1 has no vendor config sections. Load-time validates structure only (types/ranges/versions) — capability truth binds at selection (the target ref names the backend), so the gate runs at construction.
 
 **Evolution.** `schema_version` optional, absent ⇒ 1; unknown major → `ConfigError(reason="bad_version")` carrying the found version in `value` and naming the installed one in the message. Unknown **keys** → warn+ignore with nearest-key hint (never error, never silent); unknown **values** → always strict error. New fields/members in any minor; renames get a one-minor warning alias then major-drop; removals are major-only with the replacement named. Emission additive-only per minor; reading tolerant; round-trip lossy-on-unknown, loudly.
 

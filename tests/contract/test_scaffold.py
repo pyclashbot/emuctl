@@ -1,5 +1,3 @@
-"""Mini §7.4 conformance: importing emuctl adds no root-logger handlers (§2 logging discipline)."""
-
 import logging
 
 import emuctl  # noqa: F401
@@ -14,6 +12,4 @@ def test_import_is_logger_silent() -> None:
 
     after = list(root.handlers)
     added = [h for h in after if h not in before]
-    assert added == [], (
-        f"importing emuctl must not add handlers to the root logger, added {added!r}"
-    )
+    assert added == [], f"importing emuctl must not add handlers to the root logger, added {added!r}"

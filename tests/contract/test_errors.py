@@ -1,5 +1,3 @@
-"""§7.1 conformance: taxonomy codes, payloads, stable __str__, picklability."""
-
 import pickle
 from string import Formatter
 from typing import Any
@@ -94,16 +92,12 @@ CASES: tuple[tuple[type[EmuctlError], dict[str, Any], str], ...] = (
 
 def _taxonomy() -> list[type[EmuctlError]]:
     return [
-        value
-        for value in vars(errors).values()
-        if isinstance(value, type) and issubclass(value, EmuctlError)
+        value for value in vars(errors).values() if isinstance(value, type) and issubclass(value, EmuctlError)
     ]
 
 
 def test_no_extra_public_classes() -> None:
-    assert sorted(cls.__name__ for cls in _taxonomy()) == sorted(
-        cls.__name__ for cls, _, _ in CASES
-    )
+    assert sorted(cls.__name__ for cls in _taxonomy()) == sorted(cls.__name__ for cls, _, _ in CASES)
 
 
 def test_pure_tree_no_stdlib_mixing() -> None:
@@ -117,9 +111,7 @@ def test_pure_tree_no_stdlib_mixing() -> None:
 
 
 @pytest.mark.parametrize(("cls", "kwargs", "code"), CASES)
-def test_error_code_payload_args_str(
-    cls: type[EmuctlError], kwargs: dict[str, Any], code: str
-) -> None:
+def test_error_code_payload_args_str(cls: type[EmuctlError], kwargs: dict[str, Any], code: str) -> None:
     exc = cls(**kwargs)
     assert exc.args == ()
     assert exc.error_code == code
@@ -159,7 +151,6 @@ def test_suggestion_templates_are_renderable() -> None:
 def test_suggestion_template_keys_are_declared_payload_keys(
     cls: type[EmuctlError], kwargs: dict[str, Any], code: str
 ) -> None:
-    """Every {key} in a class suggestion template must be a declared payload key."""
     template_keys = {
         field.split("!")[0].split(":")[0].split(".")[0].split("[")[0]
         for _, field, _, _ in Formatter().parse(cls.suggestion)
@@ -194,9 +185,7 @@ def test_pickle_across_real_process_boundary() -> None:
         "output_reason='exit', stderr_excerpt='boom', detail='x'); "
         "sys.stdout.buffer.write(base64.b64encode(pickle.dumps(exc)))"
     )
-    proc = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, check=True, timeout=60
-    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, check=True, timeout=60)
     import pickle as _pickle
 
     clone = _pickle.loads(base64.b64decode(proc.stdout))  # noqa: S301 - child sent our own bytes

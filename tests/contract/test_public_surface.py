@@ -1,10 +1,3 @@
-"""§7 conformance (public surface, §1/§3/§4/§5/§6): the package-level export
-list, import silence (no backend modules at `import emuctl`, adapters load
-only when connect()/discover() touch the registry), construction-time typed
-refusals through the package surface, the stale-identity §3 behavior on ops,
-the multi-instance concurrency promise, and the enumeration/deferred-surface
-boundaries."""
-
 from __future__ import annotations
 
 import asyncio
@@ -67,6 +60,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         # Error taxonomy (§2).
         "EmuctlError",
         "InvalidArgumentError",
+        "InstanceNotFoundError",
         "InvalidSerialError",
         "ExtrasMissingError",
         "ExecutableNotFoundError",
@@ -75,7 +69,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "OperationTimeoutError",
         "VendorCommandError",
         "DeviceStateError",
-        "InstanceNotFoundError",
         "FeatureNotSupportedError",
         "BackendNotAvailableError",
         "BackendNotFoundError",
@@ -101,14 +94,11 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "AsyncEmulatorController",
         "AdbController",
         # Config models + precedence + gate (§4).
-        "RendererMode",
         "DisplayConfig",
-        "ResourceConfig",
         "AdbConfig",
-        "LogConfig",
         "EmuctlConfig",
-        "CreateSpec",
         "ConfigSpec",
+        "CreateSpec",
         "ConfigWarning",
         "ResolvedConfig",
         "SCHEMA_VERSION",
@@ -139,8 +129,6 @@ FORBIDDEN_EXPORTS: tuple[str, ...] = (
 
 @pytest.fixture(autouse=True)
 def _evict_backend_modules() -> Iterator[None]:
-    """Leave no `emuctl.backends*` trace: package-surface tests import the
-    registry at runtime and predecessor tests own the no-leak invariant."""
     before = set(sys.modules)
     yield
     for name in [n for n in sys.modules if n.startswith("emuctl.backends")]:
@@ -168,8 +156,6 @@ def test_every_export_is_freshly_importable(name: str) -> None:
 
 
 def test_registry_machinery_is_not_public() -> None:
-    """discover() is the ONLY enumeration path (§1 invariant 11, §3 Boundary):
-    registry/selection functions never leak onto the package."""
     for name in FORBIDDEN_EXPORTS:
         assert not hasattr(emuctl, name), name
         assert name not in emuctl.__all__, name
@@ -183,9 +169,6 @@ def test_multi_instance_promise_wording_is_pinned() -> None:
 
 
 def test_import_pulls_no_backends_then_connect_loads_adapters() -> None:
-    """Fresh interpreter: `import emuctl` imports ZERO emuctl.backends* modules
-    (and prints nothing); calling connect() resolves the registry and imports
-    the adapter lazily — and nothing else."""
     script = textwrap.dedent(
         """
         import asyncio, sys
@@ -203,9 +186,7 @@ def test_import_pulls_no_backends_then_connect_loads_adapters() -> None:
         print("CONNECTED")
         """
     )
-    proc = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, check=False
-    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stderr
     # No stdout, no stderr, no trace: the package import + connect are silent.
     assert proc.stdout.splitlines() == ["CLEAN", "CONNECTED"]
@@ -228,9 +209,6 @@ def test_import_pulls_no_backends_then_connect_loads_adapters() -> None:
     ],
 )
 def test_connect_refusals_raise_at_construction(target: Any, exception: type[Exception]) -> None:
-    """Selection refusals raise HERE, at construction (§3/§5) — canonical
-    targets only, no deferred first-call I/O failure, no shape inference.
-    Every refusal fires before load_adapter, so no adapter module appears."""
     before = sorted(m for m in sys.modules if m.startswith("emuctl.backends."))
     with pytest.raises(exception):
         asyncio.run(emuctl.connect(target))
@@ -242,8 +220,6 @@ def test_connect_refusals_raise_at_construction(target: Any, exception: type[Exc
 
 
 def test_removed_backend_refusal_imports_nothing() -> None:
-    """Pinned BackendId values without a v0.1 row fail cleanly before any
-    adapter import (no memu/bluestacks module exists in this release)."""
     before = sorted(m for m in sys.modules if m.startswith("emuctl.backends."))
     with pytest.raises(BackendNotAvailableError) as excinfo:
         asyncio.run(emuctl.connect("memu:pyclashbot-136"))
@@ -256,9 +232,6 @@ def test_removed_backend_refusal_imports_nothing() -> None:
 
 
 class _IoFreeDummy(AsyncEmulatorController):
-    """Port subclass binding the resolved config; construction records the
-    binding and never touches the transport."""
-
     constructed: list[str] = []
 
     def __init__(self, ref: InstanceRef, config: EmuctlConfig | None = None) -> None:
@@ -277,9 +250,6 @@ def _install_fake_module(
     *,
     instances: tuple[Any, ...] = (),
 ) -> None:
-    """Shadow an adapter module with a BackendDiscovery-shaped fake (same seam
-    as test_discovery.py: a fake module in sys.modules satisfies load_adapter's
-    import_module lookup)."""
     module = types.ModuleType(module_name)
     module.__dict__[attr] = _IoFreeDummy
 
@@ -310,9 +280,6 @@ def _adb_record(key: str) -> Any:
 def test_connect_binds_identity_and_touches_no_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Construction is cheap (§3/§5): ref + config bound, zero transport I/O,
-    and two connects for the same target are INDEPENDENT controllers (§3's
-    multi-instance promise — no shared state, no registry, no locks)."""
     _install_fake_module(monkeypatch, "emuctl.backends.adb", "AdbController")
     cfg = EmuctlConfig()
     _IoFreeDummy.constructed = []
@@ -329,9 +296,6 @@ def test_connect_binds_identity_and_touches_no_io(
 def test_connect_config_gate_refuses_at_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """§4's config↔capability gate runs AT CONSTRUCTION through the package
-    surface: plain ADB never declares CONFIGURE, so [display] is a typed
-    FeatureNotSupportedError before any I/O — never silent-ignore."""
     _install_fake_module(monkeypatch, "emuctl.backends.adb", "AdbController")
     gated = EmuctlConfig(display=DisplayConfig(width=800, height=600))
     with pytest.raises(FeatureNotSupportedError) as excinfo:
@@ -340,9 +304,6 @@ def test_connect_config_gate_refuses_at_construction(
 
 
 def test_discover_rows_via_package_surface(monkeypatch: pytest.MonkeyPatch) -> None:
-    """discover() through the package enumerates the scripted fake's rows,
-    isolated per backend, with the JSON-safe projection intact (§5's CLI
-    shape is fed from this surface)."""
     from emuctl._identification import InstanceRecord
 
     rows = tuple(

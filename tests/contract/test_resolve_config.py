@@ -1,5 +1,3 @@
-"""§7 conformance (config precedence, §4): pure fold, layers, warnings, versions."""
-
 from pathlib import Path
 
 import pytest
@@ -9,7 +7,6 @@ from emuctl.config import (
     ResolvedConfig,
     resolve_config,
 )
-from emuctl.config.model import RendererMode
 from emuctl.errors import ConfigError, ConfigValidationError, InvalidArgumentError
 
 
@@ -24,12 +21,8 @@ def test_defaults_when_no_layers(tmp_path: Path) -> None:
 
 
 def test_purity_equal_inputs_equal_results(tmp_path: Path) -> None:
-    first = resolve_config(
-        flags={"display.width": 800}, env={"EMUCTL_LOG_LEVEL": "info"}, cwd=tmp_path
-    )
-    second = resolve_config(
-        flags={"display.width": 800}, env={"EMUCTL_LOG_LEVEL": "info"}, cwd=tmp_path
-    )
+    first = resolve_config(flags={"display.width": 800}, env={"EMUCTL_LOG_LEVEL": "info"}, cwd=tmp_path)
+    second = resolve_config(flags={"display.width": 800}, env={"EMUCTL_LOG_LEVEL": "info"}, cwd=tmp_path)
     assert first == second
     assert first is not second
 
@@ -44,17 +37,11 @@ def test_env_flat_leaf_grammar(tmp_path: Path) -> None:
     resolved = resolve_config(
         env={
             "EMUCTL_DISPLAY_WIDTH": "800",
-            "EMUCTL_DISPLAY_RENDERER": "VULKAN",
-            "EMUCTL_RESOURCES_CPUS": "4",
-            "EMUCTL_LOG_LEVEL": "debug",
             "PATH": "/usr/bin",
         },
         cwd=tmp_path,
     )
     assert resolved.config.display.width == 800
-    assert resolved.config.display.renderer is RendererMode.VULKAN
-    assert resolved.config.resources.cpus == 4
-    assert resolved.config.log.level == "debug"
 
 
 def test_removed_vendor_leaf_is_unknown_and_warns(tmp_path: Path) -> None:
@@ -89,9 +76,7 @@ def test_env_bad_value_is_strict_error(tmp_path: Path) -> None:
 
 
 def test_project_file_authoritative(tmp_path: Path) -> None:
-    (tmp_path / "emuctl.toml").write_text(
-        "[display]\nwidth = 800\nheight = 600\n", encoding="utf-8"
-    )
+    (tmp_path / "emuctl.toml").write_text("[display]\nwidth = 800\nheight = 600\n", encoding="utf-8")
     resolved = resolve_config(env={}, cwd=tmp_path)
     assert resolved.config.display.width == 800
     assert resolved.config.display.height == 600
@@ -116,17 +101,13 @@ def test_outer_project_used_when_inner_has_none(tmp_path: Path) -> None:
 
 def test_emuctl_toml_wins_over_same_dir_tool_table(tmp_path: Path) -> None:
     (tmp_path / "emuctl.toml").write_text("[display]\nwidth = 800\n", encoding="utf-8")
-    (tmp_path / "pyproject.toml").write_text(
-        "[tool.emuctl.display]\nwidth = 1024\n", encoding="utf-8"
-    )
+    (tmp_path / "pyproject.toml").write_text("[tool.emuctl.display]\nwidth = 1024\n", encoding="utf-8")
     resolved = resolve_config(env={}, cwd=tmp_path)
     assert resolved.config.display.width == 800
 
 
 def test_tool_table_used_when_no_emuctl_toml(tmp_path: Path) -> None:
-    (tmp_path / "pyproject.toml").write_text(
-        "[tool.emuctl.display]\nwidth = 1024\n", encoding="utf-8"
-    )
+    (tmp_path / "pyproject.toml").write_text("[tool.emuctl.display]\nwidth = 1024\n", encoding="utf-8")
     resolved = resolve_config(env={}, cwd=tmp_path)
     assert resolved.config.display.width == 1024
 
@@ -143,28 +124,16 @@ def test_pyproject_without_tool_table_is_skipped(tmp_path: Path) -> None:
 def test_precedence_flags_over_env_over_project_over_user(tmp_path: Path) -> None:
     home = tmp_path / "home"
     (home / ".config" / "emuctl").mkdir(parents=True)
-    (home / ".config" / "emuctl" / "emuctl.toml").write_text(
-        "[display]\nwidth = 100\n", encoding="utf-8"
-    )
+    (home / ".config" / "emuctl" / "emuctl.toml").write_text("[display]\nwidth = 100\n", encoding="utf-8")
     proj = tmp_path / "proj"
     proj.mkdir()
     (proj / "emuctl.toml").write_text("[display]\nwidth = 200\n", encoding="utf-8")
     env = {"HOME": str(home), "EMUCTL_DISPLAY_WIDTH": "300"}
 
     assert resolve_config(env=env, cwd=proj).config.display.width == 300
-    assert (
-        resolve_config(flags={"display.width": 400}, env=env, cwd=proj).config.display.width == 400
-    )
+    assert resolve_config(flags={"display.width": 400}, env=env, cwd=proj).config.display.width == 400
     assert resolve_config(env={"HOME": str(home)}, cwd=proj).config.display.width == 200
     assert resolve_config(env={"HOME": str(home)}, cwd=tmp_path).config.display.width == 100
-
-
-def test_user_xdg_config_home_honored(tmp_path: Path) -> None:
-    xdg = tmp_path / "xdg"
-    (xdg / "emuctl").mkdir(parents=True)
-    (xdg / "emuctl" / "emuctl.toml").write_text("[log]\nlevel = 'debug'\n", encoding="utf-8")
-    resolved = resolve_config(env={"XDG_CONFIG_HOME": str(xdg)}, cwd=tmp_path)
-    assert resolved.config.log.level == "debug"
 
 
 def test_unknown_toml_key_warns_with_hint_and_is_ignored(tmp_path: Path) -> None:
@@ -198,9 +167,7 @@ def test_schema_version_absent_minor_and_major(tmp_path: Path) -> None:
     (tmp_path / "emuctl.toml").write_text("[display]\nwidth = 1\n", encoding="utf-8")
     assert resolve_config(env={}, cwd=tmp_path).warnings == ()
 
-    (tmp_path / "emuctl.toml").write_text(
-        "schema_version = 1.1\n[display]\nwidth = 1\n", encoding="utf-8"
-    )
+    (tmp_path / "emuctl.toml").write_text("schema_version = 1.1\n[display]\nwidth = 1\n", encoding="utf-8")
     assert resolve_config(env={}, cwd=tmp_path).config.display.width == 1
 
     (tmp_path / "emuctl.toml").write_text("schema_version = 2\n", encoding="utf-8")
@@ -230,9 +197,7 @@ def test_config_file_replaces_project_and_user(tmp_path: Path) -> None:
     other.write_text("[display]\nwidth = 320\n", encoding="utf-8")
     home = tmp_path / "home"
     (home / ".config" / "emuctl").mkdir(parents=True)
-    (home / ".config" / "emuctl" / "emuctl.toml").write_text(
-        "[display]\nwidth = 100\n", encoding="utf-8"
-    )
+    (home / ".config" / "emuctl" / "emuctl.toml").write_text("[display]\nwidth = 100\n", encoding="utf-8")
     resolved = resolve_config(env={"HOME": str(home)}, cwd=tmp_path, config_file=other)
     assert resolved.config.display.width == 320
 

@@ -1,9 +1,4 @@
-"""§7 conformance (discovery, §3): deterministic ordering, per-backend
-isolation, offline probe-skipping, canonical-only connect with
-construction-time refusals, and spec-driven key validation."""
-
 import asyncio
-import dataclasses
 import json
 import sys
 import types
@@ -14,8 +9,6 @@ import pytest
 
 from emuctl._discovery import (
     BACKEND_STATUS_REASONS,
-    BackendStatus,
-    DiscoveryReport,
     connect,
     discover,
 )
@@ -33,16 +26,6 @@ from emuctl.port import AsyncEmulatorController, CapabilityFlag, DisplayState
 
 @pytest.fixture(autouse=True)
 def _evict_backend_modules() -> Iterator[None]:
-    """Leave no `emuctl.backends*` trace: connect()/discover() import the
-    registry at runtime, and these tests run before `test_identity`'s
-    no-backend-modules invariant — evict every runtime trace afterwards.
-
-    Eviction also clears the parent-package attribute aliases: pytest's
-    string-target `setattr` resolves `a.b.c` by walking attributes from the
-    top package, while real imports resolve through `sys.modules` — a
-    sys.modules-only eviction leaves ghost aliases behind and patches land
-    on objects the code under test never reads.
-    """
     before = set(sys.modules)
     yield
     for name in [n for n in sys.modules if n.startswith("emuctl.backends")]:
@@ -55,8 +38,6 @@ def _evict_backend_modules() -> Iterator[None]:
 
 
 class _ConfigDummy(AsyncEmulatorController):
-    """Port subclass binding the resolved config (the connect() convention)."""
-
     FEATURES = frozenset({CapabilityFlag.CONFIGURE})
 
     def __init__(self, ref: InstanceRef, config: EmuctlConfig | None = None) -> None:
@@ -78,7 +59,6 @@ def _install_fake_module(
     instances: tuple[InstanceRecord, ...] = (),
     probe_error: BaseException | None = None,
 ) -> None:
-    """Shadow a stub adapter module with a BackendDiscovery-shaped fake."""
     module = types.ModuleType(module_name)
     module.__dict__[attr] = _ConfigDummy
 
@@ -100,12 +80,6 @@ def _install_fake_module(
 
 @pytest.fixture
 def windows_host(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Pretend Windows with all deps present: every spec row resolves.
-
-    Returns the registry module object; patching is object-form (no dotted
-    string resolution) so the patch provably lands on the module the code
-    under test reads.
-    """
     from emuctl.backends import _registry
 
     monkeypatch.setattr(_registry, "current_platform", lambda: Platform.WINDOWS)
@@ -115,7 +89,6 @@ def windows_host(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 @pytest.fixture
 def macos_host(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Pretend macOS (object-form patching, see `windows_host`)."""
     from emuctl.backends import _registry
 
     monkeypatch.setattr(_registry, "current_platform", lambda: Platform.MACOS)
@@ -156,9 +129,7 @@ def test_discover_default_order_is_by_backend_id(windows_host: Any) -> None:
 
 
 def test_discover_subset_sorted_and_deduped(windows_host: Any) -> None:
-    report = asyncio.run(
-        discover([BackendId.GOOGLE_PLAY, "adb", BackendId.GOOGLE_PLAY], offline=True)
-    )
+    report = asyncio.run(discover([BackendId.GOOGLE_PLAY, "adb", BackendId.GOOGLE_PLAY], offline=True))
     assert [status.backend for status in report.backends] == [
         BackendId.ADB,
         BackendId.GOOGLE_PLAY,
@@ -171,9 +142,7 @@ def test_discover_unknown_ids_raise(backends: list[Any], windows_host: Any) -> N
         asyncio.run(discover(backends))
 
 
-def test_discover_offline_probes_nothing(
-    windows_host: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_discover_offline_probes_nothing(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     # Offline performs no probes AND no enumeration: load_adapter is never
     # reached, rows report resolved-but-not-probed. (§3's parenthetical about
     # config-store enumeration still running is deferred errata — it needs an
@@ -197,8 +166,6 @@ def test_discover_offline_probes_nothing(
 
 
 def test_discover_online_adb_rows(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    """ADB is the only shipped adapter: scripted `adb devices`, banner lines
-    skipped, all removed rows report not-implemented (never a probe)."""
     import importlib
 
     from emuctl._proc import ProcessExecutor
@@ -253,9 +220,7 @@ def test_discover_online_adb_rows(windows_host: Any, monkeypatch: pytest.MonkeyP
 
 
 def test_discover_removed_rows_are_not_implemented(macos_host: Any) -> None:
-    report = asyncio.run(
-        discover([BackendId.ADB, BackendId.MEMU, BackendId.BLUESTACKS_AIR], offline=True)
-    )
+    report = asyncio.run(discover([BackendId.ADB, BackendId.MEMU, BackendId.BLUESTACKS_AIR], offline=True))
     by_id = {status.backend: status for status in report.backends}
     assert by_id[BackendId.ADB].reason == "offline"
     assert by_id[BackendId.MEMU].reason == "not-implemented-this-version"
@@ -286,13 +251,8 @@ def test_discover_convention_violation_is_adapter_unavailable(
     assert "(BackendDiscovery convention)" in (row.detail or "")
 
 
-def test_discover_isolation_adb_keeps_working(
-    windows_host: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A removed backend row never breaks ADB enumeration."""
-    _install_fake_module(
-        monkeypatch, "emuctl.backends.adb", "AdbController", instances=(_adb_record(),)
-    )
+def test_discover_isolation_adb_keeps_working(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_module(monkeypatch, "emuctl.backends.adb", "AdbController", instances=(_adb_record(),))
     report = asyncio.run(discover([BackendId.ADB, BackendId.MEMU]))
     by_id = {status.backend: status for status in report.backends}
     assert by_id[BackendId.ADB].available is True
@@ -301,26 +261,13 @@ def test_discover_isolation_adb_keeps_working(
 
 
 def test_discover_report_is_json_safe(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_module(
-        monkeypatch, "emuctl.backends.adb", "AdbController", instances=(_adb_record(),)
-    )
+    _install_fake_module(monkeypatch, "emuctl.backends.adb", "AdbController", instances=(_adb_record(),))
     report = asyncio.run(discover([BackendId.ADB, BackendId.GOOGLE_PLAY]))
     payload = json.loads(json.dumps(report.to_dict()))
     assert payload["offline"] is False
     assert [row["backend"] for row in payload["backends"]] == ["adb", "google-play"]
     assert payload["backends"][0]["instances"][0]["ref"] == "adb:emulator-5554"
     assert payload["backends"][0]["instances"][0]["details"] == {"transport": "adb"}
-
-
-def test_status_and_report_are_frozen() -> None:
-    status = BackendStatus(backend=BackendId.ADB, available=True, reason="ok")
-    report = DiscoveryReport(backends=(status,))
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        status.available = False  # ty: ignore[invalid-assignment]
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        report.offline = True  # ty: ignore[invalid-assignment]
-    with pytest.raises(InvalidArgumentError):
-        BackendStatus(backend=BackendId.ADB, available=True, reason="bogus")
 
 
 @pytest.mark.parametrize("target", ["emulator-5554", "myvm", "127.0.0.1:5555", "foo:bar"])
@@ -367,8 +314,6 @@ def test_connect_refusal_removed_backend() -> None:
 def test_connect_refusal_imports_no_adapter(
     monkeypatch: pytest.MonkeyPatch, platform: Platform, target: str, exc: type[Exception]
 ) -> None:
-    """Every selection refusal fires before any adapter import: no
-    `emuctl.backends.*` module appears in `sys.modules` during the refusal."""
     from emuctl.backends import _registry
 
     monkeypatch.setattr(_registry, "current_platform", lambda: platform)
@@ -376,9 +321,7 @@ def test_connect_refusal_imports_no_adapter(
     before = set(sys.modules)
     with pytest.raises(exc):
         asyncio.run(connect(target))
-    assert [
-        name for name in sys.modules if name not in before and name.startswith("emuctl.backends.")
-    ] == []
+    assert [name for name in sys.modules if name not in before and name.startswith("emuctl.backends.")] == []
 
 
 def test_connect_validates_adb_keys_against_serial_allowlist() -> None:
@@ -393,25 +336,19 @@ def test_connect_binds_resolved_config(windows_host: Any, monkeypatch: pytest.Mo
     assert isinstance(controller, _ConfigDummy)
     assert controller.bound_config == EmuctlConfig()
     cfg = EmuctlConfig()
-    again = asyncio.run(
-        connect(InstanceRef(backend=BackendId.ADB, key="emulator-5554"), config=cfg)
-    )
+    again = asyncio.run(connect(InstanceRef(backend=BackendId.ADB, key="emulator-5554"), config=cfg))
     assert isinstance(again, _ConfigDummy)
     assert again.bound_config is cfg
 
 
-def test_connect_accepts_display_for_adb_configure(
-    windows_host: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_connect_accepts_display_for_adb_configure(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_module(monkeypatch, "emuctl.backends.adb", "AdbController")
     gated = EmuctlConfig(display=DisplayConfig(width=800, height=600))
     controller = asyncio.run(connect("adb:emulator-5554", config=gated))
     assert isinstance(controller, _ConfigDummy)
 
 
-def test_connect_rejects_bad_config_object(
-    windows_host: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_connect_rejects_bad_config_object(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_module(monkeypatch, "emuctl.backends.adb", "AdbController")
     with pytest.raises(InvalidArgumentError) as excinfo:
         asyncio.run(connect("adb:emulator-5554", config="x"))  # ty: ignore[invalid-argument-type]

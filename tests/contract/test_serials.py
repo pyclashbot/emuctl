@@ -1,5 +1,3 @@
-"""§7 conformance (serial security control, §3): allowlist validation + server-verb list."""
-
 from typing import Any
 
 import pytest

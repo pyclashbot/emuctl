@@ -1,5 +1,3 @@
-"""§7.2/7.3 conformance: bounded timeout, cancel abandonment, scoped cleanup (§2/§6)."""
-
 import asyncio
 import logging
 import os
@@ -19,8 +17,6 @@ from emuctl.timing import DEFAULT
 
 
 class FakeProcess:
-    """Transcript-replaying child: scripted outputs, optional hang/stubbornness."""
-
     def __init__(
         self,
         stdout: bytes = b"",
@@ -74,8 +70,6 @@ class FakeProcess:
 
 
 class Harness:
-    """Records argv seen by the seam and serves a fixed fake process."""
-
     def __init__(self, proc: FakeProcess) -> None:
         self.proc = proc
         self.seen: list[list[str]] = []
@@ -89,9 +83,7 @@ def test_argv_passed_verbatim_and_result_returned() -> None:
     proc = FakeProcess(stdout=b"out", stderr=b"err", returncode=0)
     harness = Harness(proc)
     executor = ProcessExecutor(_spawn=harness.spawn)
-    result = asyncio.run(
-        executor.run(["adb", "-s", "emulator-5554", "shell", "echo hi"], operation="probe")
-    )
+    result = asyncio.run(executor.run(["adb", "-s", "emulator-5554", "shell", "echo hi"], operation="probe"))
     assert harness.seen == [["adb", "-s", "emulator-5554", "shell", "echo hi"]]
     assert result == ProcessResult(stdout=b"out", stderr=b"err", returncode=0)
 
@@ -438,10 +430,6 @@ def test_spawn_detached_argv_validation_matches_run() -> None:
 
 
 def test_spawn_detached_is_untracked_and_never_swept() -> None:
-    """The returned handle is deliberately untracked: ``close()`` must NOT
-    abandon it (terminate/kill stay untouched) — and it must never be
-    awaited (a ``communicate()`` on this fake would hang for 30 s; the bottle
-    proves no drain happened)."""
     proc = FakeProcess(hang=True)
     harness = Harness(proc)
     executor = ProcessExecutor(_spawn=harness.spawn)
@@ -461,8 +449,6 @@ def test_spawn_detached_is_untracked_and_never_swept() -> None:
 def test_spawn_detached_default_spawner_discards_outputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Production detached shape: stdout/stderr DEVNULL (a GUI child can
-    never deadlock on un-drained pipes), argv verbatim, no-window flags."""
     captured: dict[str, object] = {}
 
     async def fake_create(*argv: str, **kwargs: object) -> FakeProcess:

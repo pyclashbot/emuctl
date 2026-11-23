@@ -1,6 +1,3 @@
-"""§4 — Config package: model + resolve_config precedence
-(flags > env > project > user > defaults)."""
-
 from __future__ import annotations
 
 import difflib
@@ -17,52 +14,35 @@ from emuctl.config.model import (
     CreateSpec,
     DisplayConfig,
     EmuctlConfig,
-    LogConfig,
-    RendererMode,
-    ResourceConfig,
 )
 from emuctl.errors import ConfigError, ConfigValidationError, InvalidArgumentError
 
 __all__ = [
-    "RendererMode",
     "DisplayConfig",
-    "ResourceConfig",
     "AdbConfig",
-    "LogConfig",
     "EmuctlConfig",
-    "CreateSpec",
     "ConfigSpec",
+    "CreateSpec",
     "ConfigWarning",
     "ResolvedConfig",
     "SCHEMA_VERSION",
     "resolve_config",
 ]
 
-#: Installed config schema major. Files may omit `schema_version` (⇒ 1) or
-#: carry a 1.x minor (accepted); any other major is a `bad_version` refusal.
 SCHEMA_VERSION: Final[int] = 1
 
-_LeafKind = Literal["int", "bool", "str", "renderer", "level"]
+_LeafKind = Literal["int", "bool", "str", "level"]
 
-#: The canonical leaf vocabulary: every settable dotted path and its kind.
 _LEAVES: Final[dict[str, _LeafKind]] = {
     "display.width": "int",
     "display.height": "int",
     "display.dpi": "int",
-    "display.fps": "int",
-    "display.renderer": "renderer",
-    "resources.cpus": "int",
-    "resources.memory_mb": "int",
-    "resources.cpu_cap_pct": "int",
     "adb.path": "str",
     "adb.host": "str",
     "adb.port": "int",
-    "log.level": "level",
-    "log.file": "str",
 }
 
-#: Top-level sections (own a TOML table each).
-_SECTIONS: Final[frozenset[str]] = frozenset({"display", "resources", "adb", "log"})
+_SECTIONS: Final[frozenset[str]] = frozenset({"display", "adb"})
 
 _ENV_PREFIX: Final[str] = "EMUCTL_"
 _TRUE_TOKENS: Final[frozenset[str]] = frozenset({"true", "1"})
@@ -70,9 +50,6 @@ _FALSE_TOKENS: Final[frozenset[str]] = frozenset({"false", "0"})
 
 
 def _shown(value: object) -> str | int | float | bool | None:
-    """Project an arbitrary TOML value into the ConfigError value payload."""
-    if isinstance(value, RendererMode):
-        return value.value
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return None
@@ -80,12 +57,6 @@ def _shown(value: object) -> str | int | float | bool | None:
 
 @dataclass(frozen=True, slots=True)
 class ConfigWarning:
-    """An unknown config key: warn + ignore, with a nearest-key hint.
-
-    Records only — ``resolve_config`` is pure and never calls
-    ``warnings.warn``; the CLI surface renders these for the user.
-    """
-
     layer: str
     path: str
     nearest: str | None = None
@@ -99,8 +70,6 @@ class ConfigWarning:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedConfig:
-    """The precedence-fold result: effective config + collected warnings."""
-
     config: EmuctlConfig
     warnings: tuple[ConfigWarning, ...] = ()
 
@@ -113,18 +82,11 @@ class ResolvedConfig:
 
 
 def _nearest_leaf(path: str) -> str | None:
-    """Closest known canonical leaf (the contract's hint mechanism)."""
     matches = difflib.get_close_matches(path, sorted(_LEAVES), n=1, cutoff=0.6)
     return matches[0] if matches else None
 
 
-def _coerce_leaf(leaf: str, value: object, *, layer: str) -> str | int | bool | RendererMode | None:
-    """Strict typed parse of one leaf value.
-
-    ``env`` values arrive as strings and are parsed by leaf kind; TOML/flags
-    values must already be native (a string where an int belongs is a strict
-    error, not a coercion). Range checks stay in the model ``__post_init__``s.
-    """
+def _coerce_leaf(leaf: str, value: object, *, layer: str) -> str | int | bool | None:
     kind = _LEAVES[leaf]
 
     def fail(expected: str) -> ConfigValidationError:
@@ -132,15 +94,6 @@ def _coerce_leaf(leaf: str, value: object, *, layer: str) -> str | int | bool | 
 
     if value is None:
         return None
-    if kind == "renderer":
-        if isinstance(value, RendererMode):
-            return value
-        if isinstance(value, str):
-            try:
-                return RendererMode(value.strip().lower())
-            except ValueError:
-                raise fail("one of auto, opengl, directx, vulkan") from None
-        raise fail("one of auto, opengl, directx, vulkan")
     if kind == "level":
         if isinstance(value, str) and value.strip():
             return value
@@ -159,7 +112,6 @@ def _coerce_leaf(leaf: str, value: object, *, layer: str) -> str | int | bool | 
             if token in _FALSE_TOKENS:
                 return False
         raise fail("a bool (true/false)")
-    # kind == "int"
     if isinstance(value, bool):
         raise fail("an int")
     if isinstance(value, int):
@@ -173,18 +125,14 @@ def _coerce_leaf(leaf: str, value: object, *, layer: str) -> str | int | bool | 
 
 
 class _Collector:
-    """Leaf-first fold state: winning value + winning layer per leaf, plus warnings."""
-
     def __init__(self) -> None:
-        self.leaves: dict[str, str | int | bool | RendererMode | None] = {}
+        self.leaves: dict[str, str | int | bool | None] = {}
         self.layers: dict[str, str] = {}
         self.warnings: list[ConfigWarning] = []
 
     def set_leaf(self, leaf: str, value: object, layer: str) -> None:
         coerced = _coerce_leaf(leaf, value, layer=layer)
         if coerced is None:
-            # Explicit null resets the leaf to its default (None = leave-as-is
-            # everywhere in the model), so drop any weaker-layer value too.
             self.leaves.pop(leaf, None)
             self.layers.pop(leaf, None)
         else:
@@ -204,7 +152,6 @@ class _Collector:
 
 
 def _apply_env(env: Mapping[str, str], out: _Collector) -> None:
-    """Flat leaf-only grammar: EMUCTL_DISPLAY_WIDTH, EMUCTL_RESOURCES_CPUS, …"""
     by_flat = {leaf.replace(".", "_"): leaf for leaf in _LEAVES}
     for name in sorted(env):
         if not name.startswith(_ENV_PREFIX):
@@ -221,11 +168,8 @@ def _apply_env(env: Mapping[str, str], out: _Collector) -> None:
 
 
 def _check_schema_version(value: object, *, layer: str, path: str) -> None:
-    """Absent ⇒ 1 (handled by the caller); 1.x accepted; other majors refused."""
     if isinstance(value, bool):
-        raise ConfigValidationError(
-            layer=layer, path="schema_version", value=value, expected="schema major 1"
-        )
+        raise ConfigValidationError(layer=layer, path="schema_version", value=value, expected="schema major 1")
     major: int | None = None
     if isinstance(value, int):
         major = value
@@ -255,7 +199,6 @@ def _check_schema_version(value: object, *, layer: str, path: str) -> None:
 
 
 def _walk_mapping(out: _Collector, data: Mapping[str, object], *, layer: str, prefix: str) -> None:
-    """Fold one TOML table: known leaves set, unknown keys warn+ignore."""
     for key in sorted(data):
         value = data[key]
         path = f"{prefix}.{key}" if prefix else str(key)
@@ -263,9 +206,7 @@ def _walk_mapping(out: _Collector, data: Mapping[str, object], *, layer: str, pr
             _check_schema_version(value, layer=layer, path=path)
             continue
         if prefix == "" and key in _SECTIONS and not isinstance(value, Mapping):
-            raise ConfigValidationError(
-                layer=layer, path=path, value=_shown(value), expected="a table"
-            )
+            raise ConfigValidationError(layer=layer, path=path, value=_shown(value), expected="a table")
         if isinstance(value, Mapping):
             _walk_mapping(out, value, layer=layer, prefix=path)
         elif path in _LEAVES:
@@ -281,13 +222,9 @@ def _read_toml_file(path: Path, *, layer: str) -> Mapping[str, object]:
     except FileNotFoundError:
         raise ConfigError(layer=layer, path=str(path), reason="unreadable", value=None) from None
     except OSError as exc:
-        raise ConfigError(
-            layer=layer, path=str(path), reason="unreadable", value=str(exc)
-        ) from None
+        raise ConfigError(layer=layer, path=str(path), reason="unreadable", value=str(exc)) from None
     except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(
-            layer=layer, path=str(path), reason="unreadable", value=str(exc)
-        ) from None
+        raise ConfigError(layer=layer, path=str(path), reason="unreadable", value=str(exc)) from None
 
 
 def _apply_project_file(path: Path, data: Mapping[str, object], out: _Collector) -> None:
@@ -303,14 +240,6 @@ def _apply_project_file(path: Path, data: Mapping[str, object], out: _Collector)
 
 
 def _find_project_file(cwd: Path) -> tuple[Path, Mapping[str, object]] | None:
-    """Walk cwd → parents; per dir `emuctl.toml` wins over `[tool.emuctl]`.
-
-    The FIRST dir containing either is authoritative; outer dirs are ignored.
-    A present-but-broken file (unreadable or unparseable) raises ConfigError
-    loudly — the walk never masks a user's broken authoritative file. Only
-    absence (layer not present) or a VALID pyproject.toml lacking the
-    `[tool.emuctl]` table is skipped.
-    """
     for directory in (cwd, *cwd.parents):
         candidate = directory / "emuctl.toml"
         if candidate.is_file():
@@ -326,12 +255,6 @@ def _find_project_file(cwd: Path) -> tuple[Path, Mapping[str, object]] | None:
 
 
 def _user_config_path(env: Mapping[str, str]) -> Path | None:
-    """XDG user file derived from the passed env only (never os.expanduser).
-
-    ``%APPDATA%\\emuctl`` → ``$XDG_CONFIG_HOME/emuctl`` → ``$HOME/.config/emuctl``,
-    always ``emuctl.toml``. None when the env names no home (real processes
-    always set one of these); the user layer is then simply absent.
-    """
     appdata = env.get("APPDATA")
     if appdata:
         return Path(appdata) / "emuctl" / "emuctl.toml"
@@ -345,35 +268,19 @@ def _user_config_path(env: Mapping[str, str]) -> Path | None:
 
 
 def _build_config(out: _Collector) -> EmuctlConfig:
-    """Construct the ROOT object from winning leaves (dataclasses.replace-style fold).
-
-    Range validation lives in the model; a structural failure is remapped to
-    the winning leaf's layer so the error names the file that set it.
-    """
     leaves = out.leaves
     try:
         display = DisplayConfig(
             width=cast("int | None", leaves.get("display.width")),
             height=cast("int | None", leaves.get("display.height")),
             dpi=cast("int | None", leaves.get("display.dpi")),
-            fps=cast("int | None", leaves.get("display.fps")),
-            renderer=cast("RendererMode | str | None", leaves.get("display.renderer")),
-        )
-        resources = ResourceConfig(
-            cpus=cast("int | None", leaves.get("resources.cpus")),
-            memory_mb=cast("int | None", leaves.get("resources.memory_mb")),
-            cpu_cap_pct=cast("int | None", leaves.get("resources.cpu_cap_pct")),
         )
         adb = AdbConfig(
             path=cast("str | None", leaves.get("adb.path")),
             host=cast(str, leaves.get("adb.host", "127.0.0.1")),
             port=cast(int, leaves.get("adb.port", 5037)),
         )
-        log = LogConfig(
-            level=cast(str, leaves.get("log.level", "warning")),
-            file=cast("str | None", leaves.get("log.file")),
-        )
-        return EmuctlConfig(adb=adb, display=display, resources=resources, log=log)
+        return EmuctlConfig(adb=adb, display=display)
     except ConfigValidationError as exc:
         exc.layer = out.layers.get(exc.path, "config")
         raise
@@ -387,14 +294,6 @@ def resolve_config(
     config_file: str | os.PathLike[str] | None = None,
     no_config: bool = False,
 ) -> ResolvedConfig:
-    """Fold flags → env → project → user → defaults into the effective config.
-
-    Pure function of (flags, env, cwd) plus the two flag-only escape hatches:
-    ``config_file`` replaces the project+user layers, ``no_config`` skips
-    both (combining them is caller misuse). File reads happen only at the
-    paths discovered from those inputs; bundled resources are not involved
-    (no ``importlib.resources`` need — no shipped files at v0).
-    """
     if config_file is not None and no_config:
         raise InvalidArgumentError(
             parameter="--config-file",
@@ -413,9 +312,7 @@ def resolve_config(
         else:
             user_path = _user_config_path(environ)
             if user_path is not None and user_path.is_file():
-                _walk_mapping(
-                    out, _read_toml_file(user_path, layer="user"), layer="user", prefix=""
-                )
+                _walk_mapping(out, _read_toml_file(user_path, layer="user"), layer="user", prefix="")
             found = _find_project_file(base)
             if found is not None:
                 _apply_project_file(found[0], found[1], out)

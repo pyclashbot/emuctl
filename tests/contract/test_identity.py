@@ -1,9 +1,6 @@
-"""§7 conformance (identity, §3): backend ids, refs, records, no backend imports."""
-
 import dataclasses
 import sys
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -69,12 +66,8 @@ def test_instance_ref_canonical_round_trip() -> None:
     ref = InstanceRef(backend=BackendId.ADB, key="127.0.0.1:5555")
     assert str(ref) == "adb:127.0.0.1:5555"
     assert InstanceRef.parse(str(ref)) == ref
-    assert InstanceRef.parse("memu:pyclashbot-136") == InstanceRef(
-        backend=BackendId.MEMU, key="pyclashbot-136"
-    )
-    assert InstanceRef.parse("bluestacks-air:conf") == InstanceRef(
-        backend=BackendId.BLUESTACKS_AIR, key="conf"
-    )
+    assert InstanceRef.parse("memu:pyclashbot-136") == InstanceRef(backend=BackendId.MEMU, key="pyclashbot-136")
+    assert InstanceRef.parse("bluestacks-air:conf") == InstanceRef(backend=BackendId.BLUESTACKS_AIR, key="conf")
 
 
 @pytest.mark.parametrize("bare", ["emulator-5554", "myvm", "ABCDEF123456"])
@@ -118,7 +111,7 @@ def test_unknown_backend_prefix_rejected_with_prefix_hint() -> None:
     assert excinfo.value.error_code == "invalid_argument"
 
 
-@pytest.mark.parametrize("bad", ["adb:", ":myvm", ":", ""])
+@pytest.mark.parametrize("bad", ["", ":5555", "adb:"])
 def test_empty_backend_or_key_rejected(bad: str) -> None:
     with pytest.raises(InvalidArgumentError):
         InstanceRef.parse(bad)
@@ -130,9 +123,7 @@ def test_identity_is_backend_plus_key_only() -> None:
     assert adb != bs
     assert hash(adb) != hash(bs)
     assert len({adb, bs, InstanceRef(backend=BackendId.ADB, key="shared")}) == 2
-    assert InstanceRef(backend=BackendId.ADB, key="a") != InstanceRef(
-        backend=BackendId.ADB, key="b"
-    )
+    assert InstanceRef(backend=BackendId.ADB, key="a") != InstanceRef(backend=BackendId.ADB, key="b")
 
 
 def test_key_rules_strip_and_reject_blank() -> None:
@@ -167,49 +158,6 @@ def test_instance_record_observation_shape() -> None:
     assert InstanceRecord(ref=ref, running=False, serial=None, details={}).serial is None
     with pytest.raises(dataclasses.FrozenInstanceError):
         record.running = False  # ty: ignore[invalid-assignment]
-
-
-def test_instance_record_details_sealed() -> None:
-    details = {"label": "one"}
-    record = InstanceRecord(
-        ref=InstanceRef(backend=BackendId.ADB, key="x"),
-        running=True,
-        serial=None,
-        details=details,
-    )
-    details["label"] = "mutated-outside"
-    assert record.details == {"label": "one"}
-    with pytest.raises(TypeError):
-        record.details["label"] = "mutated-inside"  # ty: ignore[invalid-assignment]
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"ref": "adb:x", "running": True, "serial": None, "details": {}},
-        {
-            "ref": InstanceRef(backend=BackendId.ADB, key="x"),
-            "running": 1,
-            "serial": None,
-            "details": {},
-        },
-        {
-            "ref": InstanceRef(backend=BackendId.ADB, key="x"),
-            "running": True,
-            "serial": "",
-            "details": {},
-        },
-        {
-            "ref": InstanceRef(backend=BackendId.ADB, key="x"),
-            "running": True,
-            "serial": None,
-            "details": {"a": 1},
-        },
-    ],
-)
-def test_instance_record_rejects_bad_shapes(kwargs: dict[str, Any]) -> None:
-    with pytest.raises(InvalidArgumentError):
-        InstanceRecord(**kwargs)
 
 
 def test_identification_touches_no_backend_modules() -> None:

@@ -1,5 +1,3 @@
-"""§7 conformance (platform truth, §3): pinned enum + single mapping point."""
-
 import sys
 from pathlib import Path
 
@@ -32,15 +30,11 @@ def test_current_platform_deterministic_and_correct() -> None:
 
 def test_platform_is_defined_once_and_imported_by_identification() -> None:
     definers = [
-        path
-        for path in sorted((SRC).rglob("*.py"))
-        if "class Platform" in path.read_text(encoding="utf-8")
+        path for path in sorted((SRC).rglob("*.py")) if "class Platform" in path.read_text(encoding="utf-8")
     ]
     assert definers == [SRC / "_platforms.py"]
     mappers = [
-        path
-        for path in sorted(SRC.rglob("*.py"))
-        if "def current_platform" in path.read_text(encoding="utf-8")
+        path for path in sorted(SRC.rglob("*.py")) if "def current_platform" in path.read_text(encoding="utf-8")
     ]
     assert mappers == [SRC / "_platforms.py"]
     assert identification.Platform is Platform

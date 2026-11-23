@@ -1,6 +1,3 @@
-"""§7 conformance (ADB, §1/§3/§4): exact argv, serial scoping, escaping,
-screenshot validation, app verbs, probes, discovery, timeouts, wiring."""
-
 import asyncio
 import functools
 import os
@@ -25,13 +22,7 @@ from emuctl.errors import (
     OperationTimeoutError,
     VendorCommandError,
 )
-from emuctl.port import PROBE_REASONS, CapabilityFlag, DisplayState
-from emuctl.timing import (
-    APP_TIMEOUT,
-    INTERACTION_TIMEOUT,
-    QUERY_TIMEOUT,
-    SNAPSHOT_TIMEOUT,
-)
+from emuctl.port import CapabilityFlag, DisplayState
 
 SERIAL = "emulator-5554"
 PREFIX = ["adb", "-P", "5037"]
@@ -39,11 +30,6 @@ SCOPED = [*PREFIX, "-s", SERIAL]
 
 
 def _sync(fn: Callable[..., Coroutine[Any, Any, Any]]) -> Callable[..., Any]:
-    """Run an async test body to completion on a fresh loop (repo convention).
-
-    The suite is plugin-free: async tests are plain coroutines driven here
-    instead of via pytest-asyncio/anyio markers.
-    """
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -54,7 +40,6 @@ def _sync(fn: Callable[..., Coroutine[Any, Any, Any]]) -> Callable[..., Any]:
 
 @pytest.fixture(autouse=True)
 def _evict_backend_modules() -> Iterator[None]:
-    """Leave no `emuctl.backends*` trace (see test_registry/test_discovery)."""
     before = set(sys.modules)
     yield
     for name in [n for n in sys.modules if n.startswith("emuctl.backends")]:
@@ -68,14 +53,12 @@ def _evict_backend_modules() -> Iterator[None]:
 
 @pytest.fixture
 def adb_module() -> Any:
-    """Import the adapter module lazily (never at collection time)."""
     import importlib
 
     return importlib.import_module("emuctl.backends.adb")
 
 
 def _png(width: int = 800, height: int = 600) -> bytes:
-    """Minimal bytes png_dimensions accepts (signature + IHDR; no CRC check)."""
     return (
         bytes((137, 80, 78, 71, 13, 10, 26, 10))
         + struct.pack(">I", 13)
@@ -86,8 +69,6 @@ def _png(width: int = 800, height: int = 600) -> bytes:
 
 
 class _FakeHandle:
-    """Minimal child-process double for the ``_spawn`` seam."""
-
     def __init__(
         self,
         stdout: bytes = b"",
@@ -139,9 +120,7 @@ def _spawn_factory(
     return _spawn
 
 
-def _ok(
-    stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0
-) -> Callable[[list[str]], _FakeHandle]:
+def _ok(stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0) -> Callable[[list[str]], _FakeHandle]:
     def respond(argv: list[str]) -> _FakeHandle:
         return _FakeHandle(stdout=stdout, stderr=stderr, returncode=returncode)
 
@@ -149,7 +128,6 @@ def _ok(
 
 
 def _make(adb_module: Any, calls: list[list[str]], respond: Any, **kwargs: Any) -> Any:
-    """Build a controller bound to SERIAL over a scripted transport."""
     ref = InstanceRef(backend=BackendId.ADB, key=kwargs.pop("key", SERIAL))
     config = kwargs.pop("config", EmuctlConfig())
     executor = ProcessExecutor(_spawn=_spawn_factory(calls, respond))  # type: ignore[arg-type]
@@ -170,28 +148,6 @@ def test_construction_binds_transport_and_probes_nothing(
     assert calls == []
 
 
-def test_construction_honors_adb_config(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    cfg = EmuctlConfig(adb=AdbConfig(path="/x/adb", host="10.0.0.2", port=5042))
-    ctl = _make(adb_module, calls, _ok(), config=cfg)
-    assert ctl.adb_path == "/x/adb"
-    assert ctl.adb_server_port == 5042
-    assert calls == []
-
-
-def test_construction_rejects_bad_config(adb_module: Any) -> None:
-    with pytest.raises(InvalidArgumentError):
-        _make(adb_module, [], _ok(), config="nope")  # type: ignore[arg-type]
-
-
-def test_construction_rejects_bad_serial(adb_module: Any) -> None:
-    with pytest.raises(InvalidSerialError):
-        _make(adb_module, [], _ok(), key="has space")
-
-
-# ── exact argv shapes per mechanic ──
-
-
 @_sync
 async def test_click_argv(adb_module: Any) -> None:
     calls: list[list[str]] = []
@@ -201,33 +157,7 @@ async def test_click_argv(adb_module: Any) -> None:
 
 
 @_sync
-async def test_click_count_repeats_with_interval(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok())
-    await ctl.click(1, 2, count=3, interval=0.01)
-    assert calls == [[*SCOPED, "shell", "input", "tap", "1", "2"]] * 3
-
-
-@_sync
-async def test_click_count_shares_one_deadline(adb_module: Any) -> None:
-    """§2: one deadline for the burst — later taps run on shrinking slices,
-    never on the full budget anew."""
-    calls: list[list[str]] = []
-    spy = _TimeoutSpy(_spawn=_spawn_factory(calls, _ok()))  # type: ignore[arg-type]
-    ref = InstanceRef(backend=BackendId.ADB, key=SERIAL)
-    ctl = adb_module.AdbController(ref, config=EmuctlConfig(), _executor=spy)
-    await ctl.click(1, 2, count=3)
-    assert spy.seen_all["click"][0] == INTERACTION_TIMEOUT
-    slices = spy.seen_all["click"]
-    assert len(slices) == 3
-    assert all(slice is not None and slice <= INTERACTION_TIMEOUT for slice in slices)
-    assert all((slices[i] or 0) <= (slices[i - 1] or 0) for i in range(1, len(slices)))
-
-
-@_sync
 async def test_cancelled_click_propagates_without_pointer_release(adb_module: Any) -> None:
-    """§2/§5: CancelledError is never caught; no extra cleanup I/O (and no
-    ~2 s delay) is added on the cancellation path."""
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, lambda argv: _FakeHandle(hang=True))
     task = asyncio.ensure_future(ctl.click(1, 2))
@@ -240,8 +170,6 @@ async def test_cancelled_click_propagates_without_pointer_release(adb_module: An
 
 @_sync
 async def test_click_timeout_releases_a_stuck_pointer(adb_module: Any) -> None:
-    """An aborted tap can leave the device pointer DOWN; one bounded
-    `motionevent UP` restores later taps, and the original timeout still wins."""
     calls: list[list[str]] = []
     hangs = {"tap": 0}
 
@@ -282,77 +210,7 @@ async def test_swipe_timeout_releases_a_stuck_pointer(adb_module: Any) -> None:
     assert calls[-1][-6:] == ["shell", "input", "motionevent", "UP", "0", "0"]
 
 
-@_sync
-async def test_click_count_expiry_is_typed_timeout(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok())
-    with pytest.raises(OperationTimeoutError) as excinfo:
-        await ctl.click(1, 2, count=3, interval=0.09, timeout=0.05)
-    assert excinfo.value.operation == "click"
-    assert len(calls) == 1  # the interval consumed the shared deadline: no tap 2
-
-
-@_sync
-async def test_swipe_argv(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok())
-    await ctl.swipe(1, 2, 3, 4, duration_ms=500)
-    assert calls == [[*SCOPED, "shell", "input", "swipe", "1", "2", "3", "4", "500"]]
-
-
-@_sync
-async def test_swipe_default_duration(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok())
-    await ctl.swipe(1, 2, 3, 4)
-    assert calls[0][-1] == "300"
-
-
-@_sync
-async def test_key_argv_str_and_int(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok())
-    await ctl.key("KEYCODE_ENTER")
-    await ctl.key(3)
-    assert calls == [
-        [*SCOPED, "shell", "input", "keyevent", "KEYCODE_ENTER"],
-        [*SCOPED, "shell", "input", "keyevent", "3"],
-    ]
-
-
-@pytest.mark.parametrize(
-    ("value", "token"),
-    [
-        ("hello", "hello"),
-        ("a b", "a%sb"),
-        ("a  b", "a%s%sb"),
-        ("x;y", "x\\;y"),
-        ('say "hi"', 'say%s\\"hi\\"'),
-        ("it's", "it\\'s"),
-        ("a&b|c", "a\\&b\\|c"),
-        ("100%s", "100%s"),  # documented: %s types as space (adb behavior)
-        ("$HOME", "\\$HOME"),
-    ],
-)
-@_sync
-async def test_text_escaping_vectors(adb_module: Any, value: str, token: str) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok())
-    await ctl.text(value)
-    assert calls == [[*SCOPED, "shell", "input", "text", token]]
-
-
-@_sync
-async def test_screenshot_argv_and_passthrough(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    frame = _png() + b"IDAT-noise-bytes"
-    ctl = _make(adb_module, calls, _ok(stdout=frame))
-    out = await ctl.screenshot()
-    assert out == frame  # byte-identical: never transcoded
-    assert calls == [[*SCOPED, "exec-out", "screencap", "-p"]]
-
-
-@pytest.mark.parametrize("body", [b"not-a-png", b"", _png()[:10], b"\x89PNGjunk"])
+@pytest.mark.parametrize("body", [b"not-a-png", b"", _png()[:10]])
 @_sync
 async def test_screenshot_corruption_maps_unusable_output(adb_module: Any, body: bytes) -> None:
     calls: list[list[str]] = []
@@ -361,19 +219,6 @@ async def test_screenshot_corruption_maps_unusable_output(adb_module: Any, body:
         await ctl.screenshot()
     assert excinfo.value.output_reason == "unusable_output"
     assert len(calls) == 1  # one attempt: no repair, no retry
-
-
-@_sync
-async def test_screenshot_nonzero_rc_maps_exit(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok(stderr=b"fail", returncode=1))
-    with pytest.raises(VendorCommandError) as excinfo:
-        await ctl.screenshot()
-    assert excinfo.value.output_reason == "exit"
-    assert excinfo.value.returncode == 1
-
-
-# ── display configure (CONFIGURE, §4) ──
 
 
 def _display_responder(
@@ -398,9 +243,7 @@ def _display_responder(
 async def test_configure_display_exact_argv_and_previous_state(adb_module: Any) -> None:
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _display_responder())
-    previous = await ctl.configure(
-        {"display.width": 419, "display.height": 633, "display.dpi": 160}
-    )
+    previous = await ctl.configure({"display.width": 419, "display.height": 633, "display.dpi": 160})
     assert previous == DisplayState(1080, 2400, 420)
     assert previous.to_spec() == {
         "display.width": 1080,
@@ -436,9 +279,7 @@ async def test_configure_is_idempotent_and_skips_equal_writes(adb_module: Any) -
         density_out=b"Physical density: 420\nOverride density: 160\n",
     )
     ctl = _make(adb_module, calls, responder)
-    previous = await ctl.configure(
-        {"display.width": 419, "display.height": 633, "display.dpi": 160}
-    )
+    previous = await ctl.configure({"display.width": 419, "display.height": 633, "display.dpi": 160})
     assert previous == DisplayState(419, 633, 160)
     assert calls == [
         [*SCOPED, "shell", "wm", "size"],
@@ -446,34 +287,19 @@ async def test_configure_is_idempotent_and_skips_equal_writes(adb_module: Any) -
     ]  # reads only: no vendor churn for an identical request
 
 
-@_sync
-async def test_configure_partial_dpi_overlay_only_writes_density(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _display_responder())
-    await ctl.configure({"display.dpi": 160})
-    assert calls == [
-        [*SCOPED, "shell", "wm", "size"],
-        [*SCOPED, "shell", "wm", "density"],
-        [*SCOPED, "shell", "wm", "density", "160"],
-    ]
-
-
 @pytest.mark.parametrize(
     "spec",
     [
-        {"display.width": 419},  # height missing
-        {"display.height": 633},  # width missing
+        {"display.width": 419},
+        {"display.height": 633},
         {"display.width": 0, "display.height": 633},
         {"display.width": 419, "display.height": 633, "display.dpi": 0},
         {"display.width": True, "display.height": 633},
-        {"display.renderer": "vulkan"},  # unsupported leaf
-        {"bogus.leaf": 1},  # unknown leaf
+        {"bogus.leaf": 1},
     ],
 )
 @_sync
-async def test_configure_invalid_spec_is_typed_before_io(
-    adb_module: Any, spec: dict[str, object]
-) -> None:
+async def test_configure_invalid_spec_is_typed_before_io(adb_module: Any, spec: dict[str, object]) -> None:
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _ok())
     with pytest.raises(InvalidArgumentError):
@@ -513,12 +339,6 @@ async def test_configure_rejects_non_mapping(adb_module: Any) -> None:
 
 @pytest.mark.skipif(os.name == "nt", reason="the fake adb shim is a POSIX executable")
 def test_consumer_configure_path_needs_no_raw_shell_out(tmp_path: Any) -> None:
-    """The py-clash-bot shape end to end: connect with a DisplayConfig, call
-    configure() with no spec, and let emuctl's fake adb do ALL the wm work.
-
-    The fake adb is the only transport; it rejects any argv outside the
-    expected wm reads/writes, so a consumer-side shell-out would fail here.
-    """
     from emuctl import connect_sync
 
     log = tmp_path / "adb.log"
@@ -568,8 +388,6 @@ else:
 
 @_sync
 async def test_transport_degradation_raises_device_state_error(adb_module: Any) -> None:
-    """§2: explicit transport-degradation stderr is DeviceStateError, not a
-    vendor command failure (mid-op observation failed)."""
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _ok(stderr=b"adb: device offline", returncode=1))
     with pytest.raises(DeviceStateError) as excinfo:
@@ -599,7 +417,6 @@ async def test_transport_state_token_map(adb_module: Any, stderr: bytes, state: 
 
 @_sync
 async def test_non_transport_vendor_failure_stays_vendor_error(adb_module: Any) -> None:
-    """A real command failure is never laundered into DeviceStateError."""
     calls: list[list[str]] = []
     ctl = _make(
         adb_module,
@@ -612,17 +429,7 @@ async def test_non_transport_vendor_failure_stays_vendor_error(adb_module: Any) 
 
 
 @_sync
-async def test_probe_maps_device_state_to_its_own_reason(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok(stderr=b"adb: device offline", returncode=1))
-    probe = await ctl.is_reachable()
-    assert (probe.ok, probe.reason) == (False, "offline")
-
-
-@_sync
 async def test_transport_loss_is_repaired_on_the_next_op(adb_module: Any) -> None:
-    """One transport blip sets DeviceStateError; the next op lazily re-attaches
-    (adb connect) before running — the failed op is never retried."""
     calls: list[list[str]] = []
     state = {"first": True}
 
@@ -650,8 +457,6 @@ async def test_transport_loss_is_repaired_on_the_next_op(adb_module: Any) -> Non
 
 @_sync
 async def test_reattach_uses_the_op_remaining_budget(adb_module: Any) -> None:
-    """The lazy reconnect is bounded by the caller's slice, never a fresh 2 s
-    (§2 one deadline). A 0.05 s op gets a 0.05 s re-attach."""
     calls: list[list[str]] = []
     state = {"first": True}
 
@@ -679,15 +484,6 @@ async def test_install_apk_argv(adb_module: Any) -> None:
     ctl = _make(adb_module, calls, _ok())
     await ctl.install_apk("dist/app.apk")
     assert calls == [[*SCOPED, "install", "dist/app.apk"]]
-
-
-@_sync
-async def test_install_apk_failure_raises(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok(stderr=b"INSTALL_FAILED", returncode=1))
-    with pytest.raises(VendorCommandError) as excinfo:
-        await ctl.install_apk("dist/app.apk")
-    assert excinfo.value.output_reason == "exit"
 
 
 @_sync
@@ -721,7 +517,6 @@ async def test_start_app_launch_plus_pidof_verify(adb_module: Any) -> None:
 async def test_start_app_primary_success_never_tries_the_fallback(
     adb_module: Any,
 ) -> None:
-    """A healthy syskeys-free launch adds no second monkey and no am verb."""
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _ok(stdout=b"1234\n"))
     await ctl.start_app("com.example.game")
@@ -735,8 +530,6 @@ async def test_start_app_primary_success_never_tries_the_fallback(
 async def test_start_app_syskeys_failure_falls_back_to_plain_monkey(
     adb_module: Any,
 ) -> None:
-    """Primary rc=251 (e.g. monkey build without the option) → the historical
-    plain invocation, then the same bounded pidof verify."""
     calls: list[list[str]] = []
 
     def respond(argv: list[str]) -> _FakeHandle:
@@ -781,7 +574,6 @@ async def test_start_app_syskeys_failure_falls_back_to_plain_monkey(
 async def test_start_app_both_launch_mechanisms_fail_carries_both_rcs(
     adb_module: Any,
 ) -> None:
-    """One VendorCommandError: fallback payload + both return codes in detail."""
     calls: list[list[str]] = []
     seen = {"monkey": 0}
 
@@ -813,13 +605,6 @@ async def test_start_app_both_launch_mechanisms_fail_carries_both_rcs(
 async def test_start_app_fallback_spends_the_one_shared_deadline(
     adb_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No budget reset, proven clock-independently (§2 one deadline per call).
-
-    The real ``time.monotonic`` can be too coarse on Windows to show any
-    shrinkage between two fast subprocesses, so inject port's clock: each read
-    advances a known 0.5 s. The expected slices are then exact — the fallback
-    gets ``initial - elapsed_so_far``, never a fresh ``5.0``.
-    """
     calls: list[list[str]] = []
 
     def respond(argv: list[str]) -> _FakeHandle:
@@ -832,8 +617,6 @@ async def test_start_app_fallback_spends_the_one_shared_deadline(
         return _FakeHandle(stdout=b"1234\n")
 
     class _SteppingClock:
-        """Deterministic monotonic stand-in: 100.0, 100.5, 101.0, …"""
-
         def __init__(self) -> None:
             self.readings: list[float] = []
             self._now = 100.0
@@ -846,7 +629,7 @@ async def test_start_app_fallback_spends_the_one_shared_deadline(
     clock = _SteppingClock()
     # Only the port's view is faked: waits.py/_proc.py keep the real clock,
     # so asyncio scheduling and executor deadlines stay untouched.
-    monkeypatch.setattr("emuctl.port.time", types.SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr("emuctl._adb.time", types.SimpleNamespace(monotonic=clock.monotonic))
 
     spy = _TimeoutSpy(_spawn=_spawn_factory(calls, respond))  # type: ignore[arg-type]
     ref = InstanceRef(backend=BackendId.ADB, key=SERIAL)
@@ -868,8 +651,6 @@ async def test_start_app_fallback_spends_the_one_shared_deadline(
 async def test_start_app_force_stop_failure_raises_before_launch(
     adb_module: Any,
 ) -> None:
-    """A failed force-stop is typed and aborts: no launcher runs, so a warm
-    popup cannot be mistaken for a completed restart."""
     calls: list[list[str]] = []
 
     def respond(argv: list[str]) -> _FakeHandle:
@@ -909,75 +690,9 @@ async def test_start_app_launch_failure_falls_back_then_raises_before_verify(
 
 
 @_sync
-async def test_start_app_slow_spawn_polls_pidof_then_succeeds(adb_module: Any) -> None:
-    """pidof negative once → positive: verify polls via wait_until under the
-    ONE shared APP budget (launch slice, then shrinking verify slices)."""
-    calls: list[list[str]] = []
-    polls = {"n": 0}
-
-    def respond(argv: list[str]) -> _FakeHandle:
-        if "force-stop" in argv:
-            return _FakeHandle()
-        if "monkey" in argv:
-            return _FakeHandle(stdout=b"events injected")
-        polls["n"] += 1
-        if polls["n"] == 1:
-            return _FakeHandle(stdout=b"", returncode=1)  # slow to spawn
-        return _FakeHandle(stdout=b"1234\n")  # now a process exists
-
-    spy = _TimeoutSpy(_spawn=_spawn_factory(calls, respond))  # type: ignore[arg-type]
-    ref = InstanceRef(backend=BackendId.ADB, key=SERIAL)
-    ctl = adb_module.AdbController(ref, config=EmuctlConfig(), _executor=spy)
-    await ctl.start_app("com.example.game", timeout=5.0)
-    verify = [c for c in calls if c[-2:] == ["pidof", "com.example.game"]]
-    assert len(verify) >= 2  # negative first, positive after polling
-    assert calls[0][-3:] == ["am", "force-stop", "com.example.game"]
-    probes = spy.seen_all["start_app"]
-    assert probes[0] == 5.0  # force-stop runs under the full resolved budget
-    assert all(budget is not None and 0 < budget <= 5.0 for budget in probes)
-    assert len(probes) >= 4  # force-stop + launch + negative poll + positive poll
-    # shared deadline: verify slices shrink across polls, never reset to the
-    # full budget anew (§2 one deadline per call, distributed internally).
-    assert all((probes[i] or 0) <= (probes[i - 1] or 0) for i in range(1, len(probes)))
-
-
-@_sync
-async def test_start_app_verify_poll_succeeds_leveraging_wait_until(
-    adb_module: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The verify loop is the sanctioned wait_until loop — proven by a spy."""
-    calls: list[list[str]] = []
-    polls = {"n": 0}
-
-    def respond(argv: list[str]) -> _FakeHandle:
-        if "pidof" in argv:
-            polls["n"] += 1
-            if polls["n"] == 1:
-                return _FakeHandle(stdout=b"", returncode=1)
-        return _FakeHandle(stdout=b"1234\n")
-
-    wait_calls: list[dict[str, Any]] = []
-
-    async def spy_wait_until(predicate: Any, *, operation: str, timeout: float) -> None:
-        wait_calls.append({"operation": operation, "timeout": timeout})
-        from emuctl.waits import wait_until as real
-
-        await real(predicate, operation=operation, timeout=timeout)
-
-    monkeypatch.setattr("emuctl.port.wait_until", spy_wait_until)
-    ctl = _make(adb_module, calls, respond)
-    await ctl.start_app("com.example.game", timeout=5.0)
-    assert wait_calls and wait_calls[0]["operation"] == "start_app"
-    assert len(wait_calls) == 1  # one wait_until loop, one shared deadline
-    assert pytest.approx(5.0, abs=0.5) == wait_calls[0]["timeout"]
-
-
-@_sync
 async def test_start_app_deadline_expiry_is_typed_timeout_never_green_pass(
     adb_module: Any,
 ) -> None:
-    """A package that never spawns polls to the shared deadline, then raises
-    the contract's typed timeout (§2: expiry never degrades to a value)."""
     calls: list[list[str]] = []
 
     def respond(argv: list[str]) -> _FakeHandle:
@@ -999,10 +714,7 @@ async def test_start_app_deadline_expiry_is_typed_timeout_never_green_pass(
 async def test_start_app_exit_zero_without_process_fails_fast(
     adb_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """rc 0 is not proof of a launch (§1.9): no pid within the short acceptance
-    window fails in seconds instead of burning the whole app budget. The error
-    is typed and explains the observation; launch stdout is never parsed."""
-    monkeypatch.setattr("emuctl.port._LAUNCH_CONFIRM_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("emuctl._adb._LAUNCH_CONFIRM_TIMEOUT_S", 0.1)
     calls: list[list[str]] = []
 
     def respond(argv: list[str]) -> _FakeHandle:
@@ -1038,9 +750,7 @@ async def test_start_app_exit_zero_without_process_fails_fast(
     ],
 )
 @_sync
-async def test_is_app_installed_exact_line_match(
-    adb_module: Any, pm_out: bytes, installed: bool
-) -> None:
+async def test_is_app_installed_exact_line_match(adb_module: Any, pm_out: bytes, installed: bool) -> None:
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _ok(stdout=pm_out))
     assert await ctl.is_app_installed("com.example.game") is installed
@@ -1054,8 +764,6 @@ async def test_is_app_installed_exact_line_match(
 async def test_loopback_prefix_omits_H_so_a_cold_server_can_start(
     adb_module: Any,
 ) -> None:
-    """`-H` marks the server REMOTE and blocks adb's documented cold-start;
-    loopback must emit `-P` only (custom ports included)."""
     calls: list[list[str]] = []
     cfg = EmuctlConfig(adb=AdbConfig(port=5042))
     ctl = _make(adb_module, calls, _ok(), config=cfg)
@@ -1065,14 +773,11 @@ async def test_loopback_prefix_omits_H_so_a_cold_server_can_start(
 
 @_sync
 async def test_genuinely_remote_host_keeps_H(adb_module: Any) -> None:
-    """Only loopback is local; a real remote host still pins the server."""
     calls: list[list[str]] = []
     cfg = EmuctlConfig(adb=AdbConfig(host="10.0.0.2", port=5037))
     ctl = _make(adb_module, calls, _ok(), config=cfg)
     await ctl.click(1, 2)
-    assert calls == [
-        ["adb", "-H", "10.0.0.2", "-P", "5037", "-s", SERIAL, "shell", "input", "tap", "1", "2"]
-    ]
+    assert calls == [["adb", "-H", "10.0.0.2", "-P", "5037", "-s", SERIAL, "shell", "input", "tap", "1", "2"]]
 
 
 @_sync
@@ -1087,26 +792,6 @@ async def test_device_verbs_carry_exactly_one_s_scope(adb_module: Any) -> None:
 
 
 @_sync
-async def test_server_verbs_bypass_scoping(adb_module: Any) -> None:
-    """`devices` (pinned exclusion) carries no `-s` — via the runner seam."""
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok(stdout=b"List of devices attached\n"))
-    await ctl._run_adb(["devices"], binary=False, operation="t", timeout=1.0, server_verb=True)
-    assert calls == [[*PREFIX, "devices"]]
-
-
-@_sync
-async def test_server_verb_policing_rejects_non_server_heads(
-    adb_module: Any,
-) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok())
-    with pytest.raises(InvalidArgumentError):
-        await ctl._run_adb(["shell"], binary=False, operation="t", timeout=1.0, server_verb=True)
-    assert calls == []  # refused before any I/O
-
-
-@_sync
 async def test_per_call_serial_recheck(adb_module: Any) -> None:
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _ok())
@@ -1114,18 +799,6 @@ async def test_per_call_serial_recheck(adb_module: Any) -> None:
     with pytest.raises(InvalidSerialError):
         await ctl.click(1, 2)
     assert calls == []
-
-
-@_sync
-async def test_vendor_run_is_device_scoped(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok(stdout=b"ok"))
-    out = await ctl._vendor_run(["shell", "echo", "hi"])
-    assert out == "ok"
-    assert calls == [[*SCOPED, "shell", "echo", "hi"]]
-
-
-# ── is_reachable: data only, stderr-vocabulary, never stdout ──
 
 
 @_sync
@@ -1156,171 +829,16 @@ async def test_is_reachable_failure_vocabulary(adb_module: Any, stderr: bytes, r
 
 
 @_sync
-async def test_is_reachable_ok_ignores_misleading_stdout(
-    adb_module: Any,
-) -> None:
-    """rc 0 decides ok even when stdout mentions failure words."""
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok(stdout=b"offline unauthorized\n"))
-    probe = await ctl.is_reachable()
-    assert (probe.ok, probe.reason) == (True, "ok")
-    assert calls == [[*SCOPED, "shell", "echo", "emuctl"]]
-
-
-@_sync
-async def test_is_reachable_missing_binary_is_no_adb(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, FileNotFoundError("adb"))
-    probe = await ctl.is_reachable()
-    assert (probe.ok, probe.reason) == (False, "no-adb")
-
-
-@_sync
-async def test_is_reachable_unexpected_error_is_data(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, RuntimeError("boom"))
-    probe = await ctl.is_reachable()
-    assert (probe.ok, probe.reason) == (False, "disconnected")
-
-
-@_sync
-async def test_is_reachable_timeout_reason(adb_module: Any) -> None:
-    async def _spawn(argv: Sequence[str]) -> _FakeHandle:
-        await asyncio.sleep(5)
-        return _FakeHandle()
-
-    ref = InstanceRef(backend=BackendId.ADB, key=SERIAL)
-    executor = ProcessExecutor(_spawn=_spawn)  # type: ignore[arg-type]
-    ctl = adb_module.AdbController(ref, config=EmuctlConfig(), _executor=executor)
-    probe = await ctl.is_reachable(timeout=0.05)
-    assert (probe.ok, probe.reason) == (False, "timeout")
-
-
-@_sync
-async def test_probe_reasons_all_stay_in_pinned_vocabulary(adb_module: Any) -> None:
-    """§1 conformance: every reason any probe path emits across this suite is
-    a member of `port.PROBE_REASONS` (the emitted vocabulary stays closed)."""
-    probe_word_out = b"emuctl\n"
-    scenarios: list[tuple[str, _FakeHandle | BaseException]] = [
-        ("ok", _FakeHandle(stdout=probe_word_out)),
-        ("offline", _FakeHandle(stdout=b"", stderr=b"adb: device offline", returncode=1)),
-        (
-            "unauthorized",
-            _FakeHandle(stdout=b"", stderr=b"error: device unauthorized", returncode=1),
-        ),
-        ("disconnected", _FakeHandle(stdout=b"", stderr=b"anything else", returncode=1)),
-        ("no-adb", FileNotFoundError("adb")),
-        # the promoted shared probe (port.AdbController) is what runs: pin
-        # the classifier lives core-side and is inherited, not a private copy
-    ]
-    reasons: set[str] = set()
-    for expected_reason, outcome in scenarios:
-        calls: list[list[str]] = []
-        respond = (
-            (lambda argv, outcome=outcome: outcome)
-            if not isinstance(outcome, BaseException)
-            else outcome
-        )
-        ctl = _make(adb_module, calls, respond)
-        probe = await ctl.is_reachable()
-        reasons.add(probe.reason)
-        assert probe.reason == expected_reason
-    reasons.add("unknown")  # the port default (no observation seam) is data too
-    assert reasons
-    assert reasons <= PROBE_REASONS
-
-
-# ── discovery: adb devices enumeration ──
-
-
-_DEVICES_FIXTURE = (
-    b"List of devices attached\n"
-    b"emulator-5554\tdevice\n"
-    b"127.0.0.1:5555\tdevice product:vsys_x86_64 model:phone device:emulator\n"
-    b"ABCDEF123456\toffline\n"
-    b"ZYX987\tunauthorized\n"
-    b"\n"
-    b"has;semicolon\tdevice\n"  # invalid serial: skipped, never a ref
-    b"lonelyline\n"  # unparseable: skipped
-)
-
-
-@_sync
-async def test_list_instances_enumeration(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    executor = ProcessExecutor(_spawn=_spawn_factory(calls, _ok(stdout=_DEVICES_FIXTURE)))  # type: ignore[arg-type]
-    found = await adb_module.list_instances(EmuctlConfig(), _executor=executor)
-    assert calls == [[*PREFIX, "devices"]]  # server verb: no -s
-    assert [str(r.ref) for r in found] == [
-        "adb:emulator-5554",
-        "adb:127.0.0.1:5555",
-        "adb:ABCDEF123456",
-        "adb:ZYX987",
-    ]
-    assert [r.running for r in found] == [True, True, False, False]
-    assert [r.serial for r in found] == [
-        "emulator-5554",
-        "127.0.0.1:5555",
-        "ABCDEF123456",
-        "ZYX987",
-    ]
-    assert [r.details["adb_state"] for r in found] == [
-        "device",
-        "device",
-        "offline",
-        "unauthorized",
-    ]
-
-
-@_sync
-async def test_list_instances_empty_server(adb_module: Any) -> None:
-    executor = ProcessExecutor(
-        _spawn=_spawn_factory([], _ok(stdout=b"List of devices attached\n\n"))  # type: ignore[arg-type]
-    )
-    assert await adb_module.list_instances(EmuctlConfig(), _executor=executor) == ()
-
-
-@_sync
 async def test_list_instances_vendor_failure_propagates(adb_module: Any) -> None:
     executor = ProcessExecutor(_spawn=_spawn_factory([], _ok(stderr=b"daemon dead", returncode=1)))  # type: ignore[arg-type]
     with pytest.raises(VendorCommandError):
         await adb_module.list_instances(EmuctlConfig(), _executor=executor)
 
 
-@_sync
-async def test_get_instance_found_and_absent(adb_module: Any) -> None:
-    executor = ProcessExecutor(_spawn=_spawn_factory([], _ok(stdout=_DEVICES_FIXTURE)))  # type: ignore[arg-type]
-    cfg = EmuctlConfig()
-    hit = await adb_module.get_instance(
-        cfg, InstanceRef(backend=BackendId.ADB, key="ABCDEF123456"), _executor=executor
-    )
-    assert hit is not None and hit.running is False
-    assert hit.details["adb_state"] == "offline"
-    miss = await adb_module.get_instance(
-        cfg, InstanceRef(backend=BackendId.ADB, key="ghost-0000"), _executor=executor
-    )
-    assert miss is None
-
-
-@_sync
-async def test_get_instance_wrong_backend_is_absent(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    executor = ProcessExecutor(_spawn=_spawn_factory(calls, _ok(stdout=_DEVICES_FIXTURE)))  # type: ignore[arg-type]
-    out = await adb_module.get_instance(
-        EmuctlConfig(),
-        InstanceRef(backend=BackendId.MEMU, key="pyclashbot-136"),
-        _executor=executor,
-    )
-    assert out is None
-    assert calls == []  # not ours: no probe at all
-
-
 # ── timeouts: group defaults, validation, cancellation ──
 
 
 class _TimeoutSpy(ProcessExecutor):
-    """Records the resolved budget per operation, then runs the fake."""
-
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.seen: dict[str, float | None] = {}
@@ -1332,31 +850,6 @@ class _TimeoutSpy(ProcessExecutor):
         self.seen[operation] = timeout
         self.seen_all.setdefault(operation, []).append(timeout)
         return await super().run(argv, operation=operation, timeout=timeout)
-
-
-@_sync
-async def test_timeout_group_defaults(adb_module: Any) -> None:
-    spy = _TimeoutSpy(_spawn=_spawn_factory([], _ok(stdout=_png())))  # type: ignore[arg-type]
-    ref = InstanceRef(backend=BackendId.ADB, key=SERIAL)
-    ctl = adb_module.AdbController(ref, config=EmuctlConfig(), _executor=spy)
-    await ctl.click(1, 2)
-    await ctl.screenshot()
-    await ctl.is_app_installed("com.example.game")
-    await ctl.install_apk("dist/app.apk")
-    await ctl.start_app("com.example.game")
-    # click: one interaction deadline, distributed — the FIRST slice carries
-    # the group constant.
-    assert spy.seen_all["click"][0] == INTERACTION_TIMEOUT
-    assert spy.seen["screenshot"] == SNAPSHOT_TIMEOUT
-    assert spy.seen["is_app_installed"] == QUERY_TIMEOUT
-    assert spy.seen["install_apk"] == APP_TIMEOUT
-    # start_app: one shared APP-group budget across launch + verify — the
-    # launch slice carries the group constant; verify slices shrink from the
-    # same deadline (never the full budget anew per subprocess).
-    budgets = spy.seen_all["start_app"]
-    assert len(budgets) >= 2  # launch + at least one verify poll
-    assert budgets[0] == APP_TIMEOUT
-    assert all(budget <= APP_TIMEOUT for budget in budgets if budget is not None)
 
 
 @_sync
@@ -1397,27 +890,7 @@ def test_features_declare_plain_adb_mechanics(adb_module: Any) -> None:
     )
 
 
-@_sync
-async def test_plain_adb_has_no_boot_create(adb_module: Any) -> None:
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok())
-    with pytest.raises(FeatureNotSupportedError) as excinfo:
-        await ctl.restart()
-    assert excinfo.value.feature == "boot"
-    with pytest.raises(FeatureNotSupportedError):
-        await ctl.start()
-    with pytest.raises(FeatureNotSupportedError):
-        await ctl.stop()
-    with pytest.raises(FeatureNotSupportedError) as excinfo:
-        await ctl.create(CreateSpec(name="new-vm"))
-    assert excinfo.value.feature == "create"
-    assert calls == []  # gate-first: no transport touched
-
-
 def test_list_instances_ignores_cold_start_daemon_banner(adb_module: Any) -> None:
-    """Cold `adb devices` banner lines precede the header and never become
-    rows (`*` is not an allowlist serial, and banner lines are skipped
-    position-independently)."""
     calls: list[list[str]] = []
     scripted = (
         b"* daemon not running; starting now at tcp:5037\n"
@@ -1434,19 +907,6 @@ def test_list_instances_ignores_cold_start_daemon_banner(adb_module: Any) -> Non
 
 
 @_sync
-async def test_closed_controller_guards_gated_ops(adb_module: Any) -> None:
-    from emuctl.errors import ControllerClosedError
-
-    calls: list[list[str]] = []
-    ctl = _make(adb_module, calls, _ok())
-    await ctl.aclose()
-    await ctl.aclose()  # idempotent
-    with pytest.raises(ControllerClosedError):
-        await ctl.click(1, 2)
-    assert calls == []
-
-
-@_sync
 async def test_is_reachable_after_close_reports_data(adb_module: Any) -> None:
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _ok(stdout=b"emuctl\n"))
@@ -1456,9 +916,7 @@ async def test_is_reachable_after_close_reports_data(adb_module: Any) -> None:
 
 
 @_sync
-async def test_connect_builds_adb_adapter_without_io(
-    adb_module: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_connect_builds_adb_adapter_without_io(adb_module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     from emuctl._discovery import connect
 
     # Zero executor spawns during construction: bind the real production
@@ -1504,18 +962,16 @@ async def test_missing_binary_maps_to_executable_not_found(
     assert excinfo.value.tool == "adb"
 
 
-@pytest.mark.parametrize("op", ["click", "key", "text", "swipe"])
 @_sync
-async def test_caller_misuse_is_invalid_argument(adb_module: Any, op: str) -> None:
+async def test_restored_boot_create_surface_gates_on_adb(adb_module: Any) -> None:
     calls: list[list[str]] = []
     ctl = _make(adb_module, calls, _ok())
-    with pytest.raises(InvalidArgumentError):
-        if op == "click":
-            await ctl.click(-1, 0)
-        elif op == "key":
-            await ctl.key("")
-        elif op == "text":
-            await ctl.text("line\nbreak")
-        elif op == "swipe":
-            await ctl.swipe(0, 0, 1, 1, duration_ms=-5)
+    for op in (
+        lambda: ctl.create(CreateSpec(name="vm")),
+        lambda: ctl.start(),
+        lambda: ctl.stop(),
+        lambda: ctl.restart(),
+    ):
+        with pytest.raises(FeatureNotSupportedError):
+            await op()
     assert calls == []

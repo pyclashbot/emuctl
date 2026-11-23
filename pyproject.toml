@@ -50,7 +50,7 @@ containers = ["emuctl"]
 layers = [
   "backends",
   # `:` = one non-independent core tier (timing→errors→waits…); `|` would forbid intra-core imports.
-  "config : log : png : port : errors : timing : waits : _proc : _serials : _identification : _sync : _discovery : _platforms",
+  "config : log : png : port : errors : timing : waits : _proc : _serials : _identification : _sync : _discovery : _platforms : _adb",
 ]
 exhaustive = true
 # CONTRACT §3/§6 sanctioned seam: connect()/discover() live in core _discovery but
@@ -72,7 +72,7 @@ include_external_packages = false
 modules = ["emuctl.backends.adb"]
 
 [tool.ruff]
-line-length = 100
+line-length = 112
 target-version = "py312"
 src = ["src", "tests"]
 
@@ -116,4 +116,3 @@ prerelease = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-markers = ["emulator: hardware-attached tests, opt-in via -m emulator (not CI)"]

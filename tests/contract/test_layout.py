@@ -1,5 +1,3 @@
-"""Layout-drift detector: the CONTRACT §6 tree exists in src/emuctl (organization lock)."""
-
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2] / "src" / "emuctl"

@@ -1,7 +1,3 @@
-"""§7 conformance (registry, §3): v0.1 ships ADB only; pinned enum values for
-removed backends fail cleanly, selection is import-free, load_adapter stays
-the only importer."""
-
 import sys
 import types
 from collections.abc import Iterator, Sequence
@@ -38,7 +34,6 @@ NEVER_IMPORT = (ADB_MODULE, *REMOVED_MODULES)
 
 @pytest.fixture
 def reg() -> Any:
-    """Lazy registry access (runtime, never collection time)."""
     from emuctl.backends import _registry
 
     return _registry
@@ -130,11 +125,7 @@ def test_refusal_unknown_id_first(reg: Any, no_backend_imports: None) -> None:
         BackendId.AVD,
     ],
 )
-def test_removed_backends_refuse_cleanly(
-    reg: Any, backend: BackendId, no_backend_imports: None
-) -> None:
-    """Known BackendId values without a v0.1 row: not-implemented, never an
-    import (their adapters remain on stack branches)."""
+def test_removed_backends_refuse_cleanly(reg: Any, backend: BackendId, no_backend_imports: None) -> None:
     with pytest.raises(BackendNotAvailableError) as excinfo:
         reg.resolve_backend(backend)
     assert excinfo.value.reason == "not-implemented-this-version"
@@ -143,24 +134,18 @@ def test_removed_backends_refuse_cleanly(
 
 
 @pytest.mark.parametrize("platform", [Platform.WINDOWS, Platform.MACOS, Platform.LINUX])
-def test_available_backends_is_adb_only(
-    reg: Any, platform: Platform, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_available_backends_is_adb_only(reg: Any, platform: Platform, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reg, "current_platform", lambda: platform)
     monkeypatch.setattr(reg, "_dep_available", lambda name: False)
     assert [spec.backend for spec in reg.available_backends()] == [BackendId.ADB]
 
 
 class _DummyController(AsyncEmulatorController):
-    """Minimal port subclass: only the abstract seam implemented."""
-
     async def _vendor_run(self, argv: Sequence[str], *, binary: bool = False) -> bytes | str:
         return b""
 
 
-def _dummy_spec(
-    module: str, attr: str, *, dep_modules: tuple[str, ...] = (), extra: str | None = None
-) -> Any:
+def _dummy_spec(module: str, attr: str, *, dep_modules: tuple[str, ...] = (), extra: str | None = None) -> Any:
     from emuctl.backends._registry import BackendSpec
 
     return BackendSpec(
@@ -180,16 +165,11 @@ def test_load_adapter_success_with_dummy_module(reg: Any, monkeypatch: pytest.Mo
     module = types.ModuleType("emuctl_test_dummy_adapter")
     module.__dict__["DummyController"] = _DummyController
     monkeypatch.setitem(sys.modules, "emuctl_test_dummy_adapter", module)
-    assert (
-        reg.load_adapter(_dummy_spec("emuctl_test_dummy_adapter", "DummyController"))
-        is _DummyController
-    )
+    assert reg.load_adapter(_dummy_spec("emuctl_test_dummy_adapter", "DummyController")) is _DummyController
 
 
 @pytest.mark.parametrize("attr", [object, str, 42, None])
-def test_load_adapter_rejects_non_port_subclass(
-    reg: Any, monkeypatch: pytest.MonkeyPatch, attr: Any
-) -> None:
+def test_load_adapter_rejects_non_port_subclass(reg: Any, monkeypatch: pytest.MonkeyPatch, attr: Any) -> None:
     module = types.ModuleType("emuctl_test_bad_adapter")
     module.__dict__["Adapter"] = attr
     monkeypatch.setitem(sys.modules, "emuctl_test_bad_adapter", module)
@@ -237,9 +217,7 @@ def test_backend_spec_is_frozen(reg: Any) -> None:
         spec.extra = "x"
 
 
-@pytest.mark.parametrize(
-    "key", ["127.0.0.1:5555", "emulator-5554", "ABCDEF123456", "transport_id:5"]
-)
+@pytest.mark.parametrize("key", ["127.0.0.1:5555", "emulator-5554", "ABCDEF123456", "transport_id:5"])
 def test_adb_key_rule_accepts_serials(reg: Any, key: str) -> None:
     spec = reg.get_registry()[BackendId.ADB]
     assert spec.validate_key(key) is None
@@ -261,7 +239,6 @@ def test_key_structural_rule_still_lives_in_identity() -> None:
 
 
 def test_spec_row_conformance_adb(reg: Any) -> None:
-    """§7.10: the sole row's module exposes the adapter + discovery seams."""
     spec = reg.get_registry()[BackendId.ADB]
     adapter = reg.load_adapter(spec)
     assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)

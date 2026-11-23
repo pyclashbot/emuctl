@@ -1,5 +1,3 @@
-"""§7.8 conformance: png_dimensions reads IHDR dims; malformed input is a typed failure."""
-
 import struct
 from typing import Any
 

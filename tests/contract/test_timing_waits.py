@@ -1,5 +1,3 @@
-"""§7.2 conformance: deadline honored, timeout payloads, no cancel conflation."""
-
 import asyncio
 import inspect
 import logging
