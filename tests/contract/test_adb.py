@@ -5,6 +5,8 @@ import asyncio
 import functools
 import struct
 import sys
+import time
+import types
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
 from typing import Any
 
@@ -347,6 +349,8 @@ async def test_start_app_launch_plus_pidof_verify(adb_module: Any) -> None:
             "com.example.game",
             "-c",
             "android.intent.category.LAUNCHER",
+            "--pct-syskeys",
+            "0",
             "1",
         ],
         [*SCOPED, "shell", "pidof", "com.example.game"],
@@ -354,7 +358,176 @@ async def test_start_app_launch_plus_pidof_verify(adb_module: Any) -> None:
 
 
 @_sync
-async def test_start_app_launch_failure_raises_before_verify(
+async def test_start_app_primary_success_never_tries_the_fallback(
+    adb_module: Any,
+) -> None:
+    """A healthy syskeys-free launch adds no second monkey and no am verb."""
+    calls: list[list[str]] = []
+    ctl = _make(adb_module, calls, _ok(stdout=b"1234\n"))
+    await ctl.start_app("com.example.game")
+    monkeys = [argv for argv in calls if "monkey" in argv]
+    assert len(monkeys) == 1
+    assert "--pct-syskeys" in monkeys[0]
+    assert all("am" not in argv or "force-stop" in argv for argv in calls)
+
+
+@_sync
+async def test_start_app_syskeys_failure_falls_back_to_plain_monkey(
+    adb_module: Any,
+) -> None:
+    """Primary rc=251 (e.g. monkey build without the option) → the historical
+    plain invocation, then the same bounded pidof verify."""
+    calls: list[list[str]] = []
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "force-stop" in argv:
+            return _FakeHandle()
+        if "monkey" in argv and "--pct-syskeys" in argv:
+            return _FakeHandle(stderr=b"monkey aborted", returncode=251)
+        if "monkey" in argv:
+            return _FakeHandle(stdout=b"Events injected: 1")
+        return _FakeHandle(stdout=b"1234\n")  # pidof: spawned
+
+    ctl = _make(adb_module, calls, respond)
+    await ctl.start_app("com.example.game")
+
+    assert calls[0][-3:] == ["am", "force-stop", "com.example.game"]
+    assert calls[1] == [
+        *SCOPED,
+        "shell",
+        "monkey",
+        "-p",
+        "com.example.game",
+        "-c",
+        "android.intent.category.LAUNCHER",
+        "--pct-syskeys",
+        "0",
+        "1",
+    ]
+    assert calls[2] == [
+        *SCOPED,
+        "shell",
+        "monkey",
+        "-p",
+        "com.example.game",
+        "-c",
+        "android.intent.category.LAUNCHER",
+        "1",
+    ]
+    assert calls[3] == [*SCOPED, "shell", "pidof", "com.example.game"]
+
+
+@_sync
+async def test_start_app_both_launch_mechanisms_fail_carries_both_rcs(
+    adb_module: Any,
+) -> None:
+    """One VendorCommandError: fallback payload + both return codes in detail."""
+    calls: list[list[str]] = []
+    seen = {"monkey": 0}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "force-stop" in argv:
+            return _FakeHandle()
+        if "monkey" in argv:
+            seen["monkey"] += 1
+            rc = 251 if seen["monkey"] == 1 else 97
+            return _FakeHandle(stderr=b"monkey aborted", returncode=rc)
+        return _FakeHandle(stderr=b"unexpected", returncode=1)
+
+    ctl = _make(adb_module, calls, respond)
+    with pytest.raises(VendorCommandError) as excinfo:
+        await ctl.start_app("com.example.game")
+
+    error = excinfo.value
+    assert error.output_reason == "exit"
+    assert error.returncode == 97  # the fallback's payload, not the first rc
+    assert "monkey" in error.command
+    assert error.stderr_excerpt == "monkey aborted"
+    assert "251" in (error.detail or "")  # original launch context preserved
+    assert "97" in (error.detail or "")
+    assert sum(1 for argv in calls if "monkey" in argv) == 2
+    assert all("pidof" not in argv for argv in calls)  # no verify after failure
+
+
+@_sync
+async def test_start_app_fallback_spends_the_one_shared_deadline(
+    adb_module: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No budget reset, proven clock-independently (§2 one deadline per call).
+
+    The real ``time.monotonic`` can be too coarse on Windows to show any
+    shrinkage between two fast subprocesses, so inject port's clock: each read
+    advances a known 0.5 s. The expected slices are then exact — the fallback
+    gets ``initial - elapsed_so_far``, never a fresh ``5.0``.
+    """
+    calls: list[list[str]] = []
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "force-stop" in argv:
+            return _FakeHandle()
+        if "monkey" in argv and "--pct-syskeys" in argv:
+            return _FakeHandle(stderr=b"monkey aborted", returncode=251)
+        if "monkey" in argv:
+            return _FakeHandle(stdout=b"Events injected: 1")
+        return _FakeHandle(stdout=b"1234\n")
+
+    class _SteppingClock:
+        """Deterministic monotonic stand-in: 100.0, 100.5, 101.0, …"""
+
+        def __init__(self) -> None:
+            self.readings: list[float] = []
+            self._now = 100.0
+
+        def monotonic(self) -> float:
+            self.readings.append(self._now)
+            self._now += 0.5
+            return self.readings[-1]
+
+    clock = _SteppingClock()
+    # Only the port's view is faked: waits.py/_proc.py keep the real clock,
+    # so asyncio scheduling and executor deadlines stay untouched.
+    monkeypatch.setattr("emuctl.port.time", types.SimpleNamespace(monotonic=clock.monotonic))
+
+    spy = _TimeoutSpy(_spawn=_spawn_factory(calls, respond))  # type: ignore[arg-type]
+    ref = InstanceRef(backend=BackendId.ADB, key=SERIAL)
+    ctl = adb_module.AdbController(ref, config=EmuctlConfig(), _executor=spy)
+    await ctl.start_app("com.example.game", timeout=5.0)
+
+    probes = spy.seen_all["start_app"]
+    assert len(probes) == 4  # force-stop + primary monkey + fallback monkey + pidof
+    assert probes[0] == 5.0  # force-stop carries the resolved op budget
+    assert probes[1] == 4.5  # primary: 5.0 deadline - 0.5 s elapsed
+    assert probes[2] == 4.0  # fallback: 5.0 deadline - 1.0 s elapsed
+    assert probes[3] == 3.0  # pidof: 5.0 deadline - 2.0 s elapsed
+    # and the general invariant the exact numbers instantiate
+    assert all(budget is not None and budget <= 5.0 for budget in probes)
+    assert all((probes[i] or 0) <= (probes[i - 1] or 0) for i in range(1, len(probes)))
+
+
+@_sync
+async def test_start_app_force_stop_failure_raises_before_launch(
+    adb_module: Any,
+) -> None:
+    """A failed force-stop is typed and aborts: no launcher runs, so a warm
+    popup cannot be mistaken for a completed restart."""
+    calls: list[list[str]] = []
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "force-stop" in argv:
+            return _FakeHandle(stderr=b"Error: package not found", returncode=1)
+        return _FakeHandle(stdout=b"events injected")
+
+    ctl = _make(adb_module, calls, respond)
+    with pytest.raises(VendorCommandError) as excinfo:
+        await ctl.start_app("com.example.game")
+    assert excinfo.value.output_reason == "exit"
+    assert calls == [[*SCOPED, "shell", "am", "force-stop", "com.example.game"]]
+    assert all("monkey" not in argv for argv in calls)
+    assert all("pidof" not in argv for argv in calls)
+
+
+@_sync
+async def test_start_app_launch_failure_falls_back_then_raises_before_verify(
     adb_module: Any,
 ) -> None:
     calls: list[list[str]] = []
@@ -369,27 +542,9 @@ async def test_start_app_launch_failure_raises_before_verify(
         await ctl.start_app("com.example.missing")
     assert excinfo.value.output_reason == "exit"
     assert calls[0][-3:] == ["am", "force-stop", "com.example.missing"]
-    assert len(calls) == 2  # force-stop + failed launch: no verify attempt
-
-
-@_sync
-async def test_start_app_force_stop_failure_raises_before_launch(
-    adb_module: Any,
-) -> None:
-    """A failed force-stop is typed and aborts: monkey never runs, so a warm
-    popup cannot be mistaken for a completed restart."""
-    calls: list[list[str]] = []
-
-    def respond(argv: list[str]) -> _FakeHandle:
-        if "force-stop" in argv:
-            return _FakeHandle(stderr=b"Error: package not found", returncode=1)
-        return _FakeHandle(stdout=b"events injected")
-
-    ctl = _make(adb_module, calls, respond)
-    with pytest.raises(VendorCommandError) as excinfo:
-        await ctl.start_app("com.example.game")
-    assert excinfo.value.output_reason == "exit"
-    assert all("monkey" not in argv for argv in calls)
+    # force-stop + primary monkey + one plain-monkey fallback: no verify
+    assert len(calls) == 3
+    assert sum(1 for argv in calls if "monkey" in argv) == 2
     assert all("pidof" not in argv for argv in calls)
 
 
@@ -478,6 +633,37 @@ async def test_start_app_deadline_expiry_is_typed_timeout_never_green_pass(
     assert excinfo.value.operation == "start_app"
     verify = [c for c in calls if "pidof" in c]
     assert len(verify) > 1  # polled, not a single launch-and-hope probe
+
+
+@_sync
+async def test_start_app_exit_zero_without_process_fails_fast(
+    adb_module: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rc 0 is not proof of a launch (§1.9): no pid within the short acceptance
+    window fails in seconds instead of burning the whole app budget. The error
+    is typed and explains the observation; launch stdout is never parsed."""
+    monkeypatch.setattr("emuctl.port._LAUNCH_CONFIRM_TIMEOUT_S", 0.1)
+    calls: list[list[str]] = []
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if "force-stop" in argv:
+            return _FakeHandle()
+        if "monkey" in argv:
+            # A silent no-op like ``am start -p`` on some images: rc 0,
+            # process never appears.
+            return _FakeHandle(stdout=b"Events injected: 1")
+        return _FakeHandle(stdout=b"", returncode=1)  # pidof: never spawns
+
+    ctl = _make(adb_module, calls, respond)
+    started = time.monotonic()
+    with pytest.raises(OperationTimeoutError) as excinfo:
+        await ctl.start_app("com.example.ghost", timeout=30.0)
+    elapsed = time.monotonic() - started
+    assert excinfo.value.operation == "start_app"
+    assert "exited 0" in (excinfo.value.detail or "")
+    assert "no process" in (excinfo.value.detail or "")
+    assert elapsed < 2.0  # acceptance window, not the 30 s op budget
+    assert sum(1 for argv in calls if "pidof" in argv) >= 1
 
 
 @pytest.mark.parametrize(
