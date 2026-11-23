@@ -2,14 +2,17 @@ name: Release
 
 # python-semantic-release job-based setup per the official UV integration guide
 # (https://python-semantic-release.readthedocs.io/en/latest/configuration/configuration-guides/uv_integration.html)
+# Release only after a successful CI run of the same commit.
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
 jobs:
   build:
     name: Build next version artifacts
     runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
     permissions:
       contents: read
     outputs:
