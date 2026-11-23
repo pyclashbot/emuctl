@@ -12,7 +12,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-keywords = ["adb", "android-emulator", "headless-android"]
+keywords = ["adb", "android", "device-automation"]
 dependencies = ["anyio>=4.10"]
 
 [project.urls]
