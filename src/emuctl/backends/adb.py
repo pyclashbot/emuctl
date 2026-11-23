@@ -12,8 +12,8 @@ stays here).
 
 The registry pins this module's ``adapter_attr`` to ``"AdbController"``, so
 this class doubles as the plain-ADB concrete adapter; future ADB-speaking
-adapters (e.g. BlueStacks Air's bundled hd-adb) inherit the core middle layer
-directly and fill in their own lifecycle mechanics.
+adapters inherit the core middle layer directly and fill in their own
+lifecycle mechanics (v0.1 ships this adapter only).
 
 Interpretation decisions (CONTRACT wins; these fill its silences):
 

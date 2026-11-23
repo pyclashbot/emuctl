@@ -9,7 +9,6 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from typing import Final
 
-from emuctl._identification import BackendId
 from emuctl.errors import ConfigValidationError, FeatureNotSupportedError
 
 __all__ = [
@@ -17,16 +16,11 @@ __all__ = [
     "DisplayConfig",
     "ResourceConfig",
     "AdbConfig",
-    "MemuSettings",
-    "MemuConfig",
-    "BlueStacksSettings",
-    "BlueStacksConfig",
     "LogConfig",
     "EmuctlConfig",
     "CreateSpec",
     "ConfigSpec",
     "CONFIGURE_FLAG",
-    "resolve_renderer",
     "ensure_config_supported",
 ]
 
@@ -161,80 +155,6 @@ class AdbConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class MemuSettings:
-    """MEmu tweakable settings (applied at configure-time)."""
-
-    hide_toolbar: bool | None = None
-    turbo: bool | None = None
-    audio: bool | None = None
-    window_mode: str | None = None
-    scale_percent: int | None = None
-
-    def __post_init__(self) -> None:
-        _check_bool("memu.settings.hide_toolbar", self.hide_toolbar)
-        _check_bool("memu.settings.turbo", self.turbo)
-        _check_bool("memu.settings.audio", self.audio)
-        object.__setattr__(
-            self, "window_mode", _check_str("memu.settings.window_mode", self.window_mode)
-        )
-        _check_int("memu.settings.scale_percent", self.scale_percent, minimum=1, maximum=100)
-
-
-@dataclass(frozen=True, slots=True)
-class MemuConfig:
-    """MEmu backend selection (paths/names) + settings."""
-
-    memuc_path: str | None = None
-    vm_name: str | None = None
-    settings: MemuSettings = field(default_factory=MemuSettings)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "memuc_path", _check_str("memu.memuc_path", self.memuc_path))
-        object.__setattr__(self, "vm_name", _check_str("memu.vm_name", self.vm_name, strip=True))
-        if not isinstance(self.settings, MemuSettings):
-            raise _fail("memu.settings", type(self.settings).__name__, "a MemuSettings")
-
-
-@dataclass(frozen=True, slots=True)
-class BlueStacksSettings:
-    """BlueStacks tweakable settings (applied at configure-time)."""
-
-    vsync: bool | None = None
-    high_fps: bool | None = None
-
-    def __post_init__(self) -> None:
-        _check_bool("bluestacks.settings.vsync", self.vsync)
-        _check_bool("bluestacks.settings.high_fps", self.high_fps)
-
-
-@dataclass(frozen=True, slots=True)
-class BlueStacksConfig:
-    """BlueStacks backend selection (ports/paths/names) + settings."""
-
-    adb_server_port: int = 5041
-    install_dir: str | None = None
-    conf_path: str | None = None
-    instance_name: str | None = None
-    settings: BlueStacksSettings = field(default_factory=BlueStacksSettings)
-
-    def __post_init__(self) -> None:
-        if self.adb_server_port is None:
-            raise _fail("bluestacks.adb_server_port", None, "an int in 1..65535")
-        _check_int("bluestacks.adb_server_port", self.adb_server_port, minimum=1, maximum=65535)
-        object.__setattr__(
-            self, "install_dir", _check_str("bluestacks.install_dir", self.install_dir)
-        )
-        object.__setattr__(self, "conf_path", _check_str("bluestacks.conf_path", self.conf_path))
-        object.__setattr__(
-            self,
-            "instance_name",
-            _check_str("bluestacks.instance_name", self.instance_name, strip=True),
-        )
-        if not isinstance(self.settings, BlueStacksSettings):
-            raise _fail("bluestacks.settings", type(self.settings).__name__, "a BlueStacksSettings")
-
-
-@dataclass(frozen=True, slots=True)
 class LogConfig:
     """Logging surface. Consumed ONLY by the CLI; the library never configures handlers."""
 
@@ -258,8 +178,6 @@ class EmuctlConfig:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     log: LogConfig = field(default_factory=LogConfig)
-    memu: MemuConfig | None = None
-    bluestacks: BlueStacksConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.adb, AdbConfig):
@@ -270,10 +188,6 @@ class EmuctlConfig:
             raise _fail("resources", type(self.resources).__name__, "a ResourceConfig")
         if not isinstance(self.log, LogConfig):
             raise _fail("log", type(self.log).__name__, "a LogConfig")
-        if self.memu is not None and not isinstance(self.memu, MemuConfig):
-            raise _fail("memu", type(self.memu).__name__, "a MemuConfig or None")
-        if self.bluestacks is not None and not isinstance(self.bluestacks, BlueStacksConfig):
-            raise _fail("bluestacks", type(self.bluestacks).__name__, "a BlueStacksConfig or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,32 +208,13 @@ class CreateSpec:
         )
 
 
-def resolve_renderer(mode: RendererMode, backend: BackendId) -> RendererMode | None:
-    """Resolve ``AUTO`` to the §4-pinned vendor default for ``backend``.
-
-    MEmu → DIRECTX; BlueStacks (Windows) → DIRECTX; BlueStacks Air (macOS) →
-    VULKAN; anything else (ADB has no renderer semantics) → None. A concrete
-    mode passes through untouched. Pure.
-    """
-    if mode is not RendererMode.AUTO:
-        return mode
-    if backend is BackendId.MEMU:
-        return RendererMode.DIRECTX
-    if backend is BackendId.BLUESTACKS:
-        return RendererMode.DIRECTX
-    if backend is BackendId.BLUESTACKS_AIR:
-        return RendererMode.VULKAN
-    return None
-
-
 def ensure_config_supported(cfg: EmuctlConfig, features: AbstractSet[object]) -> None:
     """Construction-time config ↔ capability gate.
 
-    ``[display]`` / ``[resources]`` / ``[memu.settings]`` /
-    ``[bluestacks.settings]`` each require the adapter to declare CONFIGURE;
-    anything set there without the flag is a typed refusal
+    ``[display]`` / ``[resources]`` each require the adapter to declare
+    CONFIGURE; anything set there without the flag is a typed refusal
     (``FeatureNotSupportedError``) — never a silent ignore. Selection/path
-    knobs (adb host/port, vm names, binary paths) are not gated. Backend
+    knobs (adb host/port, binary paths) are not gated. Backend
     ``features`` is the adapter's declared set; members are read by value so
     both enum and plain-string sets work. Pure.
     """
@@ -331,10 +226,6 @@ def ensure_config_supported(cfg: EmuctlConfig, features: AbstractSet[object]) ->
         offenders.append("[display]")
     if cfg.resources != ResourceConfig():
         offenders.append("[resources]")
-    if cfg.memu is not None and cfg.memu.settings != MemuSettings():
-        offenders.append("[memu.settings]")
-    if cfg.bluestacks is not None and cfg.bluestacks.settings != BlueStacksSettings():
-        offenders.append("[bluestacks.settings]")
     if offenders:
         joined = " ".join(offenders)
         raise FeatureNotSupportedError(

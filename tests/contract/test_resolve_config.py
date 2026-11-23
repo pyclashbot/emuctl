@@ -45,8 +45,6 @@ def test_env_flat_leaf_grammar(tmp_path: Path) -> None:
         env={
             "EMUCTL_DISPLAY_WIDTH": "800",
             "EMUCTL_DISPLAY_RENDERER": "VULKAN",
-            "EMUCTL_MEMU_VM_NAME": "bot-1",
-            "EMUCTL_MEMU_SETTINGS_HIDE_TOOLBAR": "true",
             "EMUCTL_RESOURCES_CPUS": "4",
             "EMUCTL_LOG_LEVEL": "debug",
             "PATH": "/usr/bin",
@@ -55,22 +53,15 @@ def test_env_flat_leaf_grammar(tmp_path: Path) -> None:
     )
     assert resolved.config.display.width == 800
     assert resolved.config.display.renderer is RendererMode.VULKAN
-    assert resolved.config.memu is not None
-    assert resolved.config.memu.vm_name == "bot-1"
-    assert resolved.config.memu.settings.hide_toolbar is True
     assert resolved.config.resources.cpus == 4
     assert resolved.config.log.level == "debug"
 
 
-def test_env_bool_tokens_strict(tmp_path: Path) -> None:
-    for token, expected in [("true", True), ("FALSE", False), ("1", True), ("0", False)]:
-        resolved = resolve_config(env={"EMUCTL_MEMU_SETTINGS_TURBO": token}, cwd=tmp_path)
-        assert resolved.config.memu is not None
-        assert resolved.config.memu.settings.turbo is expected
-    with pytest.raises(ConfigValidationError) as excinfo:
-        resolve_config(env={"EMUCTL_MEMU_SETTINGS_TURBO": "yes"}, cwd=tmp_path)
-    assert excinfo.value.layer == "env"
-    assert excinfo.value.path == "memu.settings.turbo"
+def test_removed_vendor_leaf_is_unknown_and_warns(tmp_path: Path) -> None:
+    resolved = resolve_config(env={"EMUCTL_MEMU_VM_NAME": "bot-1"}, cwd=tmp_path)
+    assert not hasattr(resolved.config, "memu")
+    assert len(resolved.warnings) == 1
+    assert resolved.warnings[0].layer == "env"
 
 
 def test_env_unknown_name_warns_with_hint(tmp_path: Path) -> None:

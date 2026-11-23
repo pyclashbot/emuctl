@@ -12,7 +12,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-keywords = ["adb", "android-emulator", "memu", "bluestacks", "avd"]
+keywords = ["adb", "android-emulator", "headless-android"]
 dependencies = ["anyio>=4.10"]
 
 [project.urls]
@@ -20,12 +20,8 @@ Repository = "https://github.com/pyclashbot/emuctl"
 Contract = "https://github.com/pyclashbot/emuctl/blob/main/CONTRACT.md"
 
 [project.optional-dependencies]
-memu = ["pymemuc>=0.6,<0.7"]
-bluestacks = []
-google-play = []
-avd = []
 cli = ["click>=8.2"]
-all = ["pymemuc>=0.6,<0.7", "click>=8.2"]
+all = ["click>=8.2"]
 
 [dependency-groups]
 dev = ["pytest>=8", "import-linter>=2.15", "pre-commit>=4"]
@@ -73,13 +69,7 @@ ignore_imports = [
 name = "Backend families are independent"
 type = "independence"
 include_external_packages = false
-modules = [
-  "emuctl.backends.adb",
-  "emuctl.backends.memu",
-  "emuctl.backends.bluestacks",
-  "emuctl.backends.google_play",
-  "emuctl.backends.avd",
-]
+modules = ["emuctl.backends.adb"]
 
 [tool.ruff]
 line-length = 100

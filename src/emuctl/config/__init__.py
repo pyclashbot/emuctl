@@ -13,15 +13,11 @@ from typing import Final, Literal, cast
 
 from emuctl.config.model import (
     AdbConfig,
-    BlueStacksConfig,
-    BlueStacksSettings,
     ConfigSpec,
     CreateSpec,
     DisplayConfig,
     EmuctlConfig,
     LogConfig,
-    MemuConfig,
-    MemuSettings,
     RendererMode,
     ResourceConfig,
 )
@@ -32,10 +28,6 @@ __all__ = [
     "DisplayConfig",
     "ResourceConfig",
     "AdbConfig",
-    "MemuSettings",
-    "MemuConfig",
-    "BlueStacksSettings",
-    "BlueStacksConfig",
     "LogConfig",
     "EmuctlConfig",
     "CreateSpec",
@@ -65,27 +57,12 @@ _LEAVES: Final[dict[str, _LeafKind]] = {
     "adb.path": "str",
     "adb.host": "str",
     "adb.port": "int",
-    "memu.memuc_path": "str",
-    "memu.vm_name": "str",
-    "memu.settings.hide_toolbar": "bool",
-    "memu.settings.turbo": "bool",
-    "memu.settings.audio": "bool",
-    "memu.settings.window_mode": "str",
-    "memu.settings.scale_percent": "int",
-    "bluestacks.adb_server_port": "int",
-    "bluestacks.install_dir": "str",
-    "bluestacks.conf_path": "str",
-    "bluestacks.instance_name": "str",
-    "bluestacks.settings.vsync": "bool",
-    "bluestacks.settings.high_fps": "bool",
     "log.level": "level",
     "log.file": "str",
 }
 
 #: Top-level sections (own a TOML table each).
-_SECTIONS: Final[frozenset[str]] = frozenset(
-    {"display", "resources", "adb", "memu", "bluestacks", "log"}
-)
+_SECTIONS: Final[frozenset[str]] = frozenset({"display", "resources", "adb", "log"})
 
 _ENV_PREFIX: Final[str] = "EMUCTL_"
 _TRUE_TOKENS: Final[frozenset[str]] = frozenset({"true", "1"})
@@ -227,7 +204,7 @@ class _Collector:
 
 
 def _apply_env(env: Mapping[str, str], out: _Collector) -> None:
-    """Flat leaf-only grammar: EMUCTL_DISPLAY_WIDTH, EMUCTL_MEMU_VM_NAME, …"""
+    """Flat leaf-only grammar: EMUCTL_DISPLAY_WIDTH, EMUCTL_RESOURCES_CPUS, …"""
     by_flat = {leaf.replace(".", "_"): leaf for leaf in _LEAVES}
     for name in sorted(env):
         if not name.startswith(_ENV_PREFIX):
@@ -286,14 +263,6 @@ def _walk_mapping(out: _Collector, data: Mapping[str, object], *, layer: str, pr
             _check_schema_version(value, layer=layer, path=path)
             continue
         if prefix == "" and key in _SECTIONS and not isinstance(value, Mapping):
-            raise ConfigValidationError(
-                layer=layer, path=path, value=_shown(value), expected="a table"
-            )
-        if (
-            prefix in ("memu", "bluestacks")
-            and key == "settings"
-            and not isinstance(value, Mapping)
-        ):
             raise ConfigValidationError(
                 layer=layer, path=path, value=_shown(value), expected="a table"
             )
@@ -400,38 +369,11 @@ def _build_config(out: _Collector) -> EmuctlConfig:
             host=cast(str, leaves.get("adb.host", "127.0.0.1")),
             port=cast(int, leaves.get("adb.port", 5037)),
         )
-        memu: MemuConfig | None = None
-        if any(k.startswith("memu.") for k in leaves):
-            memu = MemuConfig(
-                memuc_path=cast("str | None", leaves.get("memu.memuc_path")),
-                vm_name=cast("str | None", leaves.get("memu.vm_name")),
-                settings=MemuSettings(
-                    hide_toolbar=cast("bool | None", leaves.get("memu.settings.hide_toolbar")),
-                    turbo=cast("bool | None", leaves.get("memu.settings.turbo")),
-                    audio=cast("bool | None", leaves.get("memu.settings.audio")),
-                    window_mode=cast("str | None", leaves.get("memu.settings.window_mode")),
-                    scale_percent=cast("int | None", leaves.get("memu.settings.scale_percent")),
-                ),
-            )
-        bluestacks: BlueStacksConfig | None = None
-        if any(k.startswith("bluestacks.") for k in leaves):
-            bluestacks = BlueStacksConfig(
-                adb_server_port=cast(int, leaves.get("bluestacks.adb_server_port", 5041)),
-                install_dir=cast("str | None", leaves.get("bluestacks.install_dir")),
-                conf_path=cast("str | None", leaves.get("bluestacks.conf_path")),
-                instance_name=cast("str | None", leaves.get("bluestacks.instance_name")),
-                settings=BlueStacksSettings(
-                    vsync=cast("bool | None", leaves.get("bluestacks.settings.vsync")),
-                    high_fps=cast("bool | None", leaves.get("bluestacks.settings.high_fps")),
-                ),
-            )
         log = LogConfig(
             level=cast(str, leaves.get("log.level", "warning")),
             file=cast("str | None", leaves.get("log.file")),
         )
-        return EmuctlConfig(
-            adb=adb, display=display, resources=resources, log=log, memu=memu, bluestacks=bluestacks
-        )
+        return EmuctlConfig(adb=adb, display=display, resources=resources, log=log)
     except ConfigValidationError as exc:
         exc.layer = out.layers.get(exc.path, "config")
         raise

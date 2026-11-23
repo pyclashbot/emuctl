@@ -40,9 +40,9 @@ Interpretation decisions (CONTRACT §1 wins; these fill its silences):
   serial layer-3 re-check) implemented against the transport state the
   concrete adapter binds in its ``__init__`` — and, per §6's promotion tier,
   the shared echo-probe (``is_reachable``, the probe word, and the
-  stderr-failure classifier) that two+ ADB-speaking families (plain ADB and
-  MEmu) already want; backend adapters now inherit the probe instead of
-  carrying private copies. Remotely backend-specific truth — the FEATURES
+  stderr-failure classifier) shared by ADB-speaking adapters; v0.1's plain
+  ADB adapter inherits the probe instead of carrying a private copy.
+  Remotely backend-specific truth — the FEATURES
   set, the concrete ``_vendor_run`` through the ``_proc.py`` executor, the
   construction binding of ``AdbConfig``, and the module-level
   ``BackendDiscovery`` convention functions — stays in the backend module
@@ -137,7 +137,7 @@ class CapabilityFlag(enum.Enum):
     SCREENSHOT = "screenshot"  # screenshot()
     INPUT = "input"  # click / swipe / key / text
     APPS = "apps"  # start_app / is_app_installed
-    APK_INSTALL = "apk_install"  # install_apk (separately gated; Google Play cannot)
+    APK_INSTALL = "apk_install"  # install_apk (separately gated)
 
 
 ReadyCheck = Callable[["AsyncEmulatorController"], "bool | Awaitable[bool]"]
@@ -447,8 +447,7 @@ class AsyncEmulatorController(abc.ABC):
         """Existence probe backing create()'s pre-check. Default: absent (None).
 
         Backend adapters override this to consult their discovery seam; the
-        override MUST honor the passed deadline (the caller's slice — create()
-        and MEmu's lazy transport derivation both share it; a fresh
+        override MUST honor the passed deadline (the caller's slice; a fresh
         query-group hard-code would violate §2's one-deadline rule). The port
         layer cannot reach backend modules (§6 layers contract), so the
         default observes nothing.
@@ -525,7 +524,7 @@ class AsyncEmulatorController(abc.ABC):
         ...
 
     async def _install_apk(self, apk_path: str | os.PathLike[str], timeout: float | None) -> None:
-        """Install an APK (separately gated; Google Play cannot)."""
+        """Install an APK (separately gated)."""
         ...
 
     # ── lifecycle (gated defaults over the mechanics) ──
@@ -685,9 +684,6 @@ class AsyncEmulatorController(abc.ABC):
                         elapsed=time.monotonic() - start,
                     ),
                 ) from exc
-            # TRACKED PAIR with emuctl.backends.memu.MemuController.restart()'s
-            # phase() re-raise list (§6 sharing tiers — keep both files in
-            # sync when editing either list).
             except (
                 FeatureNotSupportedError,
                 ControllerClosedError,
@@ -1031,7 +1027,7 @@ def _stderr_excerpt(stderr: bytes) -> str:
 
 #: Probe word for the shared ADB-family transport probe: ``shell echo
 #: <word>``; the output is ignored (never parsed). Promoted to core per §6's
-#: sharing tiers (two+ ADB-speaking families — plain ADB and MEmu — use it).
+#: sharing tiers (shared by ADB-speaking adapters).
 _PROBE_WORD: Final[str] = "emuctl"
 
 

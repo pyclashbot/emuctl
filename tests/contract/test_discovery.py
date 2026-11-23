@@ -25,12 +25,10 @@ from emuctl.config.model import DisplayConfig, EmuctlConfig
 from emuctl.errors import (
     BackendNotAvailableError,
     BackendNotFoundError,
-    ExtrasMissingError,
-    FeatureNotSupportedError,
     InvalidArgumentError,
     InvalidSerialError,
 )
-from emuctl.port import AsyncEmulatorController
+from emuctl.port import AsyncEmulatorController, CapabilityFlag, DisplayState
 
 
 @pytest.fixture(autouse=True)
@@ -59,12 +57,17 @@ def _evict_backend_modules() -> Iterator[None]:
 class _ConfigDummy(AsyncEmulatorController):
     """Port subclass binding the resolved config (the connect() convention)."""
 
+    FEATURES = frozenset({CapabilityFlag.CONFIGURE})
+
     def __init__(self, ref: InstanceRef, config: EmuctlConfig | None = None) -> None:
         super().__init__(ref)
         self.bound_config = config
 
     async def _vendor_run(self, argv: Sequence[str], *, binary: bool = False) -> bytes | str:
         return b""
+
+    async def _configure(self, spec: Any, timeout: float | None) -> DisplayState:
+        return DisplayState(None, None, None)
 
 
 def _install_fake_module(
@@ -147,15 +150,19 @@ def test_row_reasons_pinned() -> None:
 
 def test_discover_default_order_is_by_backend_id(windows_host: Any) -> None:
     report = asyncio.run(discover(offline=True))
-    assert [status.backend for status in report.backends] == sorted(
-        BackendId, key=lambda item: item.value
-    )
+    # Default discovery walks the registry: v0.1 ships ADB only.
+    assert [status.backend for status in report.backends] == [BackendId.ADB]
     assert report.offline is True
 
 
 def test_discover_subset_sorted_and_deduped(windows_host: Any) -> None:
-    report = asyncio.run(discover([BackendId.MEMU, "adb", BackendId.MEMU], offline=True))
-    assert [status.backend for status in report.backends] == [BackendId.ADB, BackendId.MEMU]
+    report = asyncio.run(
+        discover([BackendId.GOOGLE_PLAY, "adb", BackendId.GOOGLE_PLAY], offline=True)
+    )
+    assert [status.backend for status in report.backends] == [
+        BackendId.ADB,
+        BackendId.GOOGLE_PLAY,
+    ]
 
 
 @pytest.mark.parametrize("backends", [["nope"], ["adb", "nope"], [123]])
@@ -184,28 +191,14 @@ def test_discover_offline_probes_nothing(
     report = asyncio.run(discover(offline=True))
     assert calls == []
     by_id = {status.backend: status for status in report.backends}
-    # No single host resolves every row: Windows resolves adb/memu/bs5 while
-    # Air (macOS-only) reports its platform refusal; unimplemented rows stay.
-    for backend in (BackendId.ADB, BackendId.MEMU, BackendId.BLUESTACKS):
-        assert by_id[backend].available is True
-        assert by_id[backend].reason == "offline"
-        assert by_id[backend].instances == ()
-    assert by_id[BackendId.BLUESTACKS_AIR].available is False
-    assert by_id[BackendId.BLUESTACKS_AIR].reason == "platform-unsupported"
-    for backend in (BackendId.GOOGLE_PLAY, BackendId.AVD):
-        assert by_id[backend].available is False
-        assert by_id[backend].reason == "not-implemented-this-version"
+    assert by_id[BackendId.ADB].available is True
+    assert by_id[BackendId.ADB].reason == "offline"
+    assert by_id[BackendId.ADB].instances == ()
 
 
-def test_discover_online_reports_stub_adapters_honestly(
-    windows_host: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Remaining adapter modules are docstring stubs: the online path must
-    # report "adapter-unavailable" rows, never raise. The ADB row is live:
-    # §7 pins the live tier as opt-in/marked and NEVER required, so its
-    # enumeration runs fully offline against a scripted executor (same
-    # _spawn seam as test_adb.py) — identical on machines with and without
-    # a real `adb` binary.
+def test_discover_online_adb_rows(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADB is the only shipped adapter: scripted `adb devices`, banner lines
+    skipped, all removed rows report not-implemented (never a probe)."""
     import importlib
 
     from emuctl._proc import ProcessExecutor
@@ -218,18 +211,10 @@ def test_discover_online_reports_stub_adapters_honestly(
         b"emulator-5554\tdevice\n"
         b"127.0.0.1:5555\tdevice\n"
         b"ABCDEF123456\toffline\n"
-        b"ZYX987\tunauthorized\n"
-    )
-    memuc_fixture = (
-        b"read failed\n"
-        b"0,MEmu 1,Default Android,0,0\n"
-        b"1,pyclashbot-136,Default Medium Android,1,4200\n"
-        b"garbage without commas\n"
     )
 
     class _FakeHandle:
-        def __init__(self) -> None:
-            self.returncode: int | None = 0
+        returncode: int | None = 0
 
         @property
         def pid(self) -> int | None:
@@ -242,89 +227,39 @@ def test_discover_online_reports_stub_adapters_honestly(
             return 0
 
         async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
-            return (memuc_fixture if any("listvms" in a for a in calls[-1]) else fixture, b"")
+            return (fixture, b"")
 
     async def _spawn(argv: Sequence[str]) -> _FakeHandle:
         calls.append(list(argv))
         return _FakeHandle()
 
-    def _scripted_executor() -> ProcessExecutor:
-        return ProcessExecutor(_spawn=_spawn)  # type: ignore[arg-type]
-
     adb_module = importlib.import_module("emuctl.backends.adb")
-    monkeypatch.setattr(adb_module, "ProcessExecutor", _scripted_executor)
-    memu_module = importlib.import_module("emuctl.backends.memu")
-    monkeypatch.setattr(memu_module, "ProcessExecutor", _scripted_executor)
-    # The BlueStacks family rows are LIVE conf-FILE readers now (no vendor
-    # stdout parsing — files are sanctioned, stdout prose is not): script the
-    # path resolution to an honest no-candidate store so the family rows read
-    # deterministically offline (same scripted-fake shape as the ADB/MEmu
-    # fixtures above — no real BlueStacks install is consulted).
-    stub_paths = types.ModuleType("_stub_paths")
-    stub_paths.__dict__["conf_path"] = lambda cfg, platform=None: None
-    stub_paths.__dict__["mim_meta_path"] = lambda cfg, platform=None: None
-    for backed in ("emuctl.backends.bluestacks.bs5", "emuctl.backends.bluestacks.air"):
-        sys.modules[backed] = importlib.import_module(backed)
-        monkeypatch.setattr(sys.modules[backed], "_paths", stub_paths)
+    monkeypatch.setattr(
+        adb_module,
+        "ProcessExecutor",
+        lambda: ProcessExecutor(_spawn=_spawn),  # type: ignore[arg-type]
+    )
     report = asyncio.run(discover())
-    assert report.offline is False
     by_id = {status.backend: status for status in report.backends}
-    # The ADB row: probed offline, banner lines skipped, rows honest.
     assert by_id[BackendId.ADB].available is True
     assert by_id[BackendId.ADB].reason == "ok"
     assert [str(r.ref) for r in by_id[BackendId.ADB].instances] == [
         "adb:emulator-5554",
         "adb:127.0.0.1:5555",
         "adb:ABCDEF123456",
-        "adb:ZYX987",
     ]
-    assert [r.running for r in by_id[BackendId.ADB].instances] == [True, True, False, False]
-    assert len(calls) == 2  # scripted, offline: adb devices + memuc listvms
-    assert calls[0][-1] == "devices" and "listvms" in calls[1]
-    assert all("daemon" not in str(row.ref) for row in by_id[BackendId.ADB].instances)
-    # The BlueStacks 5 row is a live conf-file reader: honest empty enumeration
-    # on the scripted no-candidate store (never adapter-unavailable, never a
-    # vendor probe; run state is conf-invisible → rows would set running False).
-    assert by_id[BackendId.BLUESTACKS].available is True
-    assert by_id[BackendId.BLUESTACKS].reason == "ok"
-    assert by_id[BackendId.BLUESTACKS].instances == ()
-    # MEMU is now a live adapter: its enumeration reads listvms rows
-    # offline — name-keyed refs, running from the running column only,
-    # unparseable lines ("read failed", comma-less noise) skipped.
-    assert by_id[BackendId.MEMU].available is True
-    assert by_id[BackendId.MEMU].reason == "ok"
-    assert [str(r.ref) for r in by_id[BackendId.MEMU].instances] == [
-        "memu:MEmu 1",
-        "memu:pyclashbot-136",
-    ]
-    assert [r.running for r in by_id[BackendId.MEMU].instances] == [False, True]
-    assert [r.details["index"] for r in by_id[BackendId.MEMU].instances] == ["0", "1"]
-    # Remaining docstring stubs report honestly; Air is macOS-only so a
-    # Windows host reports its platform refusal instead.
-    assert by_id[BackendId.BLUESTACKS_AIR].reason == "platform-unsupported"
-    for backend in (BackendId.GOOGLE_PLAY, BackendId.AVD):
-        assert by_id[backend].reason == "not-implemented-this-version"
+    assert [r.running for r in by_id[BackendId.ADB].instances] == [True, True, False]
+    assert len(calls) == 1 and calls[0][-1] == "devices"
 
 
-def test_discover_row_per_refusal_mode(macos_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    # macOS host: memu is platform-gated; air RESOLVES now but its conf-file
-    # enumeration reads through scripted no-candidate paths (offline honesty
-    # — no real /Applications/BlueStacks.app is consulted).
-    importlib = __import__("importlib")
-    for name in ("emuctl.backends.memu", "emuctl.backends.bluestacks.air"):
-        sys.modules.pop(name, None)
-    stub_paths = types.ModuleType("_stub_paths")
-    stub_paths.__dict__["conf_path"] = lambda cfg, platform=None: None
-    stub_paths.__dict__["mim_meta_path"] = lambda cfg, platform=None: None
-    air = importlib.import_module("emuctl.backends.bluestacks.air")
-    monkeypatch.setattr(air, "_paths", stub_paths)
-    report = asyncio.run(discover([BackendId.MEMU, BackendId.BLUESTACKS_AIR]))
+def test_discover_removed_rows_are_not_implemented(macos_host: Any) -> None:
+    report = asyncio.run(
+        discover([BackendId.ADB, BackendId.MEMU, BackendId.BLUESTACKS_AIR], offline=True)
+    )
     by_id = {status.backend: status for status in report.backends}
-    assert by_id[BackendId.MEMU].reason == "platform-unsupported"
-    assert by_id[BackendId.MEMU].available is False
-    assert by_id[BackendId.BLUESTACKS_AIR].reason == "ok"
-    assert by_id[BackendId.BLUESTACKS_AIR].available is True
-    assert by_id[BackendId.BLUESTACKS_AIR].instances == ()
+    assert by_id[BackendId.ADB].reason == "offline"
+    assert by_id[BackendId.MEMU].reason == "not-implemented-this-version"
+    assert by_id[BackendId.BLUESTACKS_AIR].reason == "not-implemented-this-version"
 
 
 def test_discover_convention_violation_is_adapter_unavailable(
@@ -351,28 +286,18 @@ def test_discover_convention_violation_is_adapter_unavailable(
     assert "(BackendDiscovery convention)" in (row.detail or "")
 
 
-def test_discover_per_backend_isolation(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    # One backend enumerates, one backend's probe explodes: rows, not failure.
+def test_discover_isolation_adb_keeps_working(
+    windows_host: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A removed backend row never breaks ADB enumeration."""
     _install_fake_module(
         monkeypatch, "emuctl.backends.adb", "AdbController", instances=(_adb_record(),)
     )
-    _install_fake_module(
-        monkeypatch,
-        "emuctl.backends.memu",
-        "MemuController",
-        probe_error=RuntimeError("memuc is dead"),
-    )
     report = asyncio.run(discover([BackendId.ADB, BackendId.MEMU]))
     by_id = {status.backend: status for status in report.backends}
-    adb = by_id[BackendId.ADB]
-    assert adb.available is True
-    assert adb.reason == "ok"
-    assert adb.instances == (_adb_record(),)
-    memu = by_id[BackendId.MEMU]
-    assert memu.available is False
-    assert memu.reason == "probe-failed"
-    assert memu.instances == ()
-    assert "memuc is dead" in (memu.detail or "")
+    assert by_id[BackendId.ADB].available is True
+    assert by_id[BackendId.ADB].instances == (_adb_record(),)
+    assert by_id[BackendId.MEMU].reason == "not-implemented-this-version"
 
 
 def test_discover_report_is_json_safe(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -423,22 +348,10 @@ def test_connect_refusal_not_implemented() -> None:
     assert excinfo.value.reason == "not-implemented-this-version"
 
 
-def test_connect_refusal_platform(macos_host: Any) -> None:
+def test_connect_refusal_removed_backend() -> None:
     with pytest.raises(BackendNotAvailableError) as excinfo:
         asyncio.run(connect(InstanceRef(backend=BackendId.MEMU, key="pyclashbot-136")))
-    assert excinfo.value.reason == "platform-unsupported"
-
-
-def test_connect_refusal_missing_dep(monkeypatch: pytest.MonkeyPatch) -> None:
-    from emuctl.backends import _registry
-
-    monkeypatch.setattr(_registry, "current_platform", lambda: Platform.WINDOWS)
-    # Hermetic: simulate the missing [memu] extra via the registry's
-    # dep-probe seam, independent of the ambient package store.
-    monkeypatch.setattr(_registry, "_dep_available", lambda name: False)
-    with pytest.raises(ExtrasMissingError) as excinfo:
-        asyncio.run(connect("memu:pyclashbot-136"))
-    assert excinfo.value.extra == "memu"
+    assert excinfo.value.reason == "not-implemented-this-version"
 
 
 @pytest.mark.parametrize(
@@ -446,7 +359,7 @@ def test_connect_refusal_missing_dep(monkeypatch: pytest.MonkeyPatch) -> None:
     [
         (Platform.LINUX, "google-play:anything", BackendNotAvailableError),
         (Platform.MACOS, "memu:pyclashbot-136", BackendNotAvailableError),
-        (Platform.WINDOWS, "memu:pyclashbot-136", ExtrasMissingError),
+        (Platform.WINDOWS, "bluestacks:any", BackendNotAvailableError),
         (Platform.LINUX, "adb:has space", InvalidSerialError),
         (Platform.LINUX, "emulator-5554", InvalidArgumentError),
     ],
@@ -473,12 +386,6 @@ def test_connect_validates_adb_keys_against_serial_allowlist() -> None:
         asyncio.run(connect("adb:has space"))
 
 
-def test_connect_validates_vendor_keys_via_spec(windows_host: Any) -> None:
-    with pytest.raises(InvalidArgumentError) as excinfo:
-        asyncio.run(connect("memu:has\nnewline"))
-    assert excinfo.value.parameter == "key"
-
-
 def test_connect_binds_resolved_config(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_module(monkeypatch, "emuctl.backends.adb", "AdbController")
     controller = asyncio.run(connect("adb:emulator-5554"))
@@ -493,14 +400,13 @@ def test_connect_binds_resolved_config(windows_host: Any, monkeypatch: pytest.Mo
     assert again.bound_config is cfg
 
 
-def test_connect_runs_config_capability_gate(
+def test_connect_accepts_display_for_adb_configure(
     windows_host: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _install_fake_module(monkeypatch, "emuctl.backends.adb", "AdbController")
     gated = EmuctlConfig(display=DisplayConfig(width=800, height=600))
-    with pytest.raises(FeatureNotSupportedError) as excinfo:
-        asyncio.run(connect("adb:emulator-5554", config=gated))
-    assert excinfo.value.feature == "configure"
+    controller = asyncio.run(connect("adb:emulator-5554", config=gated))
+    assert isinstance(controller, _ConfigDummy)
 
 
 def test_connect_rejects_bad_config_object(

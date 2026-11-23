@@ -6,22 +6,16 @@ from typing import Any
 
 import pytest
 
-from emuctl._identification import BackendId
 from emuctl.config.model import (
     AdbConfig,
-    BlueStacksConfig,
-    BlueStacksSettings,
     ConfigSpec,
     CreateSpec,
     DisplayConfig,
     EmuctlConfig,
     LogConfig,
-    MemuConfig,
-    MemuSettings,
     RendererMode,
     ResourceConfig,
     ensure_config_supported,
-    resolve_renderer,
 )
 from emuctl.errors import ConfigValidationError, FeatureNotSupportedError
 
@@ -37,9 +31,6 @@ def test_defaults_are_leave_as_is() -> None:
     assert cfg.display == DisplayConfig()
     assert cfg.resources == ResourceConfig()
     assert cfg.log == LogConfig(level="warning")
-    assert cfg.memu is None
-    assert cfg.bluestacks is None
-    assert BlueStacksConfig().adb_server_port == 5041
 
 
 @pytest.mark.parametrize(
@@ -66,18 +57,11 @@ def test_defaults_are_leave_as_is() -> None:
         lambda: AdbConfig(port=True),
         lambda: AdbConfig(host=""),
         lambda: AdbConfig(host="   "),
-        lambda: BlueStacksConfig(adb_server_port=0),
-        lambda: BlueStacksConfig(adb_server_port=70000),
-        lambda: MemuSettings(scale_percent=0),
-        lambda: MemuSettings(scale_percent=101),
-        lambda: MemuSettings(hide_toolbar=1),  # ty: ignore[invalid-argument-type]
-        lambda: BlueStacksSettings(vsync="yes"),  # ty: ignore[invalid-argument-type]
         lambda: DisplayConfig(renderer="bogus"),
         lambda: DisplayConfig(renderer=5),  # ty: ignore[invalid-argument-type]
         lambda: LogConfig(level="verbose"),
         lambda: LogConfig(level=""),
         lambda: LogConfig(level=10),  # ty: ignore[invalid-argument-type]
-        lambda: MemuConfig(vm_name="  "),
         lambda: CreateSpec(name=""),
         lambda: CreateSpec(name="   "),
     ],
@@ -121,10 +105,6 @@ def test_models_are_frozen_slotted() -> None:
         DisplayConfig,
         ResourceConfig,
         AdbConfig,
-        MemuSettings,
-        MemuConfig,
-        BlueStacksSettings,
-        BlueStacksConfig,
         LogConfig,
         EmuctlConfig,
         CreateSpec,
@@ -147,18 +127,10 @@ def test_gate_passes_with_configure_or_empty_config() -> None:
     full = EmuctlConfig(
         display=DisplayConfig(width=800),
         resources=ResourceConfig(cpus=2),
-        memu=MemuConfig(vm_name="v", settings=MemuSettings(hide_toolbar=True)),
-        bluestacks=BlueStacksConfig(settings=BlueStacksSettings(vsync=True)),
     )
     assert ensure_config_supported(full, frozenset({"configure"})) is None
     # Selection/path knobs alone never trip the gate.
-    assert (
-        ensure_config_supported(
-            EmuctlConfig(memu=MemuConfig(vm_name="v"), adb=AdbConfig(port=5038)),
-            frozenset(),
-        )
-        is None
-    )
+    assert ensure_config_supported(EmuctlConfig(adb=AdbConfig(port=5038)), frozenset()) is None
 
 
 @pytest.mark.parametrize(
@@ -166,8 +138,6 @@ def test_gate_passes_with_configure_or_empty_config() -> None:
     [
         EmuctlConfig(display=DisplayConfig(width=800)),
         EmuctlConfig(resources=ResourceConfig(cpus=2)),
-        EmuctlConfig(memu=MemuConfig(settings=MemuSettings(turbo=True))),
-        EmuctlConfig(bluestacks=BlueStacksConfig(settings=BlueStacksSettings(high_fps=True))),
     ],
 )
 def test_gate_refuses_without_configure(cfg: EmuctlConfig) -> None:
@@ -178,15 +148,6 @@ def test_gate_refuses_without_configure(cfg: EmuctlConfig) -> None:
     assert excinfo.value.error_code == "feature_not_supported"
 
 
-def test_plain_adb_display_is_typed_refusal() -> None:
-    with pytest.raises(FeatureNotSupportedError) as excinfo:
-        ensure_config_supported(EmuctlConfig(display=DisplayConfig(width=800)), frozenset())
-    assert excinfo.value.feature == "configure"
-
-
-def test_resolve_renderer_auto_mapping() -> None:
-    assert resolve_renderer(RendererMode.AUTO, BackendId.MEMU) is RendererMode.DIRECTX
-    assert resolve_renderer(RendererMode.AUTO, BackendId.BLUESTACKS) is RendererMode.DIRECTX
-    assert resolve_renderer(RendererMode.AUTO, BackendId.BLUESTACKS_AIR) is RendererMode.VULKAN
-    assert resolve_renderer(RendererMode.AUTO, BackendId.ADB) is None
-    assert resolve_renderer(RendererMode.VULKAN, BackendId.MEMU) is RendererMode.VULKAN
+def test_plain_adb_display_passes_once_configure_is_declared() -> None:
+    cfg = EmuctlConfig(display=DisplayConfig(width=800))
+    assert ensure_config_supported(cfg, frozenset({"configure"})) is None

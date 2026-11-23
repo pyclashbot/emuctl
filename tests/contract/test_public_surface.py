@@ -23,12 +23,10 @@ import pytest
 import emuctl
 from emuctl._discovery import BackendStatus, DiscoveryReport
 from emuctl._identification import BackendId, InstanceRef
-from emuctl._platforms import Platform
-from emuctl.config.model import DisplayConfig, EmuctlConfig, MemuConfig
+from emuctl.config.model import DisplayConfig, EmuctlConfig
 from emuctl.errors import (
     BackendNotAvailableError,
     FeatureNotSupportedError,
-    InstanceNotFoundError,
     InvalidArgumentError,
 )
 from emuctl.port import AsyncEmulatorController
@@ -107,10 +105,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "DisplayConfig",
         "ResourceConfig",
         "AdbConfig",
-        "MemuSettings",
-        "MemuConfig",
-        "BlueStacksSettings",
-        "BlueStacksConfig",
         "LogConfig",
         "EmuctlConfig",
         "CreateSpec",
@@ -247,21 +241,15 @@ def test_connect_refusals_raise_at_construction(target: Any, exception: type[Exc
     assert after == sorted(set(before) | {"emuctl.backends._registry"}), after
 
 
-def test_connect_platform_refusal_imports_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Spec-resolved refusal on the wrong host: platform →
-    BackendNotAvailableError("platform-unsupported") before any import, with
-    the selection order surviving package-level access (registry gate first)."""
-    from emuctl.backends import _registry
-
-    monkeypatch.setattr(_registry, "current_platform", lambda: Platform.MACOS)
-    monkeypatch.setattr(_registry, "_dep_available", lambda name: False)
-    before = set(sys.modules)
+def test_removed_backend_refusal_imports_nothing() -> None:
+    """Pinned BackendId values without a v0.1 row fail cleanly before any
+    adapter import (no memu/bluestacks module exists in this release)."""
+    before = sorted(m for m in sys.modules if m.startswith("emuctl.backends."))
     with pytest.raises(BackendNotAvailableError) as excinfo:
         asyncio.run(emuctl.connect("memu:pyclashbot-136"))
-    assert excinfo.value.reason == "platform-unsupported"
-    assert [
-        name for name in sys.modules if name not in before and name.startswith("emuctl.backends.")
-    ] == []
+    assert excinfo.value.reason == "not-implemented-this-version"
+    after = sorted(m for m in sys.modules if m.startswith("emuctl.backends."))
+    assert after == sorted(set(before) | {"emuctl.backends._registry"}), after
 
 
 # ── fake-scripted adapter through the package surface ──
@@ -380,86 +368,6 @@ def test_discover_rows_via_package_surface(monkeypatch: pytest.MonkeyPatch) -> N
 
     payload = json.loads(json.dumps(report.to_dict()))
     assert payload["backends"][0]["instances"][0]["ref"] == "adb:emulator-5554"
-
-
-# ── stale identity: InstanceNotFoundError surfaces on ops (§3) ──
-
-
-class _FakeResult:
-    returncode = 0
-    stdout = b""
-    stderr = b""
-
-
-class _FakeExecutor:
-    """Scripted memuc executor: `listvms` yields NO rows (the VM vanished)."""
-
-    def __init__(self, calls: list[list[str]]) -> None:
-        self._calls = calls
-
-    async def run(
-        self, argv: Sequence[str], *, operation: str, timeout: float | None
-    ) -> _FakeResult:
-        self._calls.append(list(argv))
-        return _FakeResult()
-
-
-def _scripted_memu(
-    monkeypatch: pytest.MonkeyPatch, calls: list[list[str]]
-) -> tuple[Any, EmuctlConfig]:
-    """Windows-host predicate plus the scripted memuc transport key. Platform
-    truth is the registry's, patched exactly like test_discovery/test_registry;
-    config sets the explicit memuc path so the transport seam resolves without
-    touching the host."""
-    from emuctl.backends import _registry
-
-    monkeypatch.setattr(_registry, "current_platform", lambda: Platform.WINDOWS)
-    monkeypatch.setattr(_registry, "_dep_available", lambda name: True)
-    memu = importlib.import_module("emuctl.backends.memu")
-    monkeypatch.setattr(memu, "ProcessExecutor", lambda: _FakeExecutor(calls))
-    cfg = EmuctlConfig(memu=MemuConfig(memuc_path="memuc"))
-    return memu, cfg
-
-
-def test_stale_identity_raises_instance_not_found_on_op(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """§3 identity lifetime: delete/disconnect ⇒ the ref goes stale ⇒ ops
-    raise InstanceNotFoundError (payload = canonical str(ref)) — through the
-    REAL MEmu adapter scripted at the _proc seam. Construction bound the ref
-    with zero vendor I/O (cheap construction); ONLY the op observes that the
-    listvms row vanished, and the typed refusal fires BEFORE any argv runs."""
-    calls: list[list[str]] = []
-    _, cfg = _scripted_memu(monkeypatch, calls)
-
-    controller = asyncio.run(emuctl.connect("memu:pyclashbot-136", config=cfg))
-    assert calls == []  # construction is cheap discovery — no vendor I/O
-    with pytest.raises(InstanceNotFoundError) as excinfo:
-        asyncio.run(controller.screenshot())
-    assert excinfo.value.instance_ref == "memu:pyclashbot-136"
-    # Exactly the stale-ref observation ran (one bounded listvms row fetch —
-    # the transport lookup), and NO boot/interaction argv followed.
-    assert len(calls) == 1 and "listvms" in calls[0]
-
-
-def test_stale_identity_is_exported_and_renderable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The taxonomy pin (§2/§7.1): the error CLASS is public; the payload
-    carries the canonical ref string (never the object); rendering is stable."""
-    _scripted_memu(monkeypatch, [])
-    controller = asyncio.run(
-        emuctl.connect(
-            "memu:pyclashbot-136",
-            config=EmuctlConfig(memu=MemuConfig(memuc_path="memuc")),
-        )
-    )
-    with pytest.raises(emuctl.InstanceNotFoundError) as excinfo:
-        asyncio.run(controller.screenshot())
-    exc = excinfo.value
-    assert exc.error_code == "instance_not_found"
-    assert exc.instance_ref == "memu:pyclashbot-136"
-    assert "memu:pyclashbot-136" in str(exc)
 
 
 # ── logging discipline survives the public surface (§2/§7.4) ──

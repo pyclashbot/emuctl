@@ -8,15 +8,12 @@ fixed refusal order; `load_adapter` is the ONLY dynamic adapter importer.
 
 Interpretation decisions (CONTRACT §3 wins; these fill its silences):
 
-- ``adapter_attr`` spellings (``AdbController``, ``MemuController``,
-  ``BlueStacks5Controller``, ``BlueStacksAirController``) are NOT pinned by
-  the baked contract — only the Air module path
-  (``emuctl.backends.bluestacks.air``) is. The ``<Vendor>Controller`` scheme
-  mirrors the port's ``AdbController`` middle-layer naming; adapter PRs treat
-  these spellings as pinned from here on. Name-collision note: core
-  ``AdbController`` (§6 middle layer, ADB-family interaction primitives) is a
-  different class from the future ``emuctl.backends.adb.AdbController``
-  (concrete adapter subclass inheriting it).
+- v0.1 ships the ADB backend only. ``adapter_attr`` for the sole row is
+  ``AdbController``; name-collision note: core ``AdbController`` (§6 middle
+  layer, ADB-family interaction primitives) is a different class from
+  ``emuctl.backends.adb.AdbController`` (the concrete adapter subclass
+  inheriting it). Removed vendor adapters are preserved on their stack
+  branches and are unverified for v0.1.
 - Key validators are core-owned callables referenced by the table (this file
   is core-owned per §6): ADB keys are transport serials, so the ADB row
   references the §3 serial allowlist (`validate_serial`) directly; vendor
@@ -35,7 +32,6 @@ Interpretation decisions (CONTRACT §3 wins; these fill its silences):
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
@@ -61,23 +57,6 @@ __all__ = [
     "resolve_backend",
     "load_adapter",
 ]
-
-#: Control characters rejected in vendor instance names (log/render safety).
-_CONTROL_RE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
-
-
-def _validate_vm_name(key: str) -> None:
-    """Vendor instance names: non-blank text with no control characters."""
-    if not isinstance(key, str) or not key.strip():
-        raise InvalidArgumentError(
-            parameter="key",
-            constraint="must be a non-empty instance name",
-        )
-    if _CONTROL_RE.search(key) is not None:
-        raise InvalidArgumentError(
-            parameter="key",
-            constraint="must not contain control characters",
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,12 +121,12 @@ class BackendSpec:
             )
 
 
-#: Module-level, pinned (§3): ADB full spec (core, all platforms); MEMU with
-#: its pymemuc dep (Windows); BLUESTACKS BS5 (Windows, HD-Player/HD-Adb.exe,
-#: MIM, private ADB server on 127.0.0.1:5041); BLUESTACKS_AIR (macOS
-#: Apple-Silicon Air, same [bluestacks] extra, family-package module,
-#: /Applications/BlueStacks.app + bundled hd-adb, single bluestacks.conf
-#: instance); GOOGLE_PLAY and AVD map to None (not implemented this version).
+#: Module-level, pinned (§3). v0.1 ships the ADB backend only: MEMU,
+#: BLUESTACKS, BLUESTACKS_AIR, GOOGLE_PLAY and AVD keep their pinned
+#: ``BackendId`` values (identity vocabulary) but have NO row here, so
+#: selection fails cleanly with ``BackendNotAvailableError`` and no adapter
+#: module is imported. Those adapters remain on their stack branches and are
+#: unverified for v0.1.
 _SPEC_TABLE: Final[dict[BackendId, BackendSpec | None]] = {
     BackendId.ADB: BackendSpec(
         backend=BackendId.ADB,
@@ -165,56 +144,6 @@ _SPEC_TABLE: Final[dict[BackendId, BackendSpec | None]] = {
         ),
         validate_key=validate_serial,  # §3 serial allowlist, referenced directly
     ),
-    BackendId.MEMU: BackendSpec(
-        backend=BackendId.MEMU,
-        extra="memu",
-        module="emuctl.backends.memu",
-        adapter_attr="MemuController",
-        supported_platforms=frozenset({Platform.WINDOWS}),
-        dep_modules=("pymemuc",),
-        description=(
-            "MEmu emulator driven through memuc "
-            "(Windows only; 'pymemuc' ships with the [memu] extra)."
-        ),
-        key_semantics=(
-            "MEmu VM name as shown by memuc (e.g. 'pyclashbot-136'); referential — "
-            "survives stop/start and reboots."
-        ),
-        validate_key=_validate_vm_name,
-    ),
-    BackendId.BLUESTACKS: BackendSpec(
-        backend=BackendId.BLUESTACKS,
-        extra="bluestacks",
-        module="emuctl.backends.bluestacks.bs5",
-        adapter_attr="BlueStacks5Controller",
-        supported_platforms=frozenset({Platform.WINDOWS}),
-        dep_modules=(),
-        description=(
-            "BlueStacks 5 on Windows (HD-Player with Multi-Instance Manager; "
-            "private ADB server on 127.0.0.1:5041)."
-        ),
-        key_semantics=("BlueStacks 5 instance name from the Multi-Instance Manager; referential."),
-        validate_key=_validate_vm_name,
-    ),
-    BackendId.BLUESTACKS_AIR: BackendSpec(
-        backend=BackendId.BLUESTACKS_AIR,
-        extra="bluestacks",
-        module="emuctl.backends.bluestacks.air",
-        adapter_attr="BlueStacksAirController",
-        supported_platforms=frozenset({Platform.MACOS}),
-        dep_modules=(),
-        description=(
-            "BlueStacks Air on macOS (Apple Silicon; /Applications/BlueStacks.app "
-            "with bundled hd-adb; single config-store instance)."
-        ),
-        key_semantics=(
-            "Air instance key from bluestacks.conf (single instance at v0; "
-            "MimMeta synthesized when cold); referential."
-        ),
-        validate_key=_validate_vm_name,
-    ),
-    BackendId.GOOGLE_PLAY: None,
-    BackendId.AVD: None,
 }
 
 
@@ -260,10 +189,17 @@ def resolve_backend(backend: BackendId | str) -> BackendSpec:
         wanted = BackendId.from_string(backend)
     else:
         raise BackendNotFoundError(backend_id=repr(backend))
-    try:
-        spec = _SPEC_TABLE[wanted]
-    except KeyError:
-        raise BackendNotFoundError(backend_id=wanted.value) from None
+    if wanted not in _SPEC_TABLE:
+        # Pinned BackendId value with no v0.1 row: known vocabulary, not
+        # shipped in this release (the adapter lives on its stack branch).
+        raise BackendNotAvailableError(
+            reason="not-implemented-this-version",
+            detail=(
+                f"backend '{wanted.value}' is not shipped in v0.1 "
+                "(ADB backend only); it remains on its stack branch"
+            ),
+        )
+    spec = _SPEC_TABLE[wanted]
     if spec is None:
         raise BackendNotAvailableError(
             reason="not-implemented-this-version",
