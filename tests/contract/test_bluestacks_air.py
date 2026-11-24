@@ -800,6 +800,40 @@ async def test_restart_settle_retries_until_frame_decodes(
 
 
 @_sync
+async def test_restart_terminal_check_reobserves_a_flapping_transport(
+    air_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transport can flap offline right after boot: the terminal
+    screenshot check is a bounded readiness probe too, not one shot."""
+    monkeypatch.setattr(air_module, "_BOOT_POLL_S", 0.0)
+    monkeypatch.setattr(air_module, "_PROBE_TIMEOUT_S", 1.0)
+    tools, conf = _make_env(tmp_path)
+    calls: list[list[str]] = []
+    screencaps = {"n": 0}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        head = Path(argv[0]).name
+        if head == "BlueStacks":
+            return _SpawnedHandle()
+        if head == "pgrep":
+            return _FakeHandle(returncode=1)
+        if head == "pkill":
+            return _FakeHandle(returncode=0)
+        if head == "hd-adb":
+            if "screencap" in argv:
+                screencaps["n"] += 1
+                if screencaps["n"] == 2:  # settle decoded; terminal flaps offline
+                    return _FakeHandle(stderr=b"device offline", returncode=255)
+                return _FakeHandle(stdout=_png(), returncode=0)
+            return _FakeHandle(returncode=0)
+        return _FakeHandle()
+
+    ctl = _make(air_module, calls, respond, config=_config(tools, conf))
+    await ctl.restart(timeout=5)
+    assert screencaps["n"] == 3  # settle, one failed terminal probe, re-check
+
+
+@_sync
 async def test_restart_ready_false_is_menu_not_reached(air_module: Any, tmp_path: Path) -> None:
     from emuctl.errors import EmulatorNotReadyError
 

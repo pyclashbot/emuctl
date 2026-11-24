@@ -777,7 +777,9 @@ class BlueStacksAirController(_AdbMiddleLayer):
             if not present:
                 raise EmulatorNotReadyError(reason="app_not_installed", cause=None)
         else:
-            png_dimensions(await phase("restart", "settle_failed", lambda left: self.screenshot(timeout=left)))
+            # Same bounded settle probe: ADB can flap offline for a moment
+            # right after boot, and the terminal check is still readiness.
+            await phase("restart", "settle_failed", settle)
         logger.debug("restart ready ref=%s", sanitize(str(self._ref)))
 
     # ── lifecycle close ──
