@@ -7,6 +7,7 @@
 ## Workflow
 
 - Conventional commits (`feat:`, `fix:`, `chore:`, …). Commitizen cz check runs on commit-msg.
+- Every user-visible change adds a `CHANGELOG.md` entry under `Unreleased` in the same PR.
 - Sync deps: `make setup` (uv sync + pre-commit install). Run lint/type-check/test via `make lint`, `make type-check`, `make test`.
 - Enforcement is import-linter layers/independence contracts + ruff TID251 (see §6) — keep these green.
 - Never import `subprocess` outside `src/emuctl/_proc.py`; never parse vendor stdout for control flow.
