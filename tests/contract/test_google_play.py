@@ -325,7 +325,12 @@ async def test_registry_install_location_resolves_bundled_adb(
 
 
 @_sync
-async def test_missing_adb_is_typed_refusal_before_io(gp_module: Any) -> None:
+async def test_missing_adb_is_typed_refusal_before_io(
+    gp_module: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Force "no install": otherwise a real Google Play install on the test host
+    # (its registry row) resolves a bundled adb and there is nothing to refuse.
+    monkeypatch.setattr(gp_module, "_registry_install_root", lambda: None)
     calls: list[list[str]] = []
     ctl = _make(gp_module, calls, _ok(), config=EmuctlConfig(google_play=GooglePlayConfig()))
     with pytest.raises(ExecutableNotFoundError) as excinfo:
@@ -454,7 +459,12 @@ async def test_list_instances_offline_state(gp_module: Any) -> None:
 
 
 @_sync
-async def test_list_instances_no_adb_is_honest_empty(gp_module: Any) -> None:
+async def test_list_instances_no_adb_is_honest_empty(
+    gp_module: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Force "no install" so a real Google Play install on the test host does not
+    # resolve a bundled adb and produce an enumerated row.
+    monkeypatch.setattr(gp_module, "_registry_install_root", lambda: None)
     assert await gp_module.list_instances(EmuctlConfig(google_play=GooglePlayConfig())) == ()
 
 
