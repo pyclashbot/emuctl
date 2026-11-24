@@ -21,8 +21,6 @@ ADB_MODULE = "emuctl.backends.adb"
 #: Removed vendor adapters/deps: v0.1 has no modules and must never import them.
 REMOVED_MODULES = (
     "emuctl.backends.memu",
-    "emuctl.backends.bluestacks",
-    "emuctl.backends.bluestacks.bs5",
     "emuctl.backends.bluestacks.air",
     "emuctl.backends.google_play",
     "emuctl.backends.avd",
@@ -76,10 +74,24 @@ def test_pinned_backend_ids_survive_trimming() -> None:
     }
 
 
-def test_registry_has_only_the_adb_row(reg: Any) -> None:
+def test_registry_has_the_adb_and_bluestacks_rows(reg: Any) -> None:
     registry = reg.get_registry()
-    assert set(registry) == {BackendId.ADB}
+    assert set(registry) == {BackendId.ADB, BackendId.BLUESTACKS}
     assert isinstance(registry[BackendId.ADB], reg.BackendSpec)
+    assert isinstance(registry[BackendId.BLUESTACKS], reg.BackendSpec)
+
+
+def test_bluestacks_spec_is_pinned(reg: Any) -> None:
+    spec = reg.get_registry()[BackendId.BLUESTACKS]
+    assert spec.backend is BackendId.BLUESTACKS
+    assert spec.extra == "bluestacks"
+    assert spec.module == "emuctl.backends.bluestacks.bs5"
+    assert spec.adapter_attr == "BlueStacks5Controller"
+    assert spec.supported_platforms == frozenset({Platform.WINDOWS})
+    assert spec.dep_modules == ()
+    assert spec.description.strip() != ""
+    assert spec.key_semantics.strip() != ""
+    assert callable(spec.validate_key)
 
 
 def test_adb_spec_is_pinned(reg: Any) -> None:
@@ -119,7 +131,6 @@ def test_refusal_unknown_id_first(reg: Any, no_backend_imports: None) -> None:
     "backend",
     [
         BackendId.MEMU,
-        BackendId.BLUESTACKS,
         BackendId.BLUESTACKS_AIR,
         BackendId.GOOGLE_PLAY,
         BackendId.AVD,
@@ -134,10 +145,34 @@ def test_removed_backends_refuse_cleanly(reg: Any, backend: BackendId, no_backen
 
 
 @pytest.mark.parametrize("platform", [Platform.WINDOWS, Platform.MACOS, Platform.LINUX])
-def test_available_backends_is_adb_only(reg: Any, platform: Platform, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_available_backends_is_adb_only_without_vendor_deps(
+    reg: Any, platform: Platform, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(reg, "current_platform", lambda: platform)
     monkeypatch.setattr(reg, "_dep_available", lambda name: False)
-    assert [spec.backend for spec in reg.available_backends()] == [BackendId.ADB]
+    expected = [BackendId.ADB]
+    if platform is Platform.WINDOWS:
+        expected.append(BackendId.BLUESTACKS)
+    assert [spec.backend for spec in reg.available_backends()] == expected
+
+
+def test_available_backends_includes_bluestacks_on_windows(reg: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.WINDOWS)
+    assert [spec.backend for spec in reg.available_backends()] == [
+        BackendId.ADB,
+        BackendId.BLUESTACKS,
+    ]
+
+
+def test_bluestacks_selection_refuses_platform(
+    reg: Any, no_backend_imports: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.MACOS)
+    with pytest.raises(BackendNotAvailableError) as excinfo:
+        reg.resolve_backend(BackendId.BLUESTACKS)
+    assert excinfo.value.reason == "platform-unsupported"
+    assert "windows" in (excinfo.value.detail or "")
+    assert [name for name in NEVER_IMPORT if name in sys.modules] == []
 
 
 class _DummyController(AsyncEmulatorController):
@@ -238,8 +273,32 @@ def test_key_structural_rule_still_lives_in_identity() -> None:
         InstanceRef(backend=BackendId.MEMU, key="   ")
 
 
+@pytest.mark.parametrize("key", ["pyclashbot-136", "My VM 2", "BlueStacks 5"])
+def test_bluestacks_key_rule_accepts_vm_names(reg: Any, key: str) -> None:
+    spec = reg.get_registry()[BackendId.BLUESTACKS]
+    assert spec.validate_key(key) is None
+
+
+@pytest.mark.parametrize("key", ["", "   ", "has\nnewline", "has\rcarriage"])
+def test_bluestacks_key_rule_rejects(reg: Any, key: str) -> None:
+    spec = reg.get_registry()[BackendId.BLUESTACKS]
+    with pytest.raises(InvalidArgumentError) as excinfo:
+        spec.validate_key(key)
+    assert excinfo.value.parameter == "key"
+
+
 def test_spec_row_conformance_adb(reg: Any) -> None:
     spec = reg.get_registry()[BackendId.ADB]
+    adapter = reg.load_adapter(spec)
+    assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)
+    module = sys.modules[spec.module]
+    assert callable(getattr(module, "list_instances", None))
+    assert callable(getattr(module, "get_instance", None))
+
+
+def test_spec_row_conformance_bluestacks(reg: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = reg.get_registry()[BackendId.BLUESTACKS]
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.WINDOWS)
     adapter = reg.load_adapter(spec)
     assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)
     module = sys.modules[spec.module]

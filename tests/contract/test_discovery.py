@@ -123,8 +123,8 @@ def test_row_reasons_pinned() -> None:
 
 def test_discover_default_order_is_by_backend_id(windows_host: Any) -> None:
     report = asyncio.run(discover(offline=True))
-    # Default discovery walks the registry: v0.1 ships ADB only.
-    assert [status.backend for status in report.backends] == [BackendId.ADB]
+    # Default discovery walks the registry: ADB + BlueStacks 5 shipped here.
+    assert [status.backend for status in report.backends] == [BackendId.ADB, BackendId.BLUESTACKS]
     assert report.offline is True
 
 
@@ -206,7 +206,7 @@ def test_discover_online_adb_rows(windows_host: Any, monkeypatch: pytest.MonkeyP
         "ProcessExecutor",
         lambda: ProcessExecutor(_spawn=_spawn),  # type: ignore[arg-type]
     )
-    report = asyncio.run(discover())
+    report = asyncio.run(discover([BackendId.ADB]))
     by_id = {status.backend: status for status in report.backends}
     assert by_id[BackendId.ADB].available is True
     assert by_id[BackendId.ADB].reason == "ok"
@@ -297,7 +297,7 @@ def test_connect_refusal_not_implemented() -> None:
 
 def test_connect_refusal_removed_backend() -> None:
     with pytest.raises(BackendNotAvailableError) as excinfo:
-        asyncio.run(connect(InstanceRef(backend=BackendId.MEMU, key="pyclashbot-136")))
+        asyncio.run(connect(InstanceRef(backend=BackendId.GOOGLE_PLAY, key="anything")))
     assert excinfo.value.reason == "not-implemented-this-version"
 
 
@@ -306,7 +306,7 @@ def test_connect_refusal_removed_backend() -> None:
     [
         (Platform.LINUX, "google-play:anything", BackendNotAvailableError),
         (Platform.MACOS, "memu:pyclashbot-136", BackendNotAvailableError),
-        (Platform.WINDOWS, "bluestacks:any", BackendNotAvailableError),
+        (Platform.MACOS, "bluestacks:any", BackendNotAvailableError),
         (Platform.LINUX, "adb:has space", InvalidSerialError),
         (Platform.LINUX, "emulator-5554", InvalidArgumentError),
     ],

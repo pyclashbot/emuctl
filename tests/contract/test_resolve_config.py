@@ -4,6 +4,7 @@ import pytest
 
 from emuctl.config import (
     EmuctlConfig,
+    RendererMode,
     ResolvedConfig,
     resolve_config,
 )
@@ -44,11 +45,53 @@ def test_env_flat_leaf_grammar(tmp_path: Path) -> None:
     assert resolved.config.display.width == 800
 
 
-def test_removed_vendor_leaf_is_unknown_and_warns(tmp_path: Path) -> None:
-    resolved = resolve_config(env={"EMUCTL_MEMU_VM_NAME": "bot-1"}, cwd=tmp_path)
-    assert not hasattr(resolved.config, "memu")
+def test_unshipped_vendor_leaf_is_unknown_and_warns(tmp_path: Path) -> None:
+    resolved = resolve_config(env={"EMUCTL_AVD_NAME": "bot-1"}, cwd=tmp_path)
+    assert resolved.config.bluestacks is None
     assert len(resolved.warnings) == 1
     assert resolved.warnings[0].layer == "env"
+
+
+def test_bluestacks_and_resource_env_leaves_are_recognized(tmp_path: Path) -> None:
+    resolved = resolve_config(
+        env={
+            "EMUCTL_BLUESTACKS_INSTANCE_NAME": "pyclashbot-136",
+            "EMUCTL_BLUESTACKS_SETTINGS_VSYNC": "true",
+            "EMUCTL_BLUESTACKS_ADB_SERVER_PORT": "5041",
+            "EMUCTL_RESOURCES_CPUS": "2",
+            "EMUCTL_DISPLAY_RENDERER": "auto",
+            "EMUCTL_DISPLAY_FPS": "40",
+        },
+        cwd=tmp_path,
+    )
+    assert resolved.warnings == ()
+    assert resolved.config.bluestacks is not None
+    assert resolved.config.bluestacks.instance_name == "pyclashbot-136"
+    assert resolved.config.bluestacks.adb_server_port == 5041
+    assert resolved.config.bluestacks.settings.vsync is True
+    assert resolved.config.resources.cpus == 2
+    assert resolved.config.display.renderer == RendererMode.AUTO
+    assert resolved.config.display.fps == 40
+
+
+def test_bluestacks_toml_table_builds_config(tmp_path: Path) -> None:
+    (tmp_path / "emuctl.toml").write_text(
+        "[display]\nwidth = 419\nheight = 633\nrenderer = 'opengl'\n"
+        "[resources]\ncpus = 2\nmemory_mb = 2048\n"
+        "[bluestacks]\ninstall_dir = '/opt/bluestacks'\nconf_path = '/opt/bluestacks/bluestacks.conf'\n"
+        "instance_name = 'bot-1'\n"
+        "[bluestacks.settings]\nvsync = false\nhigh_fps = true\n",
+        encoding="utf-8",
+    )
+    resolved = resolve_config(env={}, cwd=tmp_path)
+    assert resolved.config.display.renderer == RendererMode.OPENGL
+    assert resolved.config.resources.memory_mb == 2048
+    assert resolved.config.bluestacks is not None
+    assert resolved.config.bluestacks.install_dir == "/opt/bluestacks"
+    assert resolved.config.bluestacks.instance_name == "bot-1"
+    assert resolved.config.bluestacks.settings.vsync is False
+    assert resolved.config.bluestacks.settings.high_fps is True
+    assert resolved.warnings == ()
 
 
 def test_env_unknown_name_warns_with_hint(tmp_path: Path) -> None:
