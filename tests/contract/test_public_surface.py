@@ -46,6 +46,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "connect_sync",
         "EmulatorController",
         "discover",
+        "select_instance",
         "BackendStatus",
         "DiscoveryReport",
         # Identity + platform (§3).

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import os
 import subprocess
 import sys
 import time
 from asyncio.subprocess import DEVNULL, PIPE
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Protocol
@@ -50,22 +52,26 @@ def _creationflags() -> int:
     return 0
 
 
-async def _default_spawn(argv: Sequence[str]) -> _ProcessHandle:
+async def _default_spawn(argv: Sequence[str], *, env: Mapping[str, str] | None = None) -> _ProcessHandle:
     return await asyncio.create_subprocess_exec(
         *argv,
         stdout=PIPE,
         stderr=PIPE,
         stdin=DEVNULL,
+        env=env,
         creationflags=_creationflags(),
     )
 
 
-async def _default_spawn_detached(argv: Sequence[str]) -> _ProcessHandle:
+async def _default_spawn_detached(
+    argv: Sequence[str], *, env: Mapping[str, str] | None = None
+) -> _ProcessHandle:
     return await asyncio.create_subprocess_exec(
         *argv,
         stdout=DEVNULL,
         stderr=DEVNULL,
         stdin=DEVNULL,
+        env=env,
         creationflags=_creationflags(),
     )
 
@@ -88,11 +94,51 @@ def _validate_argv(argv: Sequence[str]) -> list[str]:
     return args
 
 
+def _validate_env(env: Mapping[str, str] | None) -> dict[str, str] | None:
+    if env is None:
+        return None
+    if not isinstance(env, Mapping):
+        raise InvalidArgumentError(
+            parameter="env",
+            constraint="must be a mapping of str to str, or None",
+        )
+    overlay: dict[str, str] = {}
+    for key, value in env.items():
+        if not isinstance(key, str) or not key or "=" in key or "\x00" in key:
+            raise InvalidArgumentError(
+                parameter="env",
+                constraint="every key must be a non-empty str with no '=' or NUL",
+            )
+        if not isinstance(value, str) or "\x00" in value:
+            raise InvalidArgumentError(
+                parameter="env",
+                constraint="every value must be a str with no NUL",
+            )
+        overlay[key] = value
+    return overlay
+
+
 class ProcessExecutor:
-    def __init__(self, *, _spawn: _SpawnFn | None = None) -> None:
-        self._spawn_fn: _SpawnFn = _spawn if _spawn is not None else _default_spawn
-        self._spawn_detached_fn: _SpawnFn = self._spawn_fn if _spawn is not None else _default_spawn_detached
+    def __init__(
+        self,
+        *,
+        env: Mapping[str, str] | None = None,
+        _spawn: _SpawnFn | None = None,
+    ) -> None:
+        self._env = _validate_env(env)
+        if _spawn is not None:
+            self._spawn_fn: _SpawnFn = _spawn
+            self._spawn_detached_fn: _SpawnFn = _spawn
+        else:
+            merged = None if self._env is None else {**os.environ, **self._env}
+            self._spawn_fn = functools.partial(_default_spawn, env=merged)
+            self._spawn_detached_fn = functools.partial(_default_spawn_detached, env=merged)
         self._live: set[_ProcessHandle] = set()
+
+    @property
+    def env(self) -> Mapping[str, str] | None:
+        """Per-instance environment overlay, or ``None`` when the child inherits."""
+        return self._env
 
     def _track(self, proc: _ProcessHandle) -> None:
         self._live.add(proc)
@@ -180,8 +226,14 @@ class ProcessExecutor:
             self._untrack(proc)
 
 
-async def run_process(argv: Sequence[str], *, operation: str, timeout: TimeoutParam = DEFAULT) -> ProcessResult:
-    executor = ProcessExecutor()
+async def run_process(
+    argv: Sequence[str],
+    *,
+    operation: str,
+    timeout: TimeoutParam = DEFAULT,
+    env: Mapping[str, str] | None = None,
+) -> ProcessResult:
+    executor = ProcessExecutor(env=env)
     try:
         return await executor.run(argv, operation=operation, timeout=timeout)
     finally:

@@ -9,6 +9,7 @@ from emuctl._discovery import (  # noqa: E402
     DiscoveryReport,
     connect,
     discover,
+    select_instance,
 )
 from emuctl._identification import BackendId, InstanceRecord, InstanceRef  # noqa: E402
 from emuctl._platforms import Platform, current_platform  # noqa: E402
@@ -117,6 +118,7 @@ __all__: list[str] = [
     "connect",
     "current_platform",
     "discover",
+    "select_instance",
     "EmulatorController",
     "connect_sync",
     "ensure_config_supported",
