@@ -112,10 +112,27 @@ _BLUESTACKS_LEAVES: Final[frozenset[str]] = frozenset(
     }
 )
 
-#: Known-canonical heads whose leaves this table partially covers — a leaf
-#: under them that is NOT in the table is the typed gate refusal, as opposed
-#: to an unknown key (caller misuse).
-_PARTIAL_HEADS: Final[frozenset[str]] = frozenset({"display", "resources", "bluestacks"})
+#: CANONICAL config leaves this adapter cannot translate: they deploy the
+#: §4 gate (typed, never silently dropped) instead of caller-misuse. Every
+#: other key outside :data:`_BLUESTACKS_LEAVES` is unknown vocabulary.
+_UNTRANSLATABLE_CANONICAL: Final[frozenset[str]] = frozenset(
+    {
+        "resources.cpu_cap_pct",
+        "adb.path",
+        "adb.host",
+        "adb.port",
+        "bluestacks.adb_server_port",
+        "bluestacks.install_dir",
+        "bluestacks.conf_path",
+        "bluestacks.instance_name",
+    }
+)
+
+#: Config sections whose CANONICAL leaves belong to other backends/selection
+#: (not Air's translation table): a leaf under one deploys the gate. Under
+#: ``display``/``resources`` the vocabulary is fully known here, so an
+#: unknown sub-leaf there stays caller misuse.
+_FOREIGN_SECTIONS: Final[frozenset[str]] = frozenset({"adb", "bluestacks", "memu", "google-play", "avd"})
 
 
 def _fail(path: str, value: object, expected: str) -> ConfigValidationError:
@@ -447,7 +464,7 @@ def overlay_entries(
             )
         if key not in _BLUESTACKS_LEAVES:
             head = key.partition(".")[0]
-            if head in _PARTIAL_HEADS | {"memu", "adb", "log", "google-play", "avd"}:
+            if key in _UNTRANSLATABLE_CANONICAL or head in _FOREIGN_SECTIONS:
                 raise _untranslatable(key)
             raise InvalidArgumentError(
                 parameter=key,

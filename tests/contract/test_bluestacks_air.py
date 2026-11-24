@@ -93,6 +93,10 @@ class _FakeHandle:
     def kill(self) -> None:
         self.killed = True
 
+    def finish(self, returncode: int = 0) -> None:
+        """Simulate the child exiting on its own."""
+        self._returncode = returncode
+
     async def wait(self) -> int:
         return self._returncode or 0
 
@@ -166,6 +170,17 @@ def _make(
     ref = InstanceRef(backend=BackendId.BLUESTACKS_AIR, key=key)
     executor = ProcessExecutor(_spawn=_spawn_factory(calls, respond))  # type: ignore[arg-type]
     return air_module.BlueStacksAirController(ref, config=config, _executor=executor)
+
+
+def _discovery_executor(pgrep_rc: int = 1) -> ProcessExecutor:
+    """Offline executor for the module-level discovery seams."""
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        if Path(argv[0]).name == "pgrep":
+            return _FakeHandle(returncode=pgrep_rc)
+        return _FakeHandle()
+
+    return ProcessExecutor(_spawn=_spawn_factory([], respond))  # type: ignore[arg-type]
 
 
 class _SpawnedHandle(_FakeHandle):
@@ -267,7 +282,7 @@ def test_present_mim_metadata_is_used_once_published(air_module: Any, tmp_path: 
         '{"Organization": [{"Name": "Air Main", "InstanceName": "Tiramisu64"}]}',
         encoding="utf-8",
     )
-    rows = asyncio.run(air_module.list_instances(_config(tools, conf)))
+    rows = asyncio.run(air_module.list_instances(_config(tools, conf), _executor=_discovery_executor()))
     assert [row.ref.key for row in rows] == ["Air Main"]
 
 
@@ -278,7 +293,7 @@ def test_malformed_mim_metadata_is_typed(air_module: Any, tmp_path: Path) -> Non
     meta_path.parent.mkdir(parents=True)
     meta_path.write_text("{not json", encoding="utf-8")
     with pytest.raises(ConfigValidationError):
-        asyncio.run(air_module.list_instances(_config(tools, conf)))
+        asyncio.run(air_module.list_instances(_config(tools, conf), _executor=_discovery_executor()))
 
 
 # ── BOOT mechanics: detached launch + exit-status pgrep/pkill ──
@@ -341,12 +356,37 @@ async def test_stop_argv_is_the_strict_bound_key_pattern(air_module: Any, tmp_pa
     calls: list[list[str]] = []
     ctl = _make(air_module, calls, _air_responder(calls), config=_config(tools, conf))
     await ctl.stop()
-    assert len(calls) == 1
-    assert calls[0][0] == "pkill" and calls[0][1] == "-f"
-    pattern = calls[0][2]
+    pkill = next(call for call in calls if call[0] == "pkill")
+    assert pkill[1] == "-f"
+    pattern = pkill[2]
     assert "\\ \\-\\-instance\\ Tiramisu64" in pattern  # the --instance arg, escaped
     assert KEY in pattern
     assert pattern.startswith("/Applications/") or "BlueStacks" in pattern
+    assert "BlueStacks$" in pattern  # the bare app launch (Finder) alternative
+
+
+@_sync
+async def test_pgrep_pattern_scopes_to_the_player_and_instance(air_module: Any, tmp_path: Path) -> None:
+    """Bare app launches and our ``--instance`` launch both count; a
+    *different* instance, a sibling binary, or the vendor's bare
+    ``BlueStacks`` substring sweep never does."""
+    import re
+
+    tools, conf = _make_env(tmp_path)
+    ctl = _make(air_module, [], _air_responder([]), config=_config(tools, conf))
+    player = str(tools / "BlueStacks")
+    pattern = ctl._pgrep_pattern(KEY)
+
+    def matches(cmdline: str) -> bool:
+        return re.search(pattern, cmdline) is not None
+
+    assert matches(player)
+    assert matches(f"{player} --instance {KEY}")
+    assert matches(f"{player} --instance {KEY} --restarted")
+    assert not matches(f"{player} --instance Tiramisu642")
+    assert not matches(f"{player} --instance Pie64")
+    assert not matches("/Applications/BlueStacks.app/Contents/Resources/BlueStacksAI/BlueStacksAI")
+    assert not matches("/Applications/BlueStacks.app/Contents/MacOS/HD-Player --instance Tiramisu64")
 
 
 @_sync
@@ -377,6 +417,47 @@ async def test_stop_nonzero_rc_raises_honestly(air_module: Any, tmp_path: Path) 
 
 
 @_sync
+async def test_stop_waits_for_the_player_to_exit(
+    air_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A signalled player can still be exiting; stop observes until gone so
+    configure-while-stopped cannot race the vendor's conf rewrite."""
+    monkeypatch.setattr(air_module, "_STOP_POLL_S", 0.0)
+    tools, conf = _make_env(tmp_path)
+    calls: list[list[str]] = []
+    states = iter([0, 0, 1])  # running, running, gone
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        head = Path(argv[0]).name
+        if head == "pkill":
+            return _FakeHandle(returncode=0)
+        if head == "pgrep":
+            return _FakeHandle(returncode=next(states, 1))
+        return _FakeHandle()
+
+    ctl = _make(air_module, calls, respond, config=_config(tools, conf))
+    await ctl.stop(timeout=5)
+    assert [Path(a[0]).name for a in calls] == ["pkill", "pgrep", "pgrep", "pgrep"]
+
+
+@_sync
+async def test_stop_timeout_is_operation_timeout(
+    air_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from emuctl.errors import OperationTimeoutError
+
+    monkeypatch.setattr(air_module, "_STOP_POLL_S", 0.0)
+    tools, conf = _make_env(tmp_path)
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        return _FakeHandle(returncode=0)  # never exits
+
+    ctl = _make(air_module, [], respond, config=_config(tools, conf))
+    with pytest.raises(OperationTimeoutError):
+        await ctl.stop(timeout=0.05)
+
+
+@_sync
 async def test_is_running_exit_status_only(air_module: Any, tmp_path: Path) -> None:
     """stdout is NEVER parsed: pgrep rc 0 → True, rc 1 → False, other → raise."""
     tools, conf = _make_env(tmp_path)
@@ -401,6 +482,20 @@ async def test_is_running_prefers_our_spawned_handle(air_module: Any, tmp_path: 
     await ctl.start()
     assert await ctl._is_running(None) is True
     assert len(calls) == 1  # the spawn only — no pgrep
+
+
+@_sync
+async def test_is_running_reobserves_after_our_spawn_exits(air_module: Any, tmp_path: Path) -> None:
+    """A dead spawn handle is not proof of stopped (§1.4): the scoped pgrep
+    observation decides (single-instance handover keeps the app alive)."""
+    tools, conf = _make_env(tmp_path)
+    calls: list[list[str]] = []
+    ctl = _make(air_module, calls, _air_responder(calls, pgrep_rc=0), config=_config(tools, conf))
+    await ctl.start()
+    assert isinstance(ctl._spawned, _FakeHandle)
+    ctl._spawned.finish()  # our child exited; another player may remain
+    assert await ctl._is_running(None) is True
+    assert [Path(a[0]).name for a in calls] == ["BlueStacks", "pgrep"]
 
 
 @_sync
@@ -488,6 +583,36 @@ async def test_configure_foreign_key_is_gated(air_module: Any, tmp_path: Path) -
 
 
 @_sync
+@pytest.mark.parametrize(
+    "leaf",
+    ["resources.cpu_cap_pct", "adb.port", "bluestacks.install_dir", "memu.vm_name"],
+)
+async def test_configure_canonical_untranslatable_deploys_the_gate(
+    air_module: Any, tmp_path: Path, leaf: str
+) -> None:
+    """§4: canonical leaves this table cannot translate are a typed gate,
+    never caller misuse and never a silent drop."""
+    from emuctl.errors import FeatureNotSupportedError
+
+    tools, conf = _make_env(tmp_path)
+    ctl = _make(air_module, [], _air_responder([]), config=_config(tools, conf))
+    before = conf.read_text(encoding="utf-8")
+    with pytest.raises(FeatureNotSupportedError):
+        await ctl.configure({leaf: 1}, timeout=None)
+    assert conf.read_text(encoding="utf-8") == before
+
+
+@_sync
+async def test_configure_unknown_leaf_under_known_head_is_caller_misuse(
+    air_module: Any, tmp_path: Path
+) -> None:
+    tools, conf = _make_env(tmp_path)
+    ctl = _make(air_module, [], _air_responder([]), config=_config(tools, conf))
+    with pytest.raises(InvalidArgumentError):
+        await ctl.configure({"display.bogus": 1}, timeout=None)
+
+
+@_sync
 async def test_missing_conf_raises_unreadable(air_module: Any, tmp_path: Path) -> None:
     tools, conf = _make_env(tmp_path)
     conf.unlink()
@@ -503,10 +628,21 @@ async def test_missing_conf_raises_unreadable(air_module: Any, tmp_path: Path) -
 @_sync
 async def test_list_instances_single_row(air_module: Any, tmp_path: Path) -> None:
     tools, conf = _make_env(tmp_path)
-    rows = await air_module.list_instances(_config(tools, conf))
-    assert [row.ref.key for row in rows] == [KEY]
-    assert rows[0].running is False
-    assert dict(rows[0].details) == {"internal": KEY, "adb_port": "5555"}
+    stopped = await air_module.list_instances(_config(tools, conf), _executor=_discovery_executor(pgrep_rc=1))
+    assert [row.ref.key for row in stopped] == [KEY]
+    assert stopped[0].running is False
+    assert dict(stopped[0].details) == {"internal": KEY, "adb_port": "5555"}
+
+    running = await air_module.list_instances(_config(tools, conf), _executor=_discovery_executor(pgrep_rc=0))
+    assert running[0].running is True
+
+
+@_sync
+async def test_list_instances_missing_player_is_stopped_not_a_raise(air_module: Any, tmp_path: Path) -> None:
+    tools, conf = _make_env(tmp_path)
+    (tools / "BlueStacks").unlink()
+    rows = await air_module.list_instances(_config(tools, conf), _executor=_discovery_executor(pgrep_rc=0))
+    assert rows[0].running is False  # nothing can be running without the player
 
 
 @_sync
@@ -528,10 +664,21 @@ async def test_list_instances_off_mac_is_honest_empty(
 async def test_get_instance_found_absent_foreign(air_module: Any, tmp_path: Path) -> None:
     tools, conf = _make_env(tmp_path)
     cfg = _config(tools, conf)
-    found = await air_module.get_instance(cfg, InstanceRef(backend=BackendId.BLUESTACKS_AIR, key=KEY))
+    executor = _discovery_executor()
+    found = await air_module.get_instance(
+        cfg, InstanceRef(backend=BackendId.BLUESTACKS_AIR, key=KEY), _executor=executor
+    )
     assert found is not None and found.ref.key == KEY
-    assert await air_module.get_instance(cfg, InstanceRef(backend=BackendId.BLUESTACKS_AIR, key="nope")) is None
-    assert await air_module.get_instance(cfg, InstanceRef(backend=BackendId.MEMU, key=KEY)) is None
+    assert (
+        await air_module.get_instance(
+            cfg, InstanceRef(backend=BackendId.BLUESTACKS_AIR, key="nope"), _executor=executor
+        )
+        is None
+    )
+    assert (
+        await air_module.get_instance(cfg, InstanceRef(backend=BackendId.MEMU, key=KEY), _executor=executor)
+        is None
+    )
 
 
 # ── restart: the §1.6 wholesale override, scripted end-to-end ──
@@ -545,21 +692,111 @@ async def test_restart_scripted_phase_order(air_module: Any, tmp_path: Path) -> 
     await ctl.restart(timeout=None)
     heads = [Path(a[0]).name for a in calls]
     # pgrep (not running) → configure (file write, no subprocess) → detached
-    # start → hd-adb connect → settle screencap → terminal screencap.
-    assert heads == ["pgrep", "BlueStacks", "hd-adb", "hd-adb", "hd-adb"]
+    # start → attach probe (connect + echo) → settle screencap → terminal screencap.
+    assert heads == ["pgrep", "BlueStacks", "hd-adb", "hd-adb", "hd-adb", "hd-adb"]
     assert "connect" in calls[2]
+    assert "echo" in calls[3]
     assert ctl._serial == "127.0.0.1:5555"
 
 
 @_sync
-async def test_restart_running_instance_stops_scoped(air_module: Any, tmp_path: Path) -> None:
+async def test_restart_running_instance_stops_scoped(
+    air_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(air_module, "_STOP_POLL_S", 0.0)
     tools, conf = _make_env(tmp_path)
     calls: list[list[str]] = []
-    ctl = _make(air_module, calls, _air_responder(calls, pgrep_rc=0), config=_config(tools, conf))
+    stopped = {"value": False}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        head = Path(argv[0]).name
+        if head == "pgrep":
+            return _FakeHandle(returncode=0 if not stopped["value"] else 1)
+        if head == "pkill":
+            stopped["value"] = True
+            return _FakeHandle(returncode=0)
+        if head == "BlueStacks":
+            return _SpawnedHandle()
+        if head == "hd-adb":
+            if "screencap" in argv:
+                return _FakeHandle(stdout=_png(), returncode=0)
+            return _FakeHandle(returncode=0)
+        return _FakeHandle()
+
+    ctl = _make(air_module, calls, respond, config=_config(tools, conf))
     await ctl.restart(timeout=None)
     heads = [Path(a[0]).name for a in calls]
-    assert heads == ["pgrep", "pkill", "BlueStacks", "hd-adb", "hd-adb", "hd-adb"]
+    assert heads == ["pgrep", "pkill", "pgrep", "BlueStacks", "hd-adb", "hd-adb", "hd-adb", "hd-adb"]
     assert "\\ \\-\\-instance\\ Tiramisu64" in calls[1][2]
+
+
+@_sync
+async def test_restart_waits_for_cold_boot_transport(
+    air_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The detached spawn returns before the guest answers ADB; restart must
+    poll the transport (bounded) instead of one-shotting the screenshot."""
+    monkeypatch.setattr(air_module, "_BOOT_POLL_S", 0.0)
+    monkeypatch.setattr(air_module, "_PROBE_TIMEOUT_S", 1.0)
+    tools, conf = _make_env(tmp_path)
+    calls: list[list[str]] = []
+    echoes = {"n": 0}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        head = Path(argv[0]).name
+        if head == "BlueStacks":
+            return _SpawnedHandle()
+        if head == "pgrep":
+            return _FakeHandle(returncode=1)
+        if head == "pkill":
+            return _FakeHandle(returncode=0)
+        if head == "hd-adb":
+            if "screencap" in argv:
+                return _FakeHandle(stdout=_png(), returncode=0)
+            if "echo" in argv:
+                echoes["n"] += 1
+                if echoes["n"] < 3:
+                    return _FakeHandle(stderr=b"device not found", returncode=1)
+            return _FakeHandle(returncode=0)
+        return _FakeHandle()
+
+    ctl = _make(air_module, calls, respond, config=_config(tools, conf))
+    await ctl.restart(timeout=5)
+    assert echoes["n"] == 3  # two not-yet-up probes, then ready
+
+
+@_sync
+async def test_restart_settle_retries_until_frame_decodes(
+    air_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADB can answer while the framebuffer is still coming up: the settle
+    phase retries until a screenshot decodes (§1.6)."""
+    monkeypatch.setattr(air_module, "_BOOT_POLL_S", 0.0)
+    monkeypatch.setattr(air_module, "_PROBE_TIMEOUT_S", 1.0)
+    tools, conf = _make_env(tmp_path)
+    calls: list[list[str]] = []
+    screencaps = {"n": 0}
+
+    def respond(argv: list[str]) -> _FakeHandle:
+        head = Path(argv[0]).name
+        if head == "BlueStacks":
+            return _SpawnedHandle()
+        if head == "pgrep":
+            return _FakeHandle(returncode=1)
+        if head == "pkill":
+            return _FakeHandle(returncode=0)
+        if head == "hd-adb":
+            if "screencap" in argv:
+                screencaps["n"] += 1
+                if screencaps["n"] == 1:
+                    return _FakeHandle(stderr=b"device offline", returncode=255)
+                return _FakeHandle(stdout=_png(), returncode=0)
+            return _FakeHandle(returncode=0)
+        return _FakeHandle()
+
+    ctl = _make(air_module, calls, respond, config=_config(tools, conf))
+    await ctl.restart(timeout=5)
+    assert screencaps["n"] == 3  # failed settle probe, decoded settle, terminal
 
 
 @_sync

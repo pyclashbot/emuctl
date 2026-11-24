@@ -23,10 +23,13 @@ Vendor-pinned facts (py-clash-bot ``pyclashbot/emulators/bluestacks.py``):
   (:578-583) and run-state observation is ``pgrep -fl BlueStacks`` with
   stdout substring matching (:516-529) — both reposed here: the §2 kill
   rule sanctions the INTERNAL-INSTANCE-NAME discriminator, but our
-  patterns are STRICTER than the vendor's (the full launch argv shape
-  ``<player> --instance <internal>``, regex-escaped) and the OBSERVATION
-  keys on pgrep's EXIT STATUS only (0 = a process whose command line
-  matches the bound-key pattern / 1 = none) — stdout is never parsed.
+  patterns are STRICTER than the vendor's: the complete player path, as
+  either our detached ``--instance <internal>`` launch or a bare macOS app
+  launch (Air boots its single configured instance), regex-escaped and
+  anchored — never the vendor's ``BlueStacks`` substring sweep. The
+  OBSERVATION keys on pgrep's EXIT STATUS only (0 = a process whose
+  command line matches the bound-key pattern / 1 = none) — stdout is
+  never parsed.
 
 Interpretation decisions (CONTRACT wins; these fill its silences):
 
@@ -84,6 +87,7 @@ from emuctl.errors import (
     ConfigError,
     ConfigValidationError,
     ControllerClosedError,
+    DeviceStateError,
     EmulatorNotReadyError,
     ExecutableNotFoundError,
     FeatureNotSupportedError,
@@ -103,6 +107,7 @@ from emuctl.timing import (
     TimeoutParam,
     resolve_timeout,
 )
+from emuctl.waits import wait_until
 
 __all__ = ["BlueStacksAirController", "list_instances", "get_instance"]
 
@@ -118,6 +123,23 @@ _HD_ADB_NAME: Final[str] = "hd-adb"
 
 #: pgrep/pkill exit statuses (POSIX): 1 = no process matched.
 _NO_MATCH_RC: Final[int] = 1
+
+#: Cold-boot readiness polling (§2's bounded-wait rule): the player returns
+#: from the detached spawn immediately, while the guest and its private
+#: hd-adb server need tens of seconds before a transport connect can
+#: succeed. Each probe is short so the shared restart deadline stays in
+#: charge; the poll gap keeps the probe rate sane.
+_BOOT_POLL_S: Final[float] = 0.5
+_PROBE_TIMEOUT_S: Final[float] = 5.0
+
+#: Bounded internal budget for an explicitly unbounded restart (timeout=None):
+#: the guest boot must still give up eventually — never an unbounded loop.
+_BOOT_READY_TIMEOUT_S: Final[float] = LIFECYCLE_TIMEOUT
+
+#: Stop waits for the signalled player to actually exit (the vendor's own
+#: restart polls this): a still-exiting app can rewrite bluestacks.conf after
+#: our configure-while-stopped write and hold the single-instance lock.
+_STOP_POLL_S: Final[float] = 0.25
 
 
 def _require_config(config: EmuctlConfig | None) -> EmuctlConfig:
@@ -136,30 +158,66 @@ def _bs_config(cfg: EmuctlConfig) -> BlueStacksConfig:
     return cfg.bluestacks if cfg.bluestacks is not None else BlueStacksConfig()
 
 
+def _process_pattern(player: str, internal: str) -> str:
+    """The scoped bound-key process pattern (module-level so discovery can
+    observe run state without constructing a controller).
+
+    Both accepted spellings are anchored to the complete player path — our
+    detached ``--instance <internal>`` launch, and a bare macOS app launch
+    (Air boots its single configured instance). POSIX ERE: pgrep/pkill call
+    regcomp, so no non-capturing groups or ``\\s``.
+    """
+    escaped_player = re.escape(player)
+    launch = re.escape(f"{player} --instance {internal}")
+    return f"({launch}( |$)|{escaped_player}$)"
+
+
+async def _observe_running(executor: ProcessExecutor, player: str, internal: str) -> bool:
+    """Run-state observation for one instance: pgrep exit status only."""
+    argv = ["pgrep", "-f", _process_pattern(player, internal)]
+    logger.debug("bluestacks-air op=list_instances argv=%s", [sanitize(a) for a in argv])
+    result = await executor.run(argv, operation="list_instances", timeout=QUERY_TIMEOUT)
+    if result.returncode == 0:
+        return True
+    if result.returncode == _NO_MATCH_RC:
+        return False
+    raise VendorCommandError(
+        command=argv,
+        returncode=result.returncode,
+        output_reason="exit",
+        stderr_excerpt=_stderr_excerpt(result.stderr),
+    )
+
+
 # ── discovery (BackendDiscovery convention; enumerate the ONE configured
 # instance from the conf file — a machine-readable file, never stdout) ──
 
 
-async def list_instances(config: EmuctlConfig) -> tuple[InstanceRecord, ...]:
+async def list_instances(
+    config: EmuctlConfig, *, _executor: ProcessExecutor | None = None
+) -> tuple[InstanceRecord, ...]:
     """Enumerate Air's configured instance(s) from the conf store.
 
-    Read-only, bounded, OFFLINE: run state is never parsed from a conf
-    file, so rows carry ``running=False`` (§3's boundary). Cold installs
-    with no MIM metadata get IN-MEMORY synthesis (deterministic; see
-    _meta) — never a disk write into the vendor's store. No app bundle or
-    conf on this host → honest ``()``.
+    Read-only and bounded. Identity and transport facts come from the conf
+    file; run state is a scoped ``pgrep`` exit-status observation (never a
+    conf read, never stdout parsing). Cold installs with no MIM metadata get
+    IN-MEMORY synthesis (deterministic; see _meta) — never a disk write into
+    the vendor's store. No app bundle or conf on this host → honest ``()``.
     """
     cfg = _require_config(config)
-    store_path = _paths.conf_path(_bs_config(cfg))
+    bs = _bs_config(cfg)
+    store_path = _paths.conf_path(bs)
     if store_path is None or not store_path.is_file():
         return ()
     doc = _conf.parse(store_path.read_text(encoding="utf-8", errors="replace"))
-    meta_path = _paths.mim_meta_path(_bs_config(cfg))
+    meta_path = _paths.mim_meta_path(bs)
     meta = (
         _meta.parse(meta_path.read_text(encoding="utf-8", errors="replace"))
         if meta_path is not None and meta_path.is_file()
         else _meta.synthesize(doc)
     )
+    executor = _executor if _executor is not None else ProcessExecutor()
+    player = _paths.tool_path(bs, _PLAYER_NAME)
     records: list[InstanceRecord] = []
     for internal in _conf.instance_internals(doc):
         try:
@@ -169,10 +227,11 @@ async def list_instances(config: EmuctlConfig) -> tuple[InstanceRecord, ...]:
         display = _conf.display_name(doc, internal) or internal
         named = next((e.name for e in meta.entries if e.internal == internal), None)
         details = {"internal": internal, **({"adb_port": str(port)} if port else {})}
+        running = player is not None and await _observe_running(executor, str(player), internal)
         records.append(
             InstanceRecord(
                 ref=InstanceRef(backend=BackendId.BLUESTACKS_AIR, key=named or display),
-                running=False,
+                running=running,
                 serial=None,
                 details=MappingProxyType(details),
             )
@@ -181,7 +240,9 @@ async def list_instances(config: EmuctlConfig) -> tuple[InstanceRecord, ...]:
     return tuple(records)
 
 
-async def get_instance(config: EmuctlConfig, ref: InstanceRef) -> InstanceRecord | None:
+async def get_instance(
+    config: EmuctlConfig, ref: InstanceRef, *, _executor: ProcessExecutor | None = None
+) -> InstanceRecord | None:
     """The record for ``ref`` or ``None`` when absent (never raises it)."""
     if not isinstance(ref, InstanceRef):
         raise InvalidArgumentError(
@@ -190,7 +251,7 @@ async def get_instance(config: EmuctlConfig, ref: InstanceRef) -> InstanceRecord
         )
     if ref.backend is not BackendId.BLUESTACKS_AIR:
         return None
-    for record in await list_instances(config):
+    for record in await list_instances(config, _executor=_executor):
         if record.ref.key == ref.key:
             return record
     return None
@@ -387,11 +448,17 @@ class BlueStacksAirController(_AdbMiddleLayer):
         return argv
 
     def _pgrep_pattern(self, internal: str) -> str:
-        """The STRICT bound-key discriminator (full command line): the exact
-        launch argv shape, regex-escaped. Stricter than the vendor's
-        ``BlueStacks.*<internal>`` (:581) — it cannot match an innocuous
-        string that merely CONTAINS the internal name."""
-        return re.escape(f"{self._tool(_PLAYER_NAME)} --instance {internal}")
+        """The scoped bound-key discriminator (full command line).
+
+        Two accepted spellings, both anchored to the complete player path
+        (never the vendor's bare ``BlueStacks`` substring sweep, :581):
+
+        - our detached launch: ``<player> --instance <internal>``, escaped;
+        - a normal macOS launch: ``<player>`` with no argv — Air boots its
+          single configured instance, so that process IS the bound instance
+          (the §3 row's one-instance semantics). This keeps run-state and
+          stop honest when the user opened the app from Finder first."""
+        return _process_pattern(self._tool(_PLAYER_NAME), internal)
 
     async def _tool_run(self, argv: list[str], *, operation: str, timeout: float | None) -> ProcessResult:
         args = _require_argv(argv)
@@ -404,6 +471,40 @@ class BlueStacksAirController(_AdbMiddleLayer):
                 searched=[args[0]],
                 detail=f"could not execute the tool binary: {type(exc).__name__}",
             ) from exc
+
+    async def _transport_ready(self) -> bool:
+        """One bounded cold-boot probe for :func:`emuctl.waits.wait_until`.
+
+        Attempts the private-server ``connect`` and then the shared
+        ``is_reachable`` data probe (transport/exit-status truth only — no
+        vendor stdout parsing). Both failures and not-yet-up states are
+        negative data here; the deadline in ``wait_until`` owns the budget.
+        """
+        await asyncio.sleep(_BOOT_POLL_S)
+        try:
+            await self._run_adb(
+                ["connect", self._serial],
+                binary=False,
+                operation="restart",
+                timeout=_PROBE_TIMEOUT_S,
+                server_verb=True,
+            )
+        except (DeviceStateError, VendorCommandError, OperationTimeoutError):
+            return False
+        except TimeoutError:
+            return False
+        return (await self.is_reachable(timeout=_PROBE_TIMEOUT_S)).ok
+
+    async def _stable_frame(self) -> bool:
+        """One bounded settle probe: a screenshot that decodes (§1.6)."""
+        await asyncio.sleep(_BOOT_POLL_S)
+        try:
+            png_dimensions(await self.screenshot(timeout=_PROBE_TIMEOUT_S))
+        except (DeviceStateError, VendorCommandError, OperationTimeoutError):
+            return False
+        except TimeoutError:
+            return False
+        return True
 
     # ── BOOT mechanics ──
 
@@ -425,11 +526,17 @@ class BlueStacksAirController(_AdbMiddleLayer):
         return None
 
     async def _stop(self, timeout: float | None) -> None:
-        """Scoped kill: ``pkill -f`` over the STRICT bound-key pattern (the
+        """Scoped kill: ``pkill -f`` over the bound-key pattern (the
         §2 "internal instance name" discriminator; see the module
         docstring). rc 0 = matched and signalled; ANY other rc raises
-        honestly (the §1.4 already-stopped rule mirrors memu's ``-n stop``)."""
+        honestly (the §1.4 already-stopped rule mirrors memu's ``-n stop``).
+
+        Then wait (bounded, shared deadline) until the player is gone: a
+        still-exiting app can rewrite ``bluestacks.conf`` after our
+        configure-while-stopped write and hold the single-instance lock."""
         internal, _port = self._target_and_port()
+        start = time.monotonic()
+        deadline = None if timeout is None else start + timeout
         argv = ["pkill", "-f", self._pgrep_pattern(internal)]
         result = await self._tool_run(argv, operation="stop", timeout=timeout)
         if result.returncode != 0:
@@ -439,15 +546,33 @@ class BlueStacksAirController(_AdbMiddleLayer):
                 output_reason="exit",
                 stderr_excerpt=_stderr_excerpt(result.stderr),
             )
+        if deadline is None:
+            budget = LIFECYCLE_TIMEOUT
+        else:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise OperationTimeoutError(
+                    operation="stop",
+                    deadline=deadline,
+                    elapsed=time.monotonic() - start,
+                )
+        await wait_until(self._exited, operation="stop", timeout=budget)
+
+    async def _exited(self) -> bool:
+        """One bounded stop probe: has the signalled player exited?"""
+        await asyncio.sleep(_STOP_POLL_S)
+        return not await self._is_running(_PROBE_TIMEOUT_S)
 
     async def _is_running(self, timeout: float | None) -> bool:
         """Run-state observation: OWN handle first (``returncode is None`` =
-        alive, the §2 our-PIDs truth), then ``pgrep -f`` over the STRICT
-        bound-key pattern keyed on EXIT STATUS ONLY (0 → running, 1 →
-        stopped — stdout is never parsed). Any other rc raises the failed
-        observation (§1.4)."""
-        if self._spawned is not None:
-            return self._spawned.returncode is None
+        alive, the §2 our-PIDs truth); a dead/absent handle falls through to
+        ``pgrep -f`` over the scoped bound-key pattern keyed on EXIT STATUS
+        ONLY (0 → running, 1 → stopped — stdout is never parsed). Any other
+        rc raises the failed observation (§1.4)."""
+        if self._spawned is not None and self._spawned.returncode is None:
+            return True
+        # Our spawn exited (or never existed): re-observe through the scoped
+        # pattern instead of inferring "stopped" from the handle (§1.4).
         try:
             internal, _port = self._target_and_port()
         except InstanceNotFoundError:
@@ -591,22 +716,36 @@ class BlueStacksAirController(_AdbMiddleLayer):
             except Exception as exc:
                 raise EmulatorNotReadyError(reason=reason, cause=exc) from exc
 
+        def boot_budget(left: float | None) -> float:
+            """The bounded wait for cold-boot readiness under the shared
+            deadline; an explicitly unbounded restart still has to give up
+            (§2's bounded-wait rule)."""
+            return left if left is not None else _BOOT_READY_TIMEOUT_S
+
         async def attach(budget_left: float | None) -> None:
-            """The private-server connect phase (one bounded argv
-            registration against the private 5041 server)."""
+            """The private-server connect phase: wait (bounded) for the
+            spawned guest to accept the connect against the private server,
+            then register the transport."""
             record = await self._get_instance(self._ref, budget_left)
             if record is None:
                 raise InstanceNotFoundError(instance_ref=str(self._ref))
             serial = f"127.0.0.1:{record.details['adb_port']}"
             self._serial = serial
-            await self._run_adb(
-                ["connect", serial],
-                binary=False,
+            await wait_until(
+                self._transport_ready,
                 operation="restart",
-                timeout=budget_left,
-                server_verb=True,
+                timeout=boot_budget(budget_left),
             )
             logger.debug("bluestacks-air restart connected serial=%s", sanitize(serial))
+
+        async def settle(budget_left: float | None) -> None:
+            """Settle: wait (bounded) for the first screenshot that decodes —
+            ADB may answer while the guest framebuffer is still coming up."""
+            await wait_until(
+                self._stable_frame,
+                operation="restart",
+                timeout=boot_budget(budget_left),
+            )
 
         # 1. stop-if-running
         if await phase("restart", "stop_failed", self._is_running):
@@ -618,7 +757,7 @@ class BlueStacksAirController(_AdbMiddleLayer):
         # 4. attach: private-server registration
         await phase("restart", "attach_failed", attach)
         # 5. settle: first screenshot decodes non-empty (public funnel)
-        png_dimensions(await phase("restart", "settle_failed", lambda left: self.screenshot(timeout=left)))
+        await phase("restart", "settle_failed", settle)
         # 6. app: launch + bounded spawn-verify
         if app is not None:
             await phase(
