@@ -6,17 +6,23 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from typing import Final
 
+from emuctl._identification import BackendId
 from emuctl._serials import is_valid_serial
 from emuctl.errors import ConfigValidationError, FeatureNotSupportedError
 
 __all__ = [
+    "RendererMode",
     "DisplayConfig",
+    "ResourceConfig",
     "AdbConfig",
     "GooglePlayConfig",
+    "BlueStacksSettings",
+    "BlueStacksConfig",
     "EmuctlConfig",
     "CreateSpec",
     "ConfigSpec",
     "CONFIGURE_FLAG",
+    "resolve_renderer",
     "ensure_config_supported",
 ]
 
@@ -25,6 +31,15 @@ _DIRECT_LAYER: Final[str] = "direct"
 CONFIGURE_FLAG: Final[str] = "configure"
 
 ConfigSpec = Mapping[str, str | int | float | bool | None]
+
+
+class RendererMode(enum.Enum):
+    """Canonical renderer vocabulary; each backend owns its vendor encoding."""
+
+    AUTO = "auto"
+    OPENGL = "opengl"
+    DIRECTX = "directx"
+    VULKAN = "vulkan"
 
 
 def _fail(path: str, value: str | int | float | bool | None, expected: str) -> ConfigValidationError:
@@ -71,16 +86,45 @@ def _check_str(path: str, value: str | None, *, strip: bool = False) -> str | No
     return value.strip() if strip else value
 
 
+def _coerce_renderer(value: RendererMode | str | None, path: str) -> RendererMode | None:
+    if value is None or isinstance(value, RendererMode):
+        return value
+    if isinstance(value, str):
+        try:
+            return RendererMode(value.strip().lower())
+        except ValueError:
+            pass
+    raise _fail(path, value, "one of auto, opengl, directx, vulkan")
+
+
 @dataclass(frozen=True, slots=True)
 class DisplayConfig:
     width: int | None = None
     height: int | None = None
     dpi: int | None = None
+    fps: int | None = None
+    renderer: RendererMode | str | None = None
 
     def __post_init__(self) -> None:
         _check_int("display.width", self.width, minimum=1)
         _check_int("display.height", self.height, minimum=1)
         _check_int("display.dpi", self.dpi, minimum=1)
+        _check_int("display.fps", self.fps, minimum=1)
+        object.__setattr__(self, "renderer", _coerce_renderer(self.renderer, "display.renderer"))
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceConfig:
+    """CPU/memory targets. None = the vendor's current value."""
+
+    cpus: int | None = None
+    memory_mb: int | None = None
+    cpu_cap_pct: int | None = None
+
+    def __post_init__(self) -> None:
+        _check_int("resources.cpus", self.cpus, minimum=1)
+        _check_int("resources.memory_mb", self.memory_mb, minimum=1)
+        _check_int("resources.cpu_cap_pct", self.cpu_cap_pct, minimum=1, maximum=100)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +166,43 @@ class GooglePlayConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class BlueStacksSettings:
+    """BlueStacks tweakable settings (applied at configure-time)."""
+
+    vsync: bool | None = None
+    high_fps: bool | None = None
+
+    def __post_init__(self) -> None:
+        _check_bool("bluestacks.settings.vsync", self.vsync)
+        _check_bool("bluestacks.settings.high_fps", self.high_fps)
+
+
+@dataclass(frozen=True, slots=True)
+class BlueStacksConfig:
+    """BlueStacks backend selection (paths/names) + settings."""
+
+    adb_server_port: int = 5041
+    install_dir: str | None = None
+    conf_path: str | None = None
+    instance_name: str | None = None
+    settings: BlueStacksSettings = field(default_factory=BlueStacksSettings)
+
+    def __post_init__(self) -> None:
+        if self.adb_server_port is None:
+            raise _fail("bluestacks.adb_server_port", None, "an int in 1..65535")
+        _check_int("bluestacks.adb_server_port", self.adb_server_port, minimum=1, maximum=65535)
+        object.__setattr__(self, "install_dir", _check_str("bluestacks.install_dir", self.install_dir))
+        object.__setattr__(self, "conf_path", _check_str("bluestacks.conf_path", self.conf_path))
+        object.__setattr__(
+            self,
+            "instance_name",
+            _check_str("bluestacks.instance_name", self.instance_name, strip=True),
+        )
+        if not isinstance(self.settings, BlueStacksSettings):
+            raise _fail("bluestacks.settings", type(self.settings).__name__, "a BlueStacksSettings")
+
+
+@dataclass(frozen=True, slots=True)
 class CreateSpec:
     name: str
     android_version: str | None = None
@@ -142,6 +223,8 @@ class EmuctlConfig:
     adb: AdbConfig = field(default_factory=AdbConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
     google_play: GooglePlayConfig | None = None
+    resources: ResourceConfig = field(default_factory=ResourceConfig)
+    bluestacks: BlueStacksConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.adb, AdbConfig):
@@ -154,6 +237,19 @@ class EmuctlConfig:
                 type(self.google_play).__name__,
                 "a GooglePlayConfig or None",
             )
+        if not isinstance(self.resources, ResourceConfig):
+            raise _fail("resources", type(self.resources).__name__, "a ResourceConfig")
+        if self.bluestacks is not None and not isinstance(self.bluestacks, BlueStacksConfig):
+            raise _fail("bluestacks", type(self.bluestacks).__name__, "a BlueStacksConfig or None")
+
+
+def resolve_renderer(mode: RendererMode, backend: BackendId) -> RendererMode | None:
+    """Resolve ``AUTO`` to the backend's vendor default; concrete modes pass."""
+    if mode is not RendererMode.AUTO:
+        return mode
+    if backend is BackendId.BLUESTACKS_AIR:
+        return RendererMode.VULKAN
+    return None
 
 
 def ensure_config_supported(cfg: EmuctlConfig, features: AbstractSet[object]) -> None:
@@ -163,6 +259,10 @@ def ensure_config_supported(cfg: EmuctlConfig, features: AbstractSet[object]) ->
     offenders: list[str] = []
     if cfg.display != DisplayConfig():
         offenders.append("[display]")
+    if cfg.resources != ResourceConfig():
+        offenders.append("[resources]")
+    if cfg.bluestacks is not None and cfg.bluestacks.settings != BlueStacksSettings():
+        offenders.append("[bluestacks.settings]")
     if offenders:
         joined = " ".join(offenders)
         raise FeatureNotSupportedError(

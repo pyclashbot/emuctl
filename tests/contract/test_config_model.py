@@ -1,16 +1,22 @@
-"""Config model: display/adb validation and capability gate."""
+"""Config model: display/resources/adb/bluestacks validation and the capability gate."""
 
 import dataclasses
 from typing import Any
 
 import pytest
 
+from emuctl._identification import BackendId
 from emuctl.config.model import (
     AdbConfig,
+    BlueStacksConfig,
+    BlueStacksSettings,
     DisplayConfig,
     EmuctlConfig,
     GooglePlayConfig,
+    RendererMode,
+    ResourceConfig,
     ensure_config_supported,
+    resolve_renderer,
 )
 from emuctl.errors import ConfigValidationError, FeatureNotSupportedError
 
@@ -19,6 +25,7 @@ def test_defaults_and_frozen_slots() -> None:
     cfg = EmuctlConfig()
     assert cfg.adb.port == 5037
     assert cfg.display == DisplayConfig()
+    assert cfg.bluestacks is None
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.adb = AdbConfig()  # ty: ignore[invalid-assignment]
     assert "__slots__" in DisplayConfig.__dict__
@@ -34,6 +41,14 @@ def test_defaults_and_frozen_slots() -> None:
         lambda: GooglePlayConfig(device_serial="not a serial"),
         lambda: GooglePlayConfig(device_serial=""),
         lambda: GooglePlayConfig(install_dir="   "),
+        lambda: DisplayConfig(fps=0),
+        lambda: DisplayConfig(renderer="meteor"),
+        lambda: ResourceConfig(cpus=0),
+        lambda: ResourceConfig(memory_mb=-1),
+        lambda: ResourceConfig(cpu_cap_pct=101),
+        lambda: BlueStacksConfig(adb_server_port=0),
+        lambda: BlueStacksConfig(adb_server_port=65536),
+        lambda: BlueStacksSettings(vsync="yes"),  # ty: ignore[invalid-argument-type]
         lambda: AdbConfig(port=0),
         lambda: AdbConfig(port=65536),
         lambda: AdbConfig(host="   "),
@@ -66,3 +81,31 @@ def test_google_play_defaults() -> None:
     cfg = EmuctlConfig()
     assert cfg.google_play is None
     assert GooglePlayConfig().device_serial == "localhost:6520"
+
+
+@pytest.mark.parametrize(
+    ("cfg", "section"),
+    [
+        (EmuctlConfig(resources=ResourceConfig(cpus=2)), "[resources]"),
+        (
+            EmuctlConfig(bluestacks=BlueStacksConfig(settings=BlueStacksSettings(vsync=True))),
+            "[bluestacks.settings]",
+        ),
+    ],
+)
+def test_gate_requires_configure_for_resources_and_bluestacks_settings(cfg: EmuctlConfig, section: str) -> None:
+    with pytest.raises(FeatureNotSupportedError) as excinfo:
+        ensure_config_supported(cfg, frozenset())
+    assert section in (excinfo.value.detail or "")
+    assert ensure_config_supported(cfg, frozenset({"configure"})) is None
+
+
+def test_renderer_auto_resolves_to_bluestacks_air_vulkan() -> None:
+    assert resolve_renderer(RendererMode.AUTO, BackendId.BLUESTACKS_AIR) is RendererMode.VULKAN
+    assert resolve_renderer(RendererMode.OPENGL, BackendId.BLUESTACKS_AIR) is RendererMode.OPENGL
+    assert resolve_renderer(RendererMode.AUTO, BackendId.ADB) is None
+
+
+def test_display_renderer_accepts_strings_case_insensitively() -> None:
+    assert DisplayConfig(renderer="VULKAN").renderer is RendererMode.VULKAN
+    assert DisplayConfig(renderer=" directx ").renderer is RendererMode.DIRECTX

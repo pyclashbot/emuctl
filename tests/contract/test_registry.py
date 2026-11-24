@@ -21,9 +21,7 @@ ADB_MODULE = "emuctl.backends.adb"
 #: Removed vendor adapters/deps: v0.1 has no modules and must never import them.
 REMOVED_MODULES = (
     "emuctl.backends.memu",
-    "emuctl.backends.bluestacks",
     "emuctl.backends.bluestacks.bs5",
-    "emuctl.backends.bluestacks.air",
     "emuctl.backends.avd",
     "pymemuc",
 )
@@ -75,11 +73,25 @@ def test_pinned_backend_ids_survive_trimming() -> None:
     }
 
 
-def test_registry_has_the_adb_and_google_play_rows(reg: Any) -> None:
+def test_registry_has_the_adb_bluestacks_air_and_google_play_rows(reg: Any) -> None:
     registry = reg.get_registry()
-    assert set(registry) == {BackendId.ADB, BackendId.GOOGLE_PLAY}
+    assert set(registry) == {BackendId.ADB, BackendId.BLUESTACKS_AIR, BackendId.GOOGLE_PLAY}
     assert isinstance(registry[BackendId.ADB], reg.BackendSpec)
+    assert isinstance(registry[BackendId.BLUESTACKS_AIR], reg.BackendSpec)
     assert isinstance(registry[BackendId.GOOGLE_PLAY], reg.BackendSpec)
+
+
+def test_bluestacks_air_spec_is_pinned(reg: Any) -> None:
+    spec = reg.get_registry()[BackendId.BLUESTACKS_AIR]
+    assert spec.backend is BackendId.BLUESTACKS_AIR
+    assert spec.extra == "bluestacks"
+    assert spec.module == "emuctl.backends.bluestacks.air"
+    assert spec.adapter_attr == "BlueStacksAirController"
+    assert spec.supported_platforms == frozenset({Platform.MACOS})
+    assert spec.dep_modules == ()
+    assert spec.description.strip() != ""
+    assert spec.key_semantics.strip() != ""
+    assert callable(spec.validate_key)
 
 
 def test_google_play_spec_is_pinned(reg: Any) -> None:
@@ -133,7 +145,6 @@ def test_refusal_unknown_id_first(reg: Any, no_backend_imports: None) -> None:
     [
         BackendId.MEMU,
         BackendId.BLUESTACKS,
-        BackendId.BLUESTACKS_AIR,
         BackendId.AVD,
     ],
 )
@@ -154,7 +165,17 @@ def test_available_backends_is_adb_only_without_vendor_deps(
     expected = [BackendId.ADB]
     if platform is Platform.WINDOWS:
         expected.append(BackendId.GOOGLE_PLAY)
+    if platform is Platform.MACOS:
+        expected.append(BackendId.BLUESTACKS_AIR)
     assert [spec.backend for spec in reg.available_backends()] == expected
+
+
+def test_available_backends_includes_bluestacks_air_on_macos(reg: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.MACOS)
+    assert [spec.backend for spec in reg.available_backends()] == [
+        BackendId.ADB,
+        BackendId.BLUESTACKS_AIR,
+    ]
 
 
 def test_available_backends_includes_google_play_on_windows(reg: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -163,6 +184,16 @@ def test_available_backends_includes_google_play_on_windows(reg: Any, monkeypatc
         BackendId.ADB,
         BackendId.GOOGLE_PLAY,
     ]
+
+
+def test_bluestacks_air_selection_refuses_platform(
+    reg: Any, no_backend_imports: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.WINDOWS)
+    with pytest.raises(BackendNotAvailableError) as excinfo:
+        reg.resolve_backend(BackendId.BLUESTACKS_AIR)
+    assert excinfo.value.reason == "platform-unsupported"
+    assert "macos" in (excinfo.value.detail or "")
 
 
 def test_google_play_selection_refuses_platform(
@@ -274,6 +305,20 @@ def test_key_structural_rule_still_lives_in_identity() -> None:
         InstanceRef(backend=BackendId.MEMU, key="   ")
 
 
+@pytest.mark.parametrize("key", ["pyclashbot-136", "My VM 2", "BlueStacks Air"])
+def test_bluestacks_air_key_rule_accepts_vm_names(reg: Any, key: str) -> None:
+    spec = reg.get_registry()[BackendId.BLUESTACKS_AIR]
+    assert spec.validate_key(key) is None
+
+
+@pytest.mark.parametrize("key", ["", "   ", "has\nnewline", "has\rcarriage"])
+def test_bluestacks_air_key_rule_rejects(reg: Any, key: str) -> None:
+    spec = reg.get_registry()[BackendId.BLUESTACKS_AIR]
+    with pytest.raises(InvalidArgumentError) as excinfo:
+        spec.validate_key(key)
+    assert excinfo.value.parameter == "key"
+
+
 @pytest.mark.parametrize("key", ["localhost:6520", "127.0.0.1:5555", "emulator-5554"])
 def test_google_play_key_rule_accepts_serials(reg: Any, key: str) -> None:
     spec = reg.get_registry()[BackendId.GOOGLE_PLAY]
@@ -289,6 +334,16 @@ def test_google_play_key_rule_rejects(reg: Any, key: str) -> None:
 
 def test_spec_row_conformance_adb(reg: Any) -> None:
     spec = reg.get_registry()[BackendId.ADB]
+    adapter = reg.load_adapter(spec)
+    assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)
+    module = sys.modules[spec.module]
+    assert callable(getattr(module, "list_instances", None))
+    assert callable(getattr(module, "get_instance", None))
+
+
+def test_spec_row_conformance_bluestacks_air(reg: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = reg.get_registry()[BackendId.BLUESTACKS_AIR]
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.MACOS)
     adapter = reg.load_adapter(spec)
     assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)
     module = sys.modules[spec.module]

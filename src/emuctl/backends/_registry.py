@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
@@ -25,6 +26,24 @@ __all__ = [
     "resolve_backend",
     "load_adapter",
 ]
+
+
+#: Control characters rejected in vendor instance names (log/render safety).
+_CONTROL_RE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _validate_vm_name(key: str) -> None:
+    """Vendor instance names: non-blank text with no control characters."""
+    if not isinstance(key, str) or not key.strip():
+        raise InvalidArgumentError(
+            parameter="key",
+            constraint="must be a non-empty instance name",
+        )
+    if _CONTROL_RE.search(key) is not None:
+        raise InvalidArgumentError(
+            parameter="key",
+            constraint="must not contain control characters",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +73,23 @@ _SPEC_TABLE: Final[dict[BackendId, BackendSpec | None]] = {
             "(e.g. '127.0.0.1:5555', 'emulator-5554'); positional, never referential."
         ),
         validate_key=validate_serial,
+    ),
+    BackendId.BLUESTACKS_AIR: BackendSpec(
+        backend=BackendId.BLUESTACKS_AIR,
+        extra="bluestacks",
+        module="emuctl.backends.bluestacks.air",
+        adapter_attr="BlueStacksAirController",
+        supported_platforms=frozenset({Platform.MACOS}),
+        dep_modules=(),
+        description=(
+            "BlueStacks Air on macOS (Apple Silicon; /Applications/BlueStacks.app "
+            "with bundled hd-adb; single config-store instance)."
+        ),
+        key_semantics=(
+            "Air instance display name from bluestacks.conf/MimMetaData "
+            "(single instance at v0; synthesized when cold); referential."
+        ),
+        validate_key=_validate_vm_name,
     ),
     BackendId.GOOGLE_PLAY: BackendSpec(
         backend=BackendId.GOOGLE_PLAY,
