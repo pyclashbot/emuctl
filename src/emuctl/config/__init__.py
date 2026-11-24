@@ -10,16 +10,24 @@ from typing import Final, Literal, cast
 
 from emuctl.config.model import (
     AdbConfig,
+    BlueStacksConfig,
+    BlueStacksSettings,
     ConfigSpec,
     CreateSpec,
     DisplayConfig,
     EmuctlConfig,
+    RendererMode,
+    ResourceConfig,
 )
 from emuctl.errors import ConfigError, ConfigValidationError, InvalidArgumentError
 
 __all__ = [
+    "RendererMode",
     "DisplayConfig",
+    "ResourceConfig",
     "AdbConfig",
+    "BlueStacksSettings",
+    "BlueStacksConfig",
     "EmuctlConfig",
     "ConfigSpec",
     "CreateSpec",
@@ -31,18 +39,29 @@ __all__ = [
 
 SCHEMA_VERSION: Final[int] = 1
 
-_LeafKind = Literal["int", "bool", "str", "level"]
+_LeafKind = Literal["int", "bool", "str", "renderer", "level"]
 
 _LEAVES: Final[dict[str, _LeafKind]] = {
     "display.width": "int",
     "display.height": "int",
     "display.dpi": "int",
+    "display.fps": "int",
+    "display.renderer": "renderer",
+    "resources.cpus": "int",
+    "resources.memory_mb": "int",
+    "resources.cpu_cap_pct": "int",
     "adb.path": "str",
     "adb.host": "str",
     "adb.port": "int",
+    "bluestacks.adb_server_port": "int",
+    "bluestacks.install_dir": "str",
+    "bluestacks.conf_path": "str",
+    "bluestacks.instance_name": "str",
+    "bluestacks.settings.vsync": "bool",
+    "bluestacks.settings.high_fps": "bool",
 }
 
-_SECTIONS: Final[frozenset[str]] = frozenset({"display", "adb"})
+_SECTIONS: Final[frozenset[str]] = frozenset({"display", "resources", "adb", "bluestacks"})
 
 _ENV_PREFIX: Final[str] = "EMUCTL_"
 _TRUE_TOKENS: Final[frozenset[str]] = frozenset({"true", "1"})
@@ -50,6 +69,8 @@ _FALSE_TOKENS: Final[frozenset[str]] = frozenset({"false", "0"})
 
 
 def _shown(value: object) -> str | int | float | bool | None:
+    if isinstance(value, RendererMode):
+        return value.value
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return None
@@ -86,7 +107,7 @@ def _nearest_leaf(path: str) -> str | None:
     return matches[0] if matches else None
 
 
-def _coerce_leaf(leaf: str, value: object, *, layer: str) -> str | int | bool | None:
+def _coerce_leaf(leaf: str, value: object, *, layer: str) -> str | int | bool | RendererMode | None:
     kind = _LEAVES[leaf]
 
     def fail(expected: str) -> ConfigValidationError:
@@ -94,6 +115,15 @@ def _coerce_leaf(leaf: str, value: object, *, layer: str) -> str | int | bool | 
 
     if value is None:
         return None
+    if kind == "renderer":
+        if isinstance(value, RendererMode):
+            return value
+        if isinstance(value, str):
+            try:
+                return RendererMode(value.strip().lower())
+            except ValueError:
+                raise fail("one of auto, opengl, directx, vulkan") from None
+        raise fail("one of auto, opengl, directx, vulkan")
     if kind == "level":
         if isinstance(value, str) and value.strip():
             return value
@@ -126,7 +156,7 @@ def _coerce_leaf(leaf: str, value: object, *, layer: str) -> str | int | bool | 
 
 class _Collector:
     def __init__(self) -> None:
-        self.leaves: dict[str, str | int | bool | None] = {}
+        self.leaves: dict[str, str | int | bool | RendererMode | None] = {}
         self.layers: dict[str, str] = {}
         self.warnings: list[ConfigWarning] = []
 
@@ -207,6 +237,8 @@ def _walk_mapping(out: _Collector, data: Mapping[str, object], *, layer: str, pr
             continue
         if prefix == "" and key in _SECTIONS and not isinstance(value, Mapping):
             raise ConfigValidationError(layer=layer, path=path, value=_shown(value), expected="a table")
+        if prefix == "bluestacks" and key == "settings" and not isinstance(value, Mapping):
+            raise ConfigValidationError(layer=layer, path=path, value=_shown(value), expected="a table")
         if isinstance(value, Mapping):
             _walk_mapping(out, value, layer=layer, prefix=path)
         elif path in _LEAVES:
@@ -274,13 +306,32 @@ def _build_config(out: _Collector) -> EmuctlConfig:
             width=cast("int | None", leaves.get("display.width")),
             height=cast("int | None", leaves.get("display.height")),
             dpi=cast("int | None", leaves.get("display.dpi")),
+            fps=cast("int | None", leaves.get("display.fps")),
+            renderer=cast("RendererMode | str | None", leaves.get("display.renderer")),
+        )
+        resources = ResourceConfig(
+            cpus=cast("int | None", leaves.get("resources.cpus")),
+            memory_mb=cast("int | None", leaves.get("resources.memory_mb")),
+            cpu_cap_pct=cast("int | None", leaves.get("resources.cpu_cap_pct")),
         )
         adb = AdbConfig(
             path=cast("str | None", leaves.get("adb.path")),
             host=cast(str, leaves.get("adb.host", "127.0.0.1")),
             port=cast(int, leaves.get("adb.port", 5037)),
         )
-        return EmuctlConfig(adb=adb, display=display)
+        bluestacks: BlueStacksConfig | None = None
+        if any(key.startswith("bluestacks.") for key in leaves):
+            bluestacks = BlueStacksConfig(
+                adb_server_port=cast(int, leaves.get("bluestacks.adb_server_port", 5041)),
+                install_dir=cast("str | None", leaves.get("bluestacks.install_dir")),
+                conf_path=cast("str | None", leaves.get("bluestacks.conf_path")),
+                instance_name=cast("str | None", leaves.get("bluestacks.instance_name")),
+                settings=BlueStacksSettings(
+                    vsync=cast("bool | None", leaves.get("bluestacks.settings.vsync")),
+                    high_fps=cast("bool | None", leaves.get("bluestacks.settings.high_fps")),
+                ),
+            )
+        return EmuctlConfig(adb=adb, display=display, resources=resources, bluestacks=bluestacks)
     except ConfigValidationError as exc:
         exc.layer = out.layers.get(exc.path, "config")
         raise

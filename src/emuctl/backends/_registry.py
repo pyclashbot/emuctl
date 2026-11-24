@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
@@ -25,6 +26,24 @@ __all__ = [
     "resolve_backend",
     "load_adapter",
 ]
+
+
+#: Control characters rejected in vendor instance names (log/render safety).
+_CONTROL_RE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _validate_vm_name(key: str) -> None:
+    """Vendor instance names: non-blank text with no control characters."""
+    if not isinstance(key, str) or not key.strip():
+        raise InvalidArgumentError(
+            parameter="key",
+            constraint="must be a non-empty instance name",
+        )
+    if _CONTROL_RE.search(key) is not None:
+        raise InvalidArgumentError(
+            parameter="key",
+            constraint="must not contain control characters",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +73,23 @@ _SPEC_TABLE: Final[dict[BackendId, BackendSpec | None]] = {
             "(e.g. '127.0.0.1:5555', 'emulator-5554'); positional, never referential."
         ),
         validate_key=validate_serial,
+    ),
+    BackendId.BLUESTACKS: BackendSpec(
+        backend=BackendId.BLUESTACKS,
+        extra="bluestacks",
+        module="emuctl.backends.bluestacks.bs5",
+        adapter_attr="BlueStacks5Controller",
+        supported_platforms=frozenset({Platform.WINDOWS}),
+        dep_modules=(),
+        description=(
+            "BlueStacks 5 on Windows (HD-Player with Multi-Instance Manager; "
+            "private ADB server on 127.0.0.1:5041)."
+        ),
+        key_semantics=(
+            "BlueStacks 5 instance display name from the Multi-Instance Manager "
+            "(or bluestacks.conf display_name); referential."
+        ),
+        validate_key=_validate_vm_name,
     ),
 }
 
@@ -92,8 +128,7 @@ def resolve_backend(backend: BackendId | str) -> BackendSpec:
         raise BackendNotAvailableError(
             reason="not-implemented-this-version",
             detail=(
-                f"backend '{wanted.value}' is not shipped in v0.1 "
-                "(ADB backend only); it remains on its stack branch"
+                f"backend '{wanted.value}' is not implemented in this version (it remains on its stack branch)"
             ),
         )
     spec = _SPEC_TABLE[wanted]
