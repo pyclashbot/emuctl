@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Final
 
 from emuctl._adb import _server_host_args, _stderr_excerpt
@@ -59,6 +59,7 @@ class AdbController(_AdbMiddleLayer):
         ref: InstanceRef,
         *,
         config: EmuctlConfig | None = None,
+        env: Mapping[str, str] | None = None,
         _executor: ProcessExecutor | None = None,
     ) -> None:
         super().__init__(ref)
@@ -69,7 +70,7 @@ class AdbController(_AdbMiddleLayer):
         self.adb_server_port: int | None = cfg.adb.port
         self._adb_host: str = cfg.adb.host
         self._serial: str = ref.key
-        self._executor = _executor if _executor is not None else ProcessExecutor()
+        self._executor = _executor if _executor is not None else ProcessExecutor(env=env)
         logger.debug("bind adb ref=%s", sanitize(str(ref)))
 
     async def _vendor_run(

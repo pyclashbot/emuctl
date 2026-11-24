@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import logging
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, Final
 
 from emuctl._identification import BackendId, InstanceRecord, InstanceRef
 from emuctl.config.model import EmuctlConfig, ensure_config_supported
 from emuctl.errors import (
+    AmbiguousInstanceError,
     BackendNotAvailableError,
     ExtrasMissingError,
+    InstanceNotFoundError,
     InvalidArgumentError,
 )
 from emuctl.log import sanitize
@@ -22,6 +24,7 @@ __all__ = [
     "BACKEND_STATUS_REASONS",
     "connect",
     "discover",
+    "select_instance",
 ]
 
 logger = logging.getLogger(__name__)
@@ -77,6 +80,63 @@ class DiscoveryReport:
             "offline": self.offline,
             "backends": [status.to_dict() for status in self.backends],
         }
+
+
+def _iter_records(source: DiscoveryReport | Iterable[InstanceRecord]) -> Iterator[InstanceRecord]:
+    if isinstance(source, DiscoveryReport):
+        for status in source.backends:
+            yield from status.instances
+        return
+    try:
+        iterator = iter(source)
+    except TypeError:
+        raise InvalidArgumentError(
+            parameter="instances",
+            constraint="must be a DiscoveryReport or an iterable of InstanceRecord",
+        ) from None
+    for record in iterator:
+        if not isinstance(record, InstanceRecord):
+            raise InvalidArgumentError(
+                parameter="instances",
+                constraint="every candidate must be an InstanceRecord",
+            )
+        yield record
+
+
+def select_instance(
+    instances: DiscoveryReport | Iterable[InstanceRecord],
+    *,
+    serial: str | None = None,
+    ref: InstanceRef | str | None = None,
+) -> InstanceRecord:
+    """Pick one discovered instance explicitly, never by position.
+
+    Pass exactly one selector: ``serial=`` matches a record's observed serial
+    (or its canonical key, the usual ADB case), ``ref=`` matches identity.
+    Absent → ``InstanceNotFoundError``; several matches → ``AmbiguousInstanceError``.
+    """
+    if (serial is None) == (ref is None):
+        raise InvalidArgumentError(
+            parameter="selector",
+            constraint="pass exactly one of serial= or ref=",
+        )
+    if serial is not None:
+        if not isinstance(serial, str) or not serial.strip():
+            raise InvalidArgumentError(parameter="serial", constraint="must be a non-empty string")
+        label = serial
+        found = [
+            record for record in _iter_records(instances) if record.serial == serial or record.ref.key == serial
+        ]
+    else:
+        assert ref is not None
+        target = _resolve_target(ref)
+        label = str(target)
+        found = [record for record in _iter_records(instances) if record.ref == target]
+    if not found:
+        raise InstanceNotFoundError(instance_ref=label)
+    if len(found) > 1:
+        raise AmbiguousInstanceError(selector=label, matched=[str(record.ref) for record in found])
+    return found[0]
 
 
 def _resolve_config(config: EmuctlConfig | None) -> EmuctlConfig:

@@ -463,3 +463,76 @@ def test_spawn_detached_default_spawner_discards_outputs(
     assert captured["stderr"] == _proc.DEVNULL
     assert captured["creationflags"] == _proc._creationflags()
     assert "timeout" not in captured  # fire-and-forget: fire() only, forget() by caller
+
+
+# ── per-instance environment (ADB_MDNS and friends) ──
+
+
+def test_process_executor_env_overlay_is_merged_over_inherited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_create(*argv: str, **kwargs: Any) -> FakeProcess:
+        captured["argv"] = list(argv)
+        captured["env"] = kwargs.get("env")
+        return FakeProcess(stdout=b"ok")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setenv("EMUCTL_TEST_INHERITED", "yes")
+    executor = ProcessExecutor(env={"ADB_MDNS": "0"})
+
+    result = asyncio.run(executor.run(["adb", "devices"], operation="probe"))
+
+    assert result.stdout == b"ok"
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["ADB_MDNS"] == "0"
+    assert child_env["EMUCTL_TEST_INHERITED"] == "yes"
+    assert executor.env == {"ADB_MDNS": "0"}
+
+
+def test_process_executor_without_env_lets_the_child_inherit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_create(*argv: str, **kwargs: Any) -> FakeProcess:
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    asyncio.run(ProcessExecutor().run(["adb", "devices"], operation="probe"))
+
+    assert captured["env"] is None
+
+
+def test_process_executor_env_is_validated() -> None:
+    with pytest.raises(InvalidArgumentError):
+        ProcessExecutor(env=["ADB_MDNS=0"])  # ty: ignore[invalid-argument-type]
+    with pytest.raises(InvalidArgumentError):
+        ProcessExecutor(env={"ADB_MDNS": 0})  # ty: ignore[invalid-argument-type]
+    with pytest.raises(InvalidArgumentError):
+        ProcessExecutor(env={"": "0"})
+    with pytest.raises(InvalidArgumentError):
+        ProcessExecutor(env={"A=B": "0"})
+    with pytest.raises(InvalidArgumentError):
+        ProcessExecutor(env={"ADB_MDNS": "0\x00"})
+
+
+def test_default_detached_spawner_forwards_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_create(*argv: str, **kwargs: Any) -> FakeProcess:
+        captured["argv"] = list(argv)
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    overlay = {"ADB_MDNS": "0"}
+    asyncio.run(_proc._default_spawn_detached(["player", "--instance", "x"], env=overlay))
+
+    assert captured["env"] == overlay
+    assert captured["stdout"] == _proc.DEVNULL
