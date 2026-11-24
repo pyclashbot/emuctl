@@ -11,6 +11,7 @@ Before 1.0, a minor release may contain breaking changes; those are called out b
 ### Added
 
 - `CHANGELOG.md`, maintained by hand, with an entry for every user-visible change.
+- BlueStacks 5 backend adapter (`bluestacks:<instance>`): Windows lifecycle, configuration, and discovery through the BlueStacks conf store.
 
 ## [0.1.0] - 2026-11-23
 
