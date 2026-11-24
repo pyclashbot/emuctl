@@ -18,7 +18,8 @@ from emuctl.port import AsyncEmulatorController
 
 ADB_MODULE = "emuctl.backends.adb"
 
-#: Removed vendor adapters/deps: v0.1 has no modules and must never import them.
+#: Backends with reserved ids but no registry row: selecting one refuses and no
+#: adapter module may ever load.
 REMOVED_MODULES = (
     "emuctl.backends.memu",
     "emuctl.backends.bluestacks.bs5",
