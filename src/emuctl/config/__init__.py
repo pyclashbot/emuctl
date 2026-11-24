@@ -14,12 +14,14 @@ from emuctl.config.model import (
     CreateSpec,
     DisplayConfig,
     EmuctlConfig,
+    GooglePlayConfig,
 )
 from emuctl.errors import ConfigError, ConfigValidationError, InvalidArgumentError
 
 __all__ = [
     "DisplayConfig",
     "AdbConfig",
+    "GooglePlayConfig",
     "EmuctlConfig",
     "ConfigSpec",
     "CreateSpec",
@@ -40,9 +42,12 @@ _LEAVES: Final[dict[str, _LeafKind]] = {
     "adb.path": "str",
     "adb.host": "str",
     "adb.port": "int",
+    "google-play.install_dir": "str",
+    "google-play.adb_path": "str",
+    "google-play.device_serial": "str",
 }
 
-_SECTIONS: Final[frozenset[str]] = frozenset({"display", "adb"})
+_SECTIONS: Final[frozenset[str]] = frozenset({"display", "adb", "google-play"})
 
 _ENV_PREFIX: Final[str] = "EMUCTL_"
 _TRUE_TOKENS: Final[frozenset[str]] = frozenset({"true", "1"})
@@ -151,8 +156,13 @@ class _Collector:
                 self.warn(layer, key)
 
 
+def _flat_name(leaf: str) -> str:
+    """Env spelling: both the section dot and kebab-case hyphen become ``_``."""
+    return leaf.replace(".", "_").replace("-", "_")
+
+
 def _apply_env(env: Mapping[str, str], out: _Collector) -> None:
-    by_flat = {leaf.replace(".", "_"): leaf for leaf in _LEAVES}
+    by_flat = {_flat_name(leaf): leaf for leaf in _LEAVES}
     for name in sorted(env):
         if not name.startswith(_ENV_PREFIX):
             continue
@@ -280,7 +290,14 @@ def _build_config(out: _Collector) -> EmuctlConfig:
             host=cast(str, leaves.get("adb.host", "127.0.0.1")),
             port=cast(int, leaves.get("adb.port", 5037)),
         )
-        return EmuctlConfig(adb=adb, display=display)
+        google_play: GooglePlayConfig | None = None
+        if any(key.startswith("google-play.") for key in leaves):
+            google_play = GooglePlayConfig(
+                install_dir=cast("str | None", leaves.get("google-play.install_dir")),
+                adb_path=cast("str | None", leaves.get("google-play.adb_path")),
+                device_serial=cast(str, leaves.get("google-play.device_serial", "localhost:6520")),
+            )
+        return EmuctlConfig(adb=adb, display=display, google_play=google_play)
     except ConfigValidationError as exc:
         exc.layer = out.layers.get(exc.path, "config")
         raise

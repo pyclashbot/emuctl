@@ -123,8 +123,8 @@ def test_row_reasons_pinned() -> None:
 
 def test_discover_default_order_is_by_backend_id(windows_host: Any) -> None:
     report = asyncio.run(discover(offline=True))
-    # Default discovery walks the registry: v0.1 ships ADB only.
-    assert [status.backend for status in report.backends] == [BackendId.ADB]
+    # Default discovery walks the registry: ADB + Google Play shipped here.
+    assert [status.backend for status in report.backends] == [BackendId.ADB, BackendId.GOOGLE_PLAY]
     assert report.offline is True
 
 
@@ -206,7 +206,7 @@ def test_discover_online_adb_rows(windows_host: Any, monkeypatch: pytest.MonkeyP
         "ProcessExecutor",
         lambda: ProcessExecutor(_spawn=_spawn),  # type: ignore[arg-type]
     )
-    report = asyncio.run(discover())
+    report = asyncio.run(discover([BackendId.ADB]))
     by_id = {status.backend: status for status in report.backends}
     assert by_id[BackendId.ADB].available is True
     assert by_id[BackendId.ADB].reason == "ok"
@@ -291,7 +291,7 @@ def test_connect_rejects_non_string_targets() -> None:
 
 def test_connect_refusal_not_implemented() -> None:
     with pytest.raises(BackendNotAvailableError) as excinfo:
-        asyncio.run(connect("google-play:anything"))
+        asyncio.run(connect("memu:pyclashbot-136"))
     assert excinfo.value.reason == "not-implemented-this-version"
 
 

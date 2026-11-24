@@ -5,7 +5,13 @@ from typing import Any
 
 import pytest
 
-from emuctl.config.model import AdbConfig, DisplayConfig, EmuctlConfig, ensure_config_supported
+from emuctl.config.model import (
+    AdbConfig,
+    DisplayConfig,
+    EmuctlConfig,
+    GooglePlayConfig,
+    ensure_config_supported,
+)
 from emuctl.errors import ConfigValidationError, FeatureNotSupportedError
 
 
@@ -25,6 +31,9 @@ def test_defaults_and_frozen_slots() -> None:
         lambda: DisplayConfig(height=-1),
         lambda: DisplayConfig(dpi=True),
         lambda: DisplayConfig(width="800"),  # ty: ignore[invalid-argument-type]
+        lambda: GooglePlayConfig(device_serial="not a serial"),
+        lambda: GooglePlayConfig(device_serial=""),
+        lambda: GooglePlayConfig(install_dir="   "),
         lambda: AdbConfig(port=0),
         lambda: AdbConfig(port=65536),
         lambda: AdbConfig(host="   "),
@@ -51,3 +60,9 @@ def test_gate_requires_configure_for_display() -> None:
     assert excinfo.value.feature == "configure"
     assert ensure_config_supported(cfg, frozenset({"configure"})) is None
     assert ensure_config_supported(EmuctlConfig(), frozenset()) is None
+
+
+def test_google_play_defaults() -> None:
+    cfg = EmuctlConfig()
+    assert cfg.google_play is None
+    assert GooglePlayConfig().device_serial == "localhost:6520"

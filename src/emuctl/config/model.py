@@ -6,11 +6,13 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from typing import Final
 
+from emuctl._serials import is_valid_serial
 from emuctl.errors import ConfigValidationError, FeatureNotSupportedError
 
 __all__ = [
     "DisplayConfig",
     "AdbConfig",
+    "GooglePlayConfig",
     "EmuctlConfig",
     "CreateSpec",
     "ConfigSpec",
@@ -99,6 +101,27 @@ class AdbConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GooglePlayConfig:
+    """Google Play Games on PC selection (paths/serial) — selection only."""
+
+    install_dir: str | None = None
+    adb_path: str | None = None
+    device_serial: str = "localhost:6520"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "install_dir",
+            _check_str("google-play.install_dir", self.install_dir),
+        )
+        object.__setattr__(self, "adb_path", _check_str("google-play.adb_path", self.adb_path))
+        serial = _check_str("google-play.device_serial", self.device_serial, strip=True)
+        if not is_valid_serial(serial):
+            raise _fail("google-play.device_serial", serial, "a valid ADB serial")
+        object.__setattr__(self, "device_serial", serial)
+
+
+@dataclass(frozen=True, slots=True)
 class CreateSpec:
     name: str
     android_version: str | None = None
@@ -118,12 +141,19 @@ class CreateSpec:
 class EmuctlConfig:
     adb: AdbConfig = field(default_factory=AdbConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
+    google_play: GooglePlayConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.adb, AdbConfig):
             raise _fail("adb", type(self.adb).__name__, "an AdbConfig")
         if not isinstance(self.display, DisplayConfig):
             raise _fail("display", type(self.display).__name__, "a DisplayConfig")
+        if self.google_play is not None and not isinstance(self.google_play, GooglePlayConfig):
+            raise _fail(
+                "google-play",
+                type(self.google_play).__name__,
+                "a GooglePlayConfig or None",
+            )
 
 
 def ensure_config_supported(cfg: EmuctlConfig, features: AbstractSet[object]) -> None:
