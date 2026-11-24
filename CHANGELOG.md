@@ -12,6 +12,7 @@ Before 1.0, a minor release may contain breaking changes; those are called out b
 
 - `CHANGELOG.md`, maintained by hand, with an entry for every user-visible change.
 - Google Play Games on PC backend adapter (`google-play:<serial>`): bundled-ADB discovery, interaction, and display configuration on Windows (boot stays gated).
+- BlueStacks Air backend adapter (`bluestacks-air:<instance>`): macOS lifecycle, configuration, and discovery through the BlueStacks conf store.
 
 ## [0.1.0] - 2026-11-23
 
