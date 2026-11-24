@@ -22,6 +22,7 @@ Contract = "https://github.com/pyclashbot/emuctl/blob/main/CONTRACT.md"
 [project.optional-dependencies]
 cli = ["click>=8.2"]
 google-play = []
+bluestacks = []
 all = ["click>=8.2"]
 
 [dependency-groups]
@@ -70,7 +71,7 @@ ignore_imports = [
 name = "Backend families are independent"
 type = "independence"
 include_external_packages = false
-modules = ["emuctl.backends.adb", "emuctl.backends.google_play"]
+modules = ["emuctl.backends.adb", "emuctl.backends.bluestacks", "emuctl.backends.google_play"]
 
 [tool.ruff]
 line-length = 112

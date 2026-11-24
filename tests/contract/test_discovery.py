@@ -123,8 +123,12 @@ def test_row_reasons_pinned() -> None:
 
 def test_discover_default_order_is_by_backend_id(windows_host: Any) -> None:
     report = asyncio.run(discover(offline=True))
-    # Default discovery walks the registry: ADB + Google Play shipped here.
-    assert [status.backend for status in report.backends] == [BackendId.ADB, BackendId.GOOGLE_PLAY]
+    # Default discovery walks the registry: ADB + BlueStacks Air + Google Play shipped here.
+    assert [status.backend for status in report.backends] == [
+        BackendId.ADB,
+        BackendId.BLUESTACKS_AIR,
+        BackendId.GOOGLE_PLAY,
+    ]
     assert report.offline is True
 
 
@@ -220,11 +224,11 @@ def test_discover_online_adb_rows(windows_host: Any, monkeypatch: pytest.MonkeyP
 
 
 def test_discover_removed_rows_are_not_implemented(macos_host: Any) -> None:
-    report = asyncio.run(discover([BackendId.ADB, BackendId.MEMU, BackendId.BLUESTACKS_AIR], offline=True))
+    report = asyncio.run(discover([BackendId.ADB, BackendId.MEMU, BackendId.BLUESTACKS], offline=True))
     by_id = {status.backend: status for status in report.backends}
     assert by_id[BackendId.ADB].reason == "offline"
     assert by_id[BackendId.MEMU].reason == "not-implemented-this-version"
-    assert by_id[BackendId.BLUESTACKS_AIR].reason == "not-implemented-this-version"
+    assert by_id[BackendId.BLUESTACKS].reason == "not-implemented-this-version"
 
 
 def test_discover_convention_violation_is_adapter_unavailable(
@@ -297,7 +301,7 @@ def test_connect_refusal_not_implemented() -> None:
 
 def test_connect_refusal_removed_backend() -> None:
     with pytest.raises(BackendNotAvailableError) as excinfo:
-        asyncio.run(connect(InstanceRef(backend=BackendId.MEMU, key="pyclashbot-136")))
+        asyncio.run(connect(InstanceRef(backend=BackendId.AVD, key="anything")))
     assert excinfo.value.reason == "not-implemented-this-version"
 
 
@@ -306,7 +310,7 @@ def test_connect_refusal_removed_backend() -> None:
     [
         (Platform.LINUX, "google-play:anything", BackendNotAvailableError),
         (Platform.MACOS, "memu:pyclashbot-136", BackendNotAvailableError),
-        (Platform.WINDOWS, "bluestacks:any", BackendNotAvailableError),
+        (Platform.WINDOWS, "bluestacks-air:any", BackendNotAvailableError),
         (Platform.LINUX, "adb:has space", InvalidSerialError),
         (Platform.LINUX, "emulator-5554", InvalidArgumentError),
     ],
