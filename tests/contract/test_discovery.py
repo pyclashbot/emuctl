@@ -123,8 +123,8 @@ def test_row_reasons_pinned() -> None:
 
 def test_discover_default_order_is_by_backend_id(windows_host: Any) -> None:
     report = asyncio.run(discover(offline=True))
-    # Default discovery walks the registry: v0.1 ships ADB only.
-    assert [status.backend for status in report.backends] == [BackendId.ADB]
+    # Default discovery walks the registry: ADB + MEmu shipped, the rest parked.
+    assert [status.backend for status in report.backends] == [BackendId.ADB, BackendId.MEMU]
     assert report.offline is True
 
 
@@ -206,7 +206,7 @@ def test_discover_online_adb_rows(windows_host: Any, monkeypatch: pytest.MonkeyP
         "ProcessExecutor",
         lambda: ProcessExecutor(_spawn=_spawn),  # type: ignore[arg-type]
     )
-    report = asyncio.run(discover())
+    report = asyncio.run(discover([BackendId.ADB]))
     by_id = {status.backend: status for status in report.backends}
     assert by_id[BackendId.ADB].available is True
     assert by_id[BackendId.ADB].reason == "ok"
@@ -220,10 +220,12 @@ def test_discover_online_adb_rows(windows_host: Any, monkeypatch: pytest.MonkeyP
 
 
 def test_discover_removed_rows_are_not_implemented(macos_host: Any) -> None:
-    report = asyncio.run(discover([BackendId.ADB, BackendId.MEMU, BackendId.BLUESTACKS_AIR], offline=True))
+    report = asyncio.run(
+        discover([BackendId.ADB, BackendId.GOOGLE_PLAY, BackendId.BLUESTACKS_AIR], offline=True)
+    )
     by_id = {status.backend: status for status in report.backends}
     assert by_id[BackendId.ADB].reason == "offline"
-    assert by_id[BackendId.MEMU].reason == "not-implemented-this-version"
+    assert by_id[BackendId.GOOGLE_PLAY].reason == "not-implemented-this-version"
     assert by_id[BackendId.BLUESTACKS_AIR].reason == "not-implemented-this-version"
 
 
@@ -253,11 +255,11 @@ def test_discover_convention_violation_is_adapter_unavailable(
 
 def test_discover_isolation_adb_keeps_working(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_module(monkeypatch, "emuctl.backends.adb", "AdbController", instances=(_adb_record(),))
-    report = asyncio.run(discover([BackendId.ADB, BackendId.MEMU]))
+    report = asyncio.run(discover([BackendId.ADB, BackendId.GOOGLE_PLAY]))
     by_id = {status.backend: status for status in report.backends}
     assert by_id[BackendId.ADB].available is True
     assert by_id[BackendId.ADB].instances == (_adb_record(),)
-    assert by_id[BackendId.MEMU].reason == "not-implemented-this-version"
+    assert by_id[BackendId.GOOGLE_PLAY].reason == "not-implemented-this-version"
 
 
 def test_discover_report_is_json_safe(windows_host: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -297,7 +299,7 @@ def test_connect_refusal_not_implemented() -> None:
 
 def test_connect_refusal_removed_backend() -> None:
     with pytest.raises(BackendNotAvailableError) as excinfo:
-        asyncio.run(connect(InstanceRef(backend=BackendId.MEMU, key="pyclashbot-136")))
+        asyncio.run(connect(InstanceRef(backend=BackendId.GOOGLE_PLAY, key="anything")))
     assert excinfo.value.reason == "not-implemented-this-version"
 
 

@@ -76,10 +76,24 @@ def test_pinned_backend_ids_survive_trimming() -> None:
     }
 
 
-def test_registry_has_only_the_adb_row(reg: Any) -> None:
+def test_registry_has_the_adb_and_memu_rows(reg: Any) -> None:
     registry = reg.get_registry()
-    assert set(registry) == {BackendId.ADB}
+    assert set(registry) == {BackendId.ADB, BackendId.MEMU}
     assert isinstance(registry[BackendId.ADB], reg.BackendSpec)
+    assert isinstance(registry[BackendId.MEMU], reg.BackendSpec)
+
+
+def test_memu_spec_is_pinned(reg: Any) -> None:
+    spec = reg.get_registry()[BackendId.MEMU]
+    assert spec.backend is BackendId.MEMU
+    assert spec.extra == "memu"
+    assert spec.module == "emuctl.backends.memu"
+    assert spec.adapter_attr == "MemuController"
+    assert spec.supported_platforms == frozenset({Platform.WINDOWS})
+    assert spec.dep_modules == ("pymemuc",)
+    assert spec.description.strip() != ""
+    assert spec.key_semantics.strip() != ""
+    assert callable(spec.validate_key)
 
 
 def test_adb_spec_is_pinned(reg: Any) -> None:
@@ -118,7 +132,6 @@ def test_refusal_unknown_id_first(reg: Any, no_backend_imports: None) -> None:
 @pytest.mark.parametrize(
     "backend",
     [
-        BackendId.MEMU,
         BackendId.BLUESTACKS,
         BackendId.BLUESTACKS_AIR,
         BackendId.GOOGLE_PLAY,
@@ -134,10 +147,46 @@ def test_removed_backends_refuse_cleanly(reg: Any, backend: BackendId, no_backen
 
 
 @pytest.mark.parametrize("platform", [Platform.WINDOWS, Platform.MACOS, Platform.LINUX])
-def test_available_backends_is_adb_only(reg: Any, platform: Platform, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_available_backends_is_adb_only_without_vendor_deps(
+    reg: Any, platform: Platform, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(reg, "current_platform", lambda: platform)
     monkeypatch.setattr(reg, "_dep_available", lambda name: False)
     assert [spec.backend for spec in reg.available_backends()] == [BackendId.ADB]
+
+
+def test_available_backends_includes_memu_when_platform_and_dep_resolve(
+    reg: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.WINDOWS)
+    monkeypatch.setattr(reg, "_dep_available", lambda name: True)
+    assert [spec.backend for spec in reg.available_backends()] == [
+        BackendId.ADB,
+        BackendId.MEMU,
+    ]
+
+
+def test_memu_selection_refuses_platform_before_dep(
+    reg: Any, no_backend_imports: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.MACOS)
+    with pytest.raises(BackendNotAvailableError) as excinfo:
+        reg.resolve_backend(BackendId.MEMU)
+    assert excinfo.value.reason == "platform-unsupported"
+    assert "windows" in (excinfo.value.detail or "")
+    assert [name for name in NEVER_IMPORT if name in sys.modules] == []
+
+
+def test_memu_missing_dep_names_the_extra(
+    reg: Any, no_backend_imports: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.WINDOWS)
+    monkeypatch.setattr(reg, "_dep_available", lambda name: False)
+    with pytest.raises(ExtrasMissingError) as excinfo:
+        reg.resolve_backend(BackendId.MEMU)
+    assert excinfo.value.extra == "memu"
+    assert "pymemuc" not in sys.modules
+    assert [name for name in NEVER_IMPORT if name in sys.modules] == []
 
 
 class _DummyController(AsyncEmulatorController):
@@ -238,8 +287,33 @@ def test_key_structural_rule_still_lives_in_identity() -> None:
         InstanceRef(backend=BackendId.MEMU, key="   ")
 
 
+@pytest.mark.parametrize("key", ["pyclashbot-136", "My VM 2", "memu vm"])
+def test_memu_key_rule_accepts_vm_names(reg: Any, key: str) -> None:
+    spec = reg.get_registry()[BackendId.MEMU]
+    assert spec.validate_key(key) is None
+
+
+@pytest.mark.parametrize("key", ["", "   ", "has\nnewline", "has\rcarriage"])
+def test_memu_key_rule_rejects(reg: Any, key: str) -> None:
+    spec = reg.get_registry()[BackendId.MEMU]
+    with pytest.raises(InvalidArgumentError) as excinfo:
+        spec.validate_key(key)
+    assert excinfo.value.parameter == "key"
+
+
 def test_spec_row_conformance_adb(reg: Any) -> None:
     spec = reg.get_registry()[BackendId.ADB]
+    adapter = reg.load_adapter(spec)
+    assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)
+    module = sys.modules[spec.module]
+    assert callable(getattr(module, "list_instances", None))
+    assert callable(getattr(module, "get_instance", None))
+
+
+def test_spec_row_conformance_memu(reg: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = reg.get_registry()[BackendId.MEMU]
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.WINDOWS)
+    monkeypatch.setattr(reg, "_dep_available", lambda name: True)
     adapter = reg.load_adapter(spec)
     assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)
     module = sys.modules[spec.module]
