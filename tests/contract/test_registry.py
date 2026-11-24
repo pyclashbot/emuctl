@@ -24,7 +24,6 @@ REMOVED_MODULES = (
     "emuctl.backends.bluestacks",
     "emuctl.backends.bluestacks.bs5",
     "emuctl.backends.bluestacks.air",
-    "emuctl.backends.google_play",
     "emuctl.backends.avd",
     "pymemuc",
 )
@@ -76,10 +75,24 @@ def test_pinned_backend_ids_survive_trimming() -> None:
     }
 
 
-def test_registry_has_only_the_adb_row(reg: Any) -> None:
+def test_registry_has_the_adb_and_google_play_rows(reg: Any) -> None:
     registry = reg.get_registry()
-    assert set(registry) == {BackendId.ADB}
+    assert set(registry) == {BackendId.ADB, BackendId.GOOGLE_PLAY}
     assert isinstance(registry[BackendId.ADB], reg.BackendSpec)
+    assert isinstance(registry[BackendId.GOOGLE_PLAY], reg.BackendSpec)
+
+
+def test_google_play_spec_is_pinned(reg: Any) -> None:
+    spec = reg.get_registry()[BackendId.GOOGLE_PLAY]
+    assert spec.backend is BackendId.GOOGLE_PLAY
+    assert spec.extra == "google-play"
+    assert spec.module == "emuctl.backends.google_play"
+    assert spec.adapter_attr == "GooglePlayController"
+    assert spec.supported_platforms == frozenset({Platform.WINDOWS})
+    assert spec.dep_modules == ()
+    assert spec.description.strip() != ""
+    assert spec.key_semantics.strip() != ""
+    assert callable(spec.validate_key)
 
 
 def test_adb_spec_is_pinned(reg: Any) -> None:
@@ -121,7 +134,6 @@ def test_refusal_unknown_id_first(reg: Any, no_backend_imports: None) -> None:
         BackendId.MEMU,
         BackendId.BLUESTACKS,
         BackendId.BLUESTACKS_AIR,
-        BackendId.GOOGLE_PLAY,
         BackendId.AVD,
     ],
 )
@@ -134,10 +146,34 @@ def test_removed_backends_refuse_cleanly(reg: Any, backend: BackendId, no_backen
 
 
 @pytest.mark.parametrize("platform", [Platform.WINDOWS, Platform.MACOS, Platform.LINUX])
-def test_available_backends_is_adb_only(reg: Any, platform: Platform, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_available_backends_is_adb_only_without_vendor_deps(
+    reg: Any, platform: Platform, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(reg, "current_platform", lambda: platform)
     monkeypatch.setattr(reg, "_dep_available", lambda name: False)
-    assert [spec.backend for spec in reg.available_backends()] == [BackendId.ADB]
+    expected = [BackendId.ADB]
+    if platform is Platform.WINDOWS:
+        expected.append(BackendId.GOOGLE_PLAY)
+    assert [spec.backend for spec in reg.available_backends()] == expected
+
+
+def test_available_backends_includes_google_play_on_windows(reg: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.WINDOWS)
+    assert [spec.backend for spec in reg.available_backends()] == [
+        BackendId.ADB,
+        BackendId.GOOGLE_PLAY,
+    ]
+
+
+def test_google_play_selection_refuses_platform(
+    reg: Any, no_backend_imports: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.LINUX)
+    with pytest.raises(BackendNotAvailableError) as excinfo:
+        reg.resolve_backend(BackendId.GOOGLE_PLAY)
+    assert excinfo.value.reason == "platform-unsupported"
+    assert "windows" in (excinfo.value.detail or "")
+    assert [name for name in NEVER_IMPORT if name in sys.modules] == []
 
 
 class _DummyController(AsyncEmulatorController):
@@ -238,8 +274,31 @@ def test_key_structural_rule_still_lives_in_identity() -> None:
         InstanceRef(backend=BackendId.MEMU, key="   ")
 
 
+@pytest.mark.parametrize("key", ["localhost:6520", "127.0.0.1:5555", "emulator-5554"])
+def test_google_play_key_rule_accepts_serials(reg: Any, key: str) -> None:
+    spec = reg.get_registry()[BackendId.GOOGLE_PLAY]
+    assert spec.validate_key(key) is None
+
+
+@pytest.mark.parametrize("key", ["has space", "a\nb", "", "  "])
+def test_google_play_key_rule_rejects(reg: Any, key: str) -> None:
+    spec = reg.get_registry()[BackendId.GOOGLE_PLAY]
+    with pytest.raises(InvalidArgumentError):
+        spec.validate_key(key)
+
+
 def test_spec_row_conformance_adb(reg: Any) -> None:
     spec = reg.get_registry()[BackendId.ADB]
+    adapter = reg.load_adapter(spec)
+    assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)
+    module = sys.modules[spec.module]
+    assert callable(getattr(module, "list_instances", None))
+    assert callable(getattr(module, "get_instance", None))
+
+
+def test_spec_row_conformance_google_play(reg: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = reg.get_registry()[BackendId.GOOGLE_PLAY]
+    monkeypatch.setattr(reg, "current_platform", lambda: Platform.WINDOWS)
     adapter = reg.load_adapter(spec)
     assert isinstance(adapter, type) and issubclass(adapter, AsyncEmulatorController)
     module = sys.modules[spec.module]

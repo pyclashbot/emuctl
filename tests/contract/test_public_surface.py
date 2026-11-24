@@ -206,7 +206,7 @@ def test_import_pulls_no_backends_then_connect_loads_adapters() -> None:
         ("foo:bar", InvalidArgumentError),  # unknown head
         ("adb:", InvalidArgumentError),  # empty key
         (123, InvalidArgumentError),  # non-string non-ref
-        ("google-play:anything", BackendNotAvailableError),  # spec None
+        ("bluestacks:any", BackendNotAvailableError),  # spec None
     ],
 )
 def test_connect_refusals_raise_at_construction(target: Any, exception: type[Exception]) -> None:

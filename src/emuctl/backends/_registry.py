@@ -55,6 +55,23 @@ _SPEC_TABLE: Final[dict[BackendId, BackendSpec | None]] = {
         ),
         validate_key=validate_serial,
     ),
+    BackendId.GOOGLE_PLAY: BackendSpec(
+        backend=BackendId.GOOGLE_PLAY,
+        extra="google-play",
+        module="emuctl.backends.google_play",
+        adapter_attr="GooglePlayController",
+        supported_platforms=frozenset({Platform.WINDOWS}),
+        dep_modules=(),
+        description=(
+            "Google Play Games on PC (Windows; bundled adb at "
+            "<InstallLocation>/current/emulator/adb.exe, single localhost:6520 instance)."
+        ),
+        key_semantics=(
+            "ADB transport serial of the single Google Play Games emulator "
+            "(default 'localhost:6520'); fixed for the install, so referential."
+        ),
+        validate_key=validate_serial,
+    ),
 }
 
 
@@ -92,8 +109,7 @@ def resolve_backend(backend: BackendId | str) -> BackendSpec:
         raise BackendNotAvailableError(
             reason="not-implemented-this-version",
             detail=(
-                f"backend '{wanted.value}' is not shipped in v0.1 "
-                "(ADB backend only); it remains on its stack branch"
+                f"backend '{wanted.value}' is not implemented in this version (it remains on its stack branch)"
             ),
         )
     spec = _SPEC_TABLE[wanted]

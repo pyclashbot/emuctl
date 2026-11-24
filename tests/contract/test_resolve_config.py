@@ -44,11 +44,41 @@ def test_env_flat_leaf_grammar(tmp_path: Path) -> None:
     assert resolved.config.display.width == 800
 
 
-def test_removed_vendor_leaf_is_unknown_and_warns(tmp_path: Path) -> None:
+def test_unshipped_vendor_leaf_is_unknown_and_warns(tmp_path: Path) -> None:
     resolved = resolve_config(env={"EMUCTL_MEMU_VM_NAME": "bot-1"}, cwd=tmp_path)
-    assert not hasattr(resolved.config, "memu")
+    assert resolved.config.google_play is None
     assert len(resolved.warnings) == 1
     assert resolved.warnings[0].layer == "env"
+
+
+def test_google_play_env_leaves_are_recognized(tmp_path: Path) -> None:
+    resolved = resolve_config(
+        env={
+            "EMUCTL_GOOGLE_PLAY_INSTALL_DIR": r"C:\Google\Play Games Developer Emulator",
+            "EMUCTL_GOOGLE_PLAY_ADB_PATH": r"C:\Google\Play Games Developer Emulator\current\emulator\adb.exe",
+            "EMUCTL_GOOGLE_PLAY_DEVICE_SERIAL": "localhost:6521",
+        },
+        cwd=tmp_path,
+    )
+    assert resolved.warnings == ()
+    assert resolved.config.google_play is not None
+    assert resolved.config.google_play.device_serial == "localhost:6521"
+    assert resolved.config.google_play.install_dir is not None
+
+
+def test_google_play_toml_table_builds_config(tmp_path: Path) -> None:
+    (tmp_path / "emuctl.toml").write_text(
+        "[google-play]\n"
+        "install_dir = '/opt/google-play'\n"
+        "adb_path = '/opt/google-play/current/emulator/adb.exe'\n"
+        "device_serial = 'localhost:6520'\n",
+        encoding="utf-8",
+    )
+    resolved = resolve_config(env={}, cwd=tmp_path)
+    assert resolved.config.google_play is not None
+    assert resolved.config.google_play.install_dir == "/opt/google-play"
+    assert resolved.config.google_play.device_serial == "localhost:6520"
+    assert resolved.warnings == ()
 
 
 def test_env_unknown_name_warns_with_hint(tmp_path: Path) -> None:

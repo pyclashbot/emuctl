@@ -514,7 +514,7 @@ def test_keyboard_interrupt_abandons_and_facade_stays_usable(monkeypatch: Any) -
         (123, InvalidArgumentError),
         ("nope:key", InvalidArgumentError),
         ("avd:whatever", BackendNotAvailableError),
-        ("google-play:pkg", BackendNotAvailableError),
+        ("memu:pkg", BackendNotAvailableError),
     ],
 )
 def test_connect_sync_refusals_raise_pre_portal_thread_free(target: Any, expected: type[BaseException]) -> None:
