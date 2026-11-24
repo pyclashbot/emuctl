@@ -223,7 +223,7 @@ def test_connect_refusals_raise_at_construction(target: Any, exception: type[Exc
 def test_removed_backend_refusal_imports_nothing() -> None:
     before = sorted(m for m in sys.modules if m.startswith("emuctl.backends."))
     with pytest.raises(BackendNotAvailableError) as excinfo:
-        asyncio.run(emuctl.connect("memu:pyclashbot-136"))
+        asyncio.run(emuctl.connect("google-play:anything"))
     assert excinfo.value.reason == "not-implemented-this-version"
     after = sorted(m for m in sys.modules if m.startswith("emuctl.backends."))
     assert after == sorted(set(before) | {"emuctl.backends._registry"}), after

@@ -21,7 +21,8 @@ Contract = "https://github.com/pyclashbot/emuctl/blob/main/CONTRACT.md"
 
 [project.optional-dependencies]
 cli = ["click>=8.2"]
-all = ["click>=8.2"]
+memu = ["pymemuc>=0.6,<0.7"]
+all = ["click>=8.2", "pymemuc>=0.6,<0.7"]
 
 [dependency-groups]
 dev = ["pytest>=8", "import-linter>=2.15", "pre-commit>=4"]
@@ -69,7 +70,7 @@ ignore_imports = [
 name = "Backend families are independent"
 type = "independence"
 include_external_packages = false
-modules = ["emuctl.backends.adb"]
+modules = ["emuctl.backends.adb", "emuctl.backends.memu"]
 
 [tool.ruff]
 line-length = 112
